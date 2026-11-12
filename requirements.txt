@@ -1,0 +1,16 @@
+# bookflow 依赖（开发时用 Python 3.13 验证）
+# 安装：python -m venv .venv
+#       .venv/Scripts/pip install -r requirements.txt      # Windows
+#       .venv/bin/pip install -r requirements.txt          # macOS / Linux
+rapidocr>=3.0
+pillow>=10
+numpy>=1.24
+# GPU 加速（Windows 上最省事：不需要装 CUDA）
+#   pip install onnxruntime-directml
+# 交叉验证/词表阶段需要（audit.py / disagree.py 的 jieba 词典）
+jieba>=0.42
+# 版面分析（layout 阶段，可选但强烈建议）：
+#   pip install rapid_layout   # PP-DocLayoutV3，约 0.30 s/页
+# 外部依赖（非 pip）：
+#   poppler 的 pdftoppm（render 阶段）
+# EPUB 打包不需要外部依赖：本项目自带 epub3.py（纯标准库）

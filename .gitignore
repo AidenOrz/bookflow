@@ -1,0 +1,21 @@
+# 运行产物（体积大、可重生成）
+pages/
+ocr/
+ocr_fix/
+ocr_alt/
+ocr_medium/
+ocr_merged/
+ocr_layout/
+run*/
+out/
+*.epub
+*.png
+*.jpg
+ocr.log
+*.log
+
+# 临时文件
+.tmp-*
+__pycache__/
+*.pyc
+*.bak

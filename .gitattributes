@@ -1,0 +1,8 @@
+# 统一换行：源码入库一律 LF，检出时由 git 按平台转换
+* text=auto eol=lf
+
+# 二进制/生成物
+*.epub binary
+*.png binary
+*.jpg binary
+*.onnx binary

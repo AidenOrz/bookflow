@@ -1,0 +1,97 @@
+@charset "utf-8";
+/* bookflow 成书样式表。
+ *
+ * 正文字号交给阅读器（不写绝对 px），只用 em / % 控制相对关系。
+ * 重点在最后一段：弹窗脚注的样式。 */
+
+body {
+  margin: 0 5%;
+  line-height: 1.75;
+  text-align: justify;
+  font-family: "Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", "SimSun", serif;
+  color: #000;
+}
+
+h1.chapter-title { font-size: 1.5em; text-align: center; margin: 2.2em 0 1.6em; line-height: 1.45; }
+h2 { font-size: 1.22em; margin: 2em 0 .7em; line-height: 1.45; }
+h3 { font-size: 1.06em; margin: 1.6em 0 .5em; line-height: 1.5; }
+h4 { font-size: 1em; margin: 1.2em 0 .4em; }
+
+/* 正文：中文书籍习惯首行缩进 2 字符 */
+p { margin: .42em 0; text-indent: 2em; }
+
+/* ---- 弹窗脚注 ----
+ * 正文里是 <a epub:type="noteref">，注文是 <aside epub:type="footnote">，
+ * 两者同处一个 XHTML 文件。这符合 EPUB3 的结构化语义：
+ *   Apple Books / Thorium / Kobo 识别后直接浮层弹出注文，点外部或返回键关闭；
+ *   不支持的阅读器则退化成页内跳转，aside 就近显示在章末，返回链接可跳回原处。
+ * 不写 position:absolute 之类的强制布局，避免在排版引擎差异大的设备上错位。 */
+section.footnotes {
+  margin-top: 2.4em;
+  border-top: 1px solid #999;
+  padding-top: .6em;
+  font-size: .88em;
+}
+
+aside.footnote {
+  display: block;
+  margin: .55em 0;
+  line-height: 1.6;
+}
+
+aside.footnote p { text-indent: 0; margin: .3em 0; }
+
+/* 正文中的上标注号 */
+a.fnref {
+  text-decoration: none;
+  font-size: .72em;
+  vertical-align: super;
+  line-height: 0;
+  padding: 0 .1em;
+  color: #8A2D2D;
+}
+
+/* 注文前的返回序号 */
+a.fnback {
+  text-decoration: none;
+  color: #8A2D2D;
+  margin-right: .35em;
+}
+
+/* 兜底：阅读器不支持 epub:type 弹窗、但支持 :target 时，
+ * 点注号把这一条浮到页面上，视觉上等价于弹窗。
+ * 不支持 position:fixed 的引擎会忽略这整块，退化为章末就地显示，不会破坏排版。 */
+aside.footnote:target {
+  display: block;
+  position: fixed;
+  left: 6%;
+  right: 6%;
+  bottom: 10%;
+  max-height: 60%;
+  overflow-y: auto;
+  background: #fff;
+  border: 1px solid #bbb;
+  border-radius: .4em;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, .28);
+  padding: .9em 1.1em;
+  z-index: 999;
+  font-size: .95em;
+}
+
+/* 锚不上正文的注（扫描件上标注号被 OCR 漏掉）：整章集中排在章末，
+ * 用 epub:type="endnote" 与弹窗脚注区分。 */
+aside.endnote { display: block; font-size: .86em; color: #333; margin: .3em 0 .3em 1.2em; }
+aside.endnote p { text-indent: 0; margin: .2em 0; }
+
+/* 插图与表格 */
+figure { margin: 1.2em auto; text-align: center; page-break-inside: avoid; break-inside: avoid; }
+figure img { max-width: 100%; height: auto; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: .88em; }
+td { border: .6pt solid #555; padding: .32em .45em; vertical-align: top; }
+
+ul, ol { margin: .5em 0 .6em 0; padding-left: 2em; }
+li { margin: .28em 0; }
+
+/* 封面页 */
+.cover-page { margin: 0; padding: 0; text-align: center; }
+.cover-page img { max-width: 100%; height: auto; }
