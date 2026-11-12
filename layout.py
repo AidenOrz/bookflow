@@ -31,7 +31,12 @@ WATERMARK = re.compile(r"pdfFactory|fineprint|试用版本", re.I)
 # 正文里的注号：①-⑳（U+2460..U+2473）最常见，㉑（U+3251..）起兼容，
 # 另外兼容上标数字。它也会误伤正文里的 ① 列表符号——那种情况下注号数与
 # 脚注条数对不上，plan_notes 会自动退化成页尾注释块，不会错配。
+#
+# 星号注（* / ** / ***）单独处理，见 extract_star_notes()：它的"编号"是
+# 星号个数，而正文里 `*` 也可能出现在别的场合，所以不能并进 MARK_RE 一起
+# 盲目配对，必须走那套更严的自校验。
 MARK_RE = re.compile("[①-⑳㉑-㉟]|[⁰-ₜ]+")
+STAR_RE = re.compile(r"\*{1,6}")
 
 L1_PAT = re.compile(
     r"^(?:第\s*[零一二三四五六七八九十百千两0-9]+\s*[讲章节篇卷部编]"
@@ -153,6 +158,77 @@ def extract_notes(pages):
         if keep:
             out[p["idx"]] = keep
     return dict(out)
+
+
+def split_note_blocks(rows, bw, k=1.0):
+    """按左缩进把一个页尾的注区切成多条注释。
+
+    扫描件的注区里，新的一条注往往只是比续行**多缩进一个字宽**——没有注号
+    可依赖时，缩进是唯一的断点信号。返回 [[line,...], ...]，每个子列表是
+    一条注（续行已并入前一条，不含注号）。
+    """
+    if not rows:
+        return []
+    rows = sorted(rows, key=lambda L: (L["y0"], L["x0"]))
+    left = min(L["x0"] for L in rows)
+    out = []
+    for L in rows:
+        if not out or L["x0"] > left + k * bw:
+            out.append([L])
+        else:
+            out[-1].append(L)
+    return out
+
+
+def extract_star_notes(pages, cleaned, bw, bh):
+    """抽取星号注（* / ** / ***…），返回 (notes, subs)。
+
+    这本书的脚注用星号而不是圈号，且**注区里的星号在 OCR 后大量丢失**
+    （168 行注文里只有 6 行残留纯星号），所以不能靠"注文带几个星号"来配对。
+    改成从正文侧数星号、从注区侧按缩进切块，再用两条互相独立的证据校验：
+
+      ① 块数 == 正文星号数；
+      ② 每块（除末块）都以句末标点收尾——切错边界时几乎必然切在句中。
+
+    两条都过才配对，否则整页退化成页尾注。宁可少弹窗，也不能把甲注挂到乙处，
+    读者点开看到不相干的引文比不弹窗糟得多。
+
+    返回 notes 结构与 extract_notes() 一致，可直接并入。
+    """
+    notes, subs = {}, {}
+    seq = 0
+    END = "。！？…”』」）)】》"
+    for p in pages:
+        rows = [L for L in p["lines"] if L.get("region") in NOTE_REGIONS
+                and not WATERMARK.search(L["t"])]
+        if not rows:
+            continue
+        body = [L for L in p["lines"] if L.get("region") not in NOTE_REGIONS]
+        # 正文星号：跳过行首的（那是列表符号或残片）
+        spots = []
+        for li, L in enumerate(cleaned.get(p["idx"], [])):
+            for m in STAR_RE.finditer(L["t"]):
+                if m.start() > 0:
+                    spots.append((li, m.start(), m.end(), len(m.group(0))))
+        if not spots:
+            continue
+        blocks = split_note_blocks(rows, bw)
+        texts = ["".join(L["t"] for L in b).strip() for b in blocks]
+        texts = [t for t in texts if len(re.sub(r"[^\u4e00-\u9fff0-9]", "", t)) >= 2]
+        if not texts:
+            continue
+        if len(texts) != len(spots):
+            continue                      # 证据①不成立，整页放弃
+        if len(blocks) > 1 and any(not t or t[-1] not in END for t in texts[:-1]):
+            continue                      # 证据②不成立
+        items = []
+        for (li, s, e, nstar), t in zip(spots, texts):
+            seq += 1
+            nid = "fn%d" % seq
+            items.append({"n": nstar, "mark": "*" * nstar, "text": t, "id": nid})
+            subs.setdefault((p["idx"], li), []).append((s, e, nid))
+        notes[p["idx"]] = items
+    return notes, subs
 
 
 def plan_notes(notes, cleaned):
@@ -277,18 +353,48 @@ def learn_running_heads(pages, bh):
 def detect_toc_pages(pages, bh, scan=30):
     """在原始行上判定印刷目录页（清洗前，避免页码被删）。
 
-    命中「目录/目次」标题的页直接算；否则要求该页有 ≥6 行以页码结尾，**并且**
-    下一页也满足（或本身已是最后一页）。连续性的约束很关键：正文页偶尔会有
-    引用年份「（1985）」这类行，单看一页容易误判；而目录总是连续好几页，
-    且被误判的页会被 match_entries/assemble 整页跳过，正文会静默消失。
+    命中「目录/目次」标题的页直接算。否则先挑出"有 ≥6 行以页码结尾"的候选页，
+    再要求它满足下面任一条：
+
+      A. 行尾页码**严格递增** —— 目录的页码是章节起始页，必然升序；
+      B. 前后还有一页也是候选 —— 目录通常连续好几页。
+
+    为什么两条都要：只靠 A，多页目录里某页 OCR 丢了几个页码就不再严格递增，
+    会被漏掉；只靠 B，**只有一页目录的书**永远判不出来（实测《规训与惩罚》
+    整本只有 1 页目录，老规则返回空集，目录解析跟着抛异常）。
+
+    误判的代价很高：被误判的页会被 match_entries/assemble 整页跳过，正文会
+    静默消失。所以候选门槛（≥6 行行尾页码）不能放松，版权页也有 7 个行尾
+    数字，是靠 A 的严格递增把它排除掉的。
     """
+    def tails(p):
+        """行尾页码，按纵坐标自上而下排好返回。"""
+        out = []
+        for L in p["lines"]:
+            t = L["t"].strip()
+            m = re.search(r"[（(\[【]?\s*(\d{1,4})\s*[)）\]】]?\s*$", t)
+            if m and elen(t) <= 40:
+                out.append((L["y0"], int(m.group(1))))
+        out.sort()
+        return [v for _, v in out]
+
+    def monotone(p):
+        """该页行尾页码是否严格递增。
+
+        单页目录（本书只有一页「目 录」）拿不到"相邻页也是目录"这条证据；只看
+        "行尾数字 ≥6" 又会把版权页算进来——版权页也有 7 个行尾数字。区别在于
+        目录的页码是**章节起始页**，自上而下严格递增；版权页的是一堆年份/开本/
+        版次，顺序是乱的。实测：本书目录页 12 个数严格递增，版权页 7 个数只有
+        一半升序。用这条信号把「单页目录」和「版权页」分开。
+        """
+        v = tails(p)
+        return len(v) >= 6 and all(b > a for a, b in zip(v, v[1:]))
+
     def looks_toc(p):
         texts = [L["t"].strip() for L in p["lines"]]
         if any(TOC_HEAD.match(t.replace(" ", "")) for t in texts):
             return True
-        num = sum(1 for t in texts
-                  if re.search(r"[（(\[【]?\s*\d{1,4}\s*[)）\]】]\s*$", t) and elen(t) <= 40)
-        return num >= 6
+        return len(tails(p)) >= 6
 
     ids = set()
     cand = [p for p in pages[:scan] if looks_toc(p)]
@@ -296,6 +402,11 @@ def detect_toc_pages(pages, bh, scan=30):
         # 标题命中的，单页即可认定
         texts = [L["t"].strip() for L in p["lines"]]
         if any(TOC_HEAD.match(t.replace(" ", "")) for t in texts):
+            ids.add(p["idx"])
+            continue
+        # 页码严格递增也是够强的单页证据：版权页/正文页凑不出这种序列。
+        # 少了这一条，只有一页目录的书（本书）会被"需要相邻目录页"的要求挡掉。
+        if monotone(p):
             ids.add(p["idx"])
             continue
         # 靠"行尾页码"判定的，要求前后至少还有一页也像目录（连续 2 页）
@@ -357,14 +468,25 @@ def clean_page(p, bw, bh, heads, keep_nums=False, band_top=0.085, band_bot=0.93)
         # 版面分析给出的区域标签：脚注/页脚/页码/页眉一律不进正文流。
         # 这是**可选增强**——没有 region 字段的老 JSON 行为完全不变，
         # 所以历史产物和未跑 run_layout.py 的工作目录都照旧。
+        #
+        # 例外：被标成 header 却**明显在页眉带以下**的行。版面模型会把居中
+        # 大字的章标题误判成 header（本书「参考书目」y=20.4% 页高、左右居中，
+        # 而真正的书眉都在 10~13%），照标签丢会把这个唯一的标题扔掉，
+        # 该章在成书里就凭空消失。位置证据优先于区域标签。
         if L.get("region") in DROP_REGIONS:
-            continue
+            if not (L.get("region") == "header" and not keep_nums
+                    and L["y0"] > max(band_top, 0.14) * H):
+                continue
         # 边缘竖排字（书脊）：细高且贴边
         if hpx > 2.0 * max(wpx, 1) and (L["x1"] < 0.16 * W or L["x0"] > 0.84 * W):
             continue
         # 边栏单字（书脊竖排书名逐字识别）：按**版心边界**判断，不用固定比例。
         # 固定 0.85W 会在书脊字刚好压线时漏网（本书 2169 vs 2176，差 7px）。
-        if elen(t) <= 2 and (L["x1"] < bl - 0.5 * bw or L["x0"] > br - 0.5 * bw):
+        # 但目录页上"1 位数页码"长得和边栏单字一模一样（本书页码「3」x0=1827
+        # 越过 br-0.5bw=1802），keep_nums 时不能删——删掉这一行，那条目录条目
+        # 就拿不到页码，正文匹配只能靠猜。
+        if (not keep_nums and elen(t) <= 2
+                and (L["x1"] < bl - 0.5 * bw or L["x0"] > br - 0.5 * bw)):
             continue
         # 页码：只在版心上下边缘处丢弃（目录页保留）
         if not keep_nums and PAGE_NO.match(t) and (L["y1"] < 0.12 * H or L["y0"] > 0.88 * H):
@@ -485,6 +607,7 @@ def heading_score(L, bw, bh):
 def parse_toc(pages, cleaned, bw, bh, toc_ids):
     """解析已判定的印刷目录页，得到条目与层级。"""
     entries = []
+    W = pages[0]["w"] if pages else 0   # 目录页为空时 _mk_entry 也要有页宽可用
     for p in pages:
         if p["idx"] not in toc_ids:
             continue
@@ -590,7 +713,13 @@ def _mk_entry(pend, page_no, W, toc_page):
 # 编号字符类里带上 `-—–iIl`：扫描件把「第一节」认成「第-节」是常事。
 RANKS = [
     (re.compile(r"^第\s*[零一二三四五六七八九十百千两0-9\-—–iIl]{1,3}\s*节"), 20),
-    (re.compile(r"^第\s*[零一二三四五六七八九十百千两0-9\-—–iIl]{1,3}\s*[讲章篇卷部编]"), 10),
+    # 「第X部/编/卷/篇」是比章更高的一层。它必须单独给一个名次，否则和
+    # 「第X章」共用名次 10，两者被压成同一级——本书「第一部分」与「第一章」
+    # 会被判成平级，16 条目录全变一级，章也全部挂到 part 下面看不出层次。
+    # 只在本书这类**真有分部**的书里生效：僧官制度史没有「第X部」，
+    # 名次表里少一档不影响它的 章/节/一、 三档映射。
+    (re.compile(r"^第\s*[零一二三四五六七八九十百千两0-9\-—–iIl]{1,3}\s*[部编卷篇]"), 5),
+    (re.compile(r"^第\s*[零一二三四五六七八九十百千两0-9\-—–iIl]{1,3}\s*[讲章]"), 10),
     # 无编号的独立标题（序言/绪论/后记/参考书目…）与章同级：
     # 少了这一档，旧书的「参考书目」会因为没有编号而按缩进降到二级。
     (L1_PAT, 10),
@@ -606,8 +735,12 @@ def _rank(t):
     return None
 
 
-def assign_levels(entries, W):
+def assign_levels(entries, W=None):
     """把目录条目映射成 1/2/3 级。
+
+    W（页宽）保留在签名里只是为了兼容旧调用，定层级并不需要它——信息全在标题
+    前缀和条目顺序里。早先 parse_toc 把 W 当循环变量用，一页目录都没有时这个
+    局部变量没被赋值，于是抛 UnboundLocalError；给个默认值兜住这类调用。
 
     不能只看前缀本身：`第X章` 和 `第X节` 都命中 L1_PAT，直接按 L1_PAT 判会把
     节也标成一级，整本书的层级被拍平成一个列表（实测新书 36 个节全部变成一级，
@@ -643,14 +776,49 @@ def assign_levels(entries, W):
 
 
 # ---------------------------------------------------------------- 正文匹配
-def match_entries(pages, cleaned, entries, toc_ids, bw, bh):
-    """顺序单调匹配：每条目录条目在正文中向后搜索最相似的行。"""
+def page_offset(pages):
+    """估计「PDF 页序 → 印刷页码」的整体偏移，返回 offset 或 None。
+
+    关系是 pdf_idx = printed + offset。这一本实测 297 页样本里 295 页吻合
+    （99.3%），比任何"标题相似度"都硬：目录条目本身就带页码，拿它换算
+    出来的位置直接就是章节起始页。
+
+    只认 region == "number" 的行——那是版面分析标注的页码区，而不是正文里
+    偶然出现的数字。样本少于 20 页时不返回（小书/版式特殊，宁可不猜），
+    且要求主偏移覆盖 ≥80% 的样本，避免把一本页码乱跳的书按错误偏移对齐。
+    """
+    from collections import Counter
+    pairs = []
+    for p in pages:
+        for L in p["lines"]:
+            if L.get("region") != "number":
+                continue
+            t = L["t"].strip()
+            if re.fullmatch(r"\d{1,4}", t):
+                pairs.append(p["idx"] - int(t))
+    if len(pairs) < 20:
+        return None
+    off, n = Counter(pairs).most_common(1)[0]
+    if n < 0.80 * len(pairs):
+        return None
+    return off
+
+
+def match_entries(pages, cleaned, entries, toc_ids, bw, bh, offset=None):
+    """顺序单调匹配：每条目录条目在正文中向后搜索最相似的行。
+
+    offset 给出时（见 page_offset），带印刷页码的条目先在"页码换算出来的那一页"
+    上找标题；找到就直接采信。这是必需的：本书每个部分扉页都把该部分的章名
+    重列一遍，纯文本匹配会把「第一章 驯顺的肉体」错配到扉页上，于是三章的
+    起始页全被算成同一页，正文被整段吞掉。
+    """
     stream = []  # (page_idx, line_idx)
     for p in pages:
         if p["idx"] in toc_ids:
             continue
         for j, L in enumerate(cleaned[p["idx"]]):
             stream.append((p["idx"], j))
+    pos_of = {pl: k for k, pl in enumerate(stream)}
 
     matched = []
     cursor = 0
@@ -660,8 +828,25 @@ def match_entries(pages, cleaned, entries, toc_ids, bw, bh):
             continue
         best = None
         best_score = 0.0
-        # 搜索窗口：从上次命中往后 900 行
-        for k in range(cursor, min(cursor + 900, len(stream))):
+        # ① 页码锚定：条目自带印刷页码时，换算出的那一页就是它的起始页。
+        #    这是本书唯一可靠的信号——每个部分扉页都把该部分的章名重列一遍，
+        #    纯文本搜索会让三章全撞到扉页上，正文被整段吞掉。
+        #    要求同页高相似（≥0.80）才采信，不像就退回常规搜索。
+        if offset is not None and e.get("page") is not None:
+            aim = e["page"] + offset
+            if 0 <= aim < len(pages):
+                for li, L in enumerate(cleaned.get(aim, [])):
+                    cand = norm(L["t"])
+                    if not cand or abs(len(cand) - len(tgt)) > 10:
+                        continue
+                    if SequenceMatcher(None, cand, tgt).ratio() >= 0.80:
+                        k = pos_of.get((aim, li))
+                        if k is not None:
+                            best, best_score = k, 2.0
+                        break
+        # ② 常规搜索：从上次命中往后 900 行（页码已经定住就不再搜）
+        rng = () if best is not None else range(cursor, min(cursor + 900, len(stream)))
+        for k in rng:
             pi, li = stream[k]
             L = cleaned[pi][li]
             cand = norm(L["t"])
@@ -1065,13 +1250,28 @@ def build(src=None, meta=None):
                                    band_top=band_top, band_bot=band_bot)
                for p in pages}
     entries = parse_toc(pages, cleaned, bw, bh, toc_ids)
-    stream, matched = match_entries(pages, cleaned, entries, toc_ids, bw, bh)
+    offset = page_offset(pages)
+    stream, matched = match_entries(pages, cleaned, entries, toc_ids, bw, bh, offset)
     start = 0
     if meta.get("drop_front", True) and matched and matched[0]["level"] == 1:
         start = matched[0]["pos"]
     # 脚注：抽区域 → 判断能否内联锚定 → 组装时替换成 [^id]
+    # 两条通道：圈号注走 plan_notes 的严格配对；星号注走 extract_star_notes
+    # 的"块数+句末"双校验。两条都产出同样结构的 notes/subs，可以合并。
     notes = extract_notes(pages)
     subs, orphan = plan_notes(notes, cleaned) if notes else ({}, {})
+    star_notes, star_subs = extract_star_notes(pages, cleaned, bw, bh)
+    if star_notes:
+        # 星号通道接管这些页。extract_notes 把同一页注区合成了**一整条**无注号
+        # 条目，留着会和星号切分出的注重复落盘（实测 83+75=158 条，同一条注
+        # 出现两遍）。这些页只保留星号版本。
+        for pi in list(star_notes):
+            notes.pop(pi, None)
+        for key in [k for k in subs if k[0] in star_notes]:
+            del subs[key]
+        notes.update(star_notes)
+        for key, v in star_subs.items():
+            subs.setdefault(key, []).extend(v)
     blocks = assemble(pages, cleaned, stream, matched, toc_ids, bw, bh, start,
                       notes=notes, subs=subs, orphan=orphan)
     md = to_markdown(blocks, meta)

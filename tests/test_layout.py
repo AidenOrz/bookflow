@@ -304,5 +304,149 @@ class TestCli(unittest.TestCase):
                              "报错时不应留下 book.md")
 
 
+class TestTocDetect(unittest.TestCase):
+    def _page(self, idx, tails, w=2083, h=3355):
+        """构造一页，行尾是数字（模拟页尾页码列）。"""
+        lines = []
+        for i, n in enumerate(tails):
+            y = 1400 + i * 80
+            lines.append((300, y, 800, y + 60, "某章某节"))
+            lines.append((1760, y, 1870, y + 60, str(n)))
+        return synth_page(idx, lines, w, h)
+
+    def test_single_page_toc_is_detected(self):
+        """只有一页目录的书：页码严格递增就是单页证据。
+
+        真实案例《规训与惩罚》——整本只有 1 页「目 录」，旧规则要求
+        "相邻页也是目录"，于是永远判不出来，目录解析跟着抛异常。
+        """
+        pages = [self._page(i, [1, 2, 3]) for i in range(3)]
+        pages.append(self._page(3, [3, 35, 81, 117, 153, 193, 219]))
+        toc = layout.detect_toc_pages(pages, 60)
+        self.assertIn(3, toc)
+
+    def test_copyright_page_not_toc(self):
+        """版权页也有 ≥6 个行尾数字，但顺序是乱的，不能判成目录。
+
+        误判的代价：该页会被整页跳过，正文静默消失。
+        """
+        pages = [self._page(i, [1, 2, 3]) for i in range(3)]
+        pages.append(self._page(3, [9, 7, 59, 1975, 10, 1, 12]))
+        self.assertNotIn(3, layout.detect_toc_pages(pages, 60))
+
+
+class TestPartRank(unittest.TestCase):
+    def test_part_outranks_chapter(self):
+        """「第X部分」必须比「第X章」高一级。
+
+        两者曾共用名次 10，被压成同一级，16 条目录全变一级。
+        """
+        self.assertLess(layout._rank("第一部分 酷刑"),
+                        layout._rank("第一章 犯人的肉体"))
+        self.assertLess(layout._rank("第二编 某某"),
+                        layout._rank("第二章 某某"))
+
+    def test_chapter_and_section_unchanged(self):
+        """没有分部的书（僧官制度史）三档映射必须保持不变。"""
+        r_ch = layout._rank("第二章 南朝的僧官制度")
+        r_sec = layout._rank("第一节 中央和地方僧官")
+        r_num = layout._rank("一、尼僧僧官")
+        self.assertLess(r_ch, r_sec)
+        self.assertLess(r_sec, r_num)
+
+
+class TestPageOffset(unittest.TestCase):
+    def _numbered(self, idx, printed, w=2083, h=3355):
+        p = synth_page(idx, [(300, 600, 800, 660, "正文一行")], w, h)
+        p["lines"].append({"x0": 155, "y0": 312, "x1": 230, "y1": 373,
+                           "t": str(printed), "s": 0.99, "region": "number"})
+        return p
+
+    def test_offset_is_learned(self):
+        """pdf_idx = printed + 5 时，offset 必须算成 5。"""
+        pages = [self._numbered(i, i - 5) for i in range(5, 40)]
+        self.assertEqual(layout.page_offset(pages), 5)
+
+    def test_offset_needs_enough_samples(self):
+        """样本太少时不敢猜，返回 None（小书宁可走常规匹配）。"""
+        pages = [self._numbered(i, i - 5) for i in range(5, 15)]
+        self.assertIsNone(layout.page_offset(pages))
+
+    def test_offset_rejects_scattered_pages(self):
+        """页码乱跳的书不能按错误偏移对齐。"""
+        pages = [self._numbered(i, (i * 7) % 23) for i in range(40)]
+        self.assertIsNone(layout.page_offset(pages))
+
+
+class TestStarNotes(unittest.TestCase):
+    def _page(self, idx, body_marks, notes, w=2083, h=3355):
+        lines = [(300, 600 + i * 80, 1750, 660 + i * 80,
+                  "行文内容%s继续" % mk)
+                 for i, mk in enumerate(body_marks)]
+        p = synth_page(idx, lines, w, h)
+        for i, (x0, t) in enumerate(notes):
+            p["lines"].append({"x0": x0, "y0": 2800 + i * 70, "x1": 1750,
+                               "y1": 2860 + i * 70, "t": t, "s": 0.99,
+                               "region": "footnote"})
+        return p
+
+    def test_star_notes_pair_when_counts_match(self):
+        """正文 1 个星号 + 注区 1 条 -> 内联成 [^fn] 弹窗脚注。"""
+        pages = [self._page(0, ["*"], [(400, "注释甲的内容足够长。")])]
+        cleaned = {0: [L for L in pages[0]["lines"]
+                       if L.get("region") != "footnote"]}
+        notes, subs = layout.extract_star_notes(pages, cleaned, 63.0, 62.6)
+        self.assertEqual(len(notes.get(0, [])), 1)
+        self.assertEqual(len(subs.get((0, 0), [])), 1)
+
+    def test_star_notes_skip_on_count_mismatch(self):
+        """正文 2 星号但注区只切出 1 块 -> 整页放弃，不能瞎配。"""
+        pages = [self._page(0, ["*", "**"], [(400, "只有一条注文内容。")])]
+        cleaned = {0: [L for L in pages[0]["lines"]
+                       if L.get("region") != "footnote"]}
+        notes, subs = layout.extract_star_notes(pages, cleaned, 63.0, 62.6)
+        self.assertEqual(notes, {})
+        self.assertEqual(subs, {})
+
+    def test_star_notes_skip_on_bad_boundary(self):
+        """块数对得上，但非末块不收句 -> 切错了边界，整页放弃。"""
+        pages = [self._page(0, ["*", "**"],
+                            [(400, "第一条注文没有结束"),
+                             (520, "第二条注文结束了。")])]
+        cleaned = {0: [L for L in pages[0]["lines"]
+                       if L.get("region") != "footnote"]}
+        notes, subs = layout.extract_star_notes(pages, cleaned, 63.0, 62.6)
+        self.assertEqual(notes, {})
+
+    def test_leading_star_ignored(self):
+        """行首星号是列表符号，不是注号。"""
+        pages = [self._page(0, ["*"], [(400, "注释甲的内容足够长。")])]
+        pages[0]["lines"][0]["t"] = "*行文内容继续"
+        cleaned = {0: [L for L in pages[0]["lines"]
+                       if L.get("region") != "footnote"]}
+        notes, subs = layout.extract_star_notes(pages, cleaned, 63.0, 62.6)
+        self.assertEqual(notes, {})
+
+
+class TestHeaderRescue(unittest.TestCase):
+    def test_title_below_band_survives_header_label(self):
+        """被标成 header、但位置远在页眉带以下的标题必须保留。
+
+        真实案例：「参考书目」被版面模型标成 header（y=20.4% 页高），
+        照标签丢会让这一章从成书里凭空消失。
+        """
+        p = synth_page(0, [(700, 600, 1300, 700, "参考书目")])
+        p["lines"][0]["region"] = "header"
+        out = layout.clean_page(p, 63.0, 62.6, set(), band_top=0.09)
+        self.assertEqual([L["t"] for L in out], ["参考书目"])
+
+    def test_real_running_head_still_dropped(self):
+        """真正的书眉（在页眉带内）仍然要丢。"""
+        p = synth_page(0, [(300, 312, 900, 373, "规训与惩罚")])
+        p["lines"][0]["region"] = "header"
+        out = layout.clean_page(p, 63.0, 62.6, set(), band_top=0.09)
+        self.assertEqual(out, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
