@@ -1,5 +1,9 @@
 """bookflow.audit — 找出"字数正常、置信度也不低，只有语义才知道错"的字。
 
+输出里带**PDF 页码**：人工校对必须能直接翻到原书那一页。只给 book.md 的字符
+位置没有意义——成书近两千个段落，逐段找等于重读一遍。页码来自 layout.py 的
+`page_map`（块级「md 偏移 → PDF 页」映射，写在 report.json 里）。
+
 前置环节能抓"漏字"，抓不了「进人/进入」「自已/自己」「异已/异己」这类替换型错误。
 这里用一条很硬的判据：**词表归属**。
 
@@ -73,11 +77,50 @@ def load_dict(path, max_len=4):
     return d
 
 
+def load_page_map(report_path):
+    """从 report.json 读出 [(md_offset, pdf_page)]；缺失时返回 None。
+
+    这份映射由 layout.to_markdown_with_pages() 产出，随 make_md.py 写进
+    report.json 的 layout.page_map。读不到就退化成旧行为（只给上下文），
+    不能让 audit 因为没有页码而整体失败。
+    """
+    if not report_path or not os.path.exists(report_path):
+        return None
+    try:
+        rep = jsonio.read(report_path)
+    except Exception:
+        return None
+    pm = ((rep or {}).get("layout") or {}).get("page_map")
+    if not pm:
+        return None
+    return [(int(o), int(p)) for o, p in pm]
+
+
+def page_of(page_map, offset):
+    """md 字符偏移 -> PDF 页码（1 基）。找不到返回 None。
+
+    page_map 按偏移升序，取最后一个起始偏移 <= offset 的块所在页。
+    """
+    if not page_map:
+        return None
+    lo, hi, best = 0, len(page_map) - 1, None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if page_map[mid][0] <= offset:
+            best = page_map[mid][1]
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--md", default="out/book.md")
     ap.add_argument("--out", default="out/audit.txt")
     ap.add_argument("--json", default="out/audit.json")
+    ap.add_argument("--report", default="",
+                    help="report.json 路径（提供 PDF 页码）；留空则同目录找 report.json")
     ap.add_argument("--min-alt", type=int, default=200, help="替换后词的词频下限")
     ap.add_argument("--top", type=int, default=200)
     ap.add_argument("--ratio", type=float, default=3.0,
@@ -89,6 +132,13 @@ def main():
     dic = load_dict(DICT_PATH)
     print("词表 %s：%d 个词" % (DICT_PATH, len(dic)))
     text = jsonio.read_text(a.md)
+    # 页码映射：没给 --report 就到 book.md 同目录找 report.json
+    rp = a.report or os.path.join(os.path.dirname(os.path.abspath(a.md)), "report.json")
+    page_map = load_page_map(rp)
+    if page_map:
+        print("页码映射 %s：%d 个块" % (rp, len(page_map)))
+    else:
+        print("页码映射缺失（%s），清单里将没有 PDF 页码" % rp)
 
     alt_of = defaultdict(set)
     for x, y in CONFUSE:
@@ -140,6 +190,7 @@ def main():
                     seen.add(key)
                     hits.append({
                         "pos": i, "len": n, "wrong": w, "right": cand, "freq": f,
+                        "page": page_of(page_map, i),
                         "ctx": text[max(0, i - 20):i + n + 18].replace("\n", " "),
                     })
                     break
@@ -147,12 +198,19 @@ def main():
                     continue
                 break
 
-    hits.sort(key=lambda h: -h["freq"])
+    # 按页码排序：校对的人是**顺着 PDF 翻**的，按词频排等于来回跳页。
+    # 没有页码的排最后（映射缺失时退化成旧行为）。
+    hits.sort(key=lambda h: (h["page"] is None, h["page"] or 0, h["pos"]))
+    has_pg = any(h["page"] for h in hits)
     lines = ["可疑字级错误 %d 处（判据：原词不在词表，形近字替换后成为词频≥%d 的常用词）"
-             % (len(hits), a.min_alt), ""]
+             % (len(hits), a.min_alt)]
+    if has_pg:
+        lines.append("按 PDF 页码排序，可直接翻原书核对。")
+    lines.append("")
     for h in hits[:a.top]:
-        lines.append("  %-46s  %s → %s   (词频 %d)" %
-                     (h["ctx"], h["wrong"], h["right"], h["freq"]))
+        pg = ("PDF p%-4d" % h["page"]) if h["page"] else "PDF ??? "
+        lines.append("  %s  %-46s  %s → %s   (词频 %d)" %
+                     (pg, h["ctx"], h["wrong"], h["right"], h["freq"]))
     txt = "\n".join(lines)
     print(txt[:4000])
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)

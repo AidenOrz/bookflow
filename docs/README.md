@@ -42,7 +42,7 @@ $py = "python"
 | repair | `bookflow.py repair` | 整页识别退化行（整行丢字）逐行重识别 |
 | layout | `bookflow.py layout` | **可选增强**：PP-DocLayoutV3 标出脚注/页眉/页码区域 |
 | md | `bookflow.py md` | 版面清理 → 同行合并 → 目录解析 → 顺序匹配 → 合段 → 形近字修正 |
-| audit | `bookflow.py audit` | 词表+形近字置换找替换型错字，出清单与对照图（**不自动改**） |
+| audit | `bookflow.py audit` | 词表+形近字置换找替换型错字，**按 PDF 页码排序**出清单与对照图（不自动改） |
 | epub | `bookflow.py epub` | EPUB3 + 三级目录 + **弹窗脚注** + 自校验 + 封面（`epub3.py`） |
 | prune | `bookflow.py prune` | 删除可重生成的中间产物 |
 
@@ -164,15 +164,20 @@ EPUB3 有专门的脚注语义，主流阅读器（Apple Books / Thorium / Kobo�
 
 **用这些清单做二次核对，而不是通读全书。**
 
+`audit.txt` 的每处疑点都带 **PDF 页码**，按页码排序——校对的人顺着 PDF 翻一遍即可，
+不用在成书里逐段找。页码来自 `layout.py` 的 `page_map`（块级「md 偏移 → PDF 页」），
+由 `to_markdown_with_pages()` 产出、随 `report.json` 落盘，`audit.py` 二分查找换算。
+
 ## 测试
 
 ~~~powershell
 python -m unittest discover -s tests -v
 ~~~
 
-30 个用例，全部来自真实踩过的坑（正文首行被当书眉删、标题残片漏消费、重复页、
+35 个用例，全部来自真实踩过的坑（正文首行被当书眉删、标题残片漏消费、重复页、
 空输入静默成功、fix 规则误伤、脚注误连、EPUB 断链、单页目录判不出、
-「第X部分」被压平到与「第X章」同级、章节撞到分部扉页、星号注错配等）。
+「第X部分」被压平到与「第X章」同级、章节撞到分部扉页、星号注错配、
+校对页码因漏算换行符整体偏移等）。
 
 ## 已知限制
 

@@ -1001,6 +1001,8 @@ def assemble(pages, cleaned, stream, matched, toc_ids, bw, bh, start=0,
 
     blocks = []
     buf = []                     # 段落文本片段
+    buf_page = []                # [(段内偏移, 页idx)]，flush 时随段落块落盘
+    buf_len = [0]                # 段内已累积字符数（避免每次 sum(buf) 变 O(n^2)）
     prev = None
     last_head = None
     note_defs = {it["id"]: it["text"] for items in (notes or {}).values() for it in items}
@@ -1047,6 +1049,11 @@ def assemble(pages, cleaned, stream, matched, toc_ids, bw, bh, start=0,
                 continue      # 计划内联，最后按 `used` 复核（见 assemble 收尾）
             by_chapter.setdefault(owner_of.get(it["id"], -1), []).append(it)
 
+    note_page = {}               # 注 id -> 它所在的 PDF 页码（1 基）
+    for pi, items in (notes or {}).items():
+        for it in items:
+            note_page[it["id"]] = pi + 1
+
     def emit_notes(upto=None):
         """落盘本章脚注。
 
@@ -1066,7 +1073,10 @@ def assemble(pages, cleaned, stream, matched, toc_ids, bw, bh, start=0,
             rest.extend(by_chapter.pop(ch))
         if rest:
             emitted.update(it["id"] for it in rest)
-            blocks.append(("pn", [(it.get("mark") or "", it["text"]) for it in rest]))
+            # 带上第一条注所在页：pn 块里的注来自不同页，取首条即可代表
+            # 这一批的起始位置（校对清单只需要能翻到附近）。
+            blocks.append(("pn", [(it.get("mark") or "", it["text"]) for it in rest],
+                           [note_page.get(it["id"]) for it in rest]))
     # 版心常态左边界。
     # 不能用众数：页内有长引文块时，众数会落在引文缩进上（实测偏移可达 130px
     # ≈ 2 字宽），于是整页的「顶格行」都算出负缩进，该页再也断不出段。
@@ -1078,8 +1088,16 @@ def assemble(pages, cleaned, stream, matched, toc_ids, bw, bh, start=0,
 
     def flush():
         if buf:
-            blocks.append(("p", "".join(buf)))
+            # 带上**行级**页码：[(段内字符偏移, PDF 页码), ...]。
+            # 校对清单要能让人直接翻到原书那一页，只记"段落首页"不够——
+            # 一段常跨 2~3 页，命中点落在段中时首页会差 1~2 页（实测偏差
+            # 最大到 3 页）。逐行记偏移，命中在哪一行就给哪一行所在的页。
+            # 必须传副本：buf_page.clear() 在下一次 flush 前会把已落盘的块改空
+            # （实测 page_map 只剩标题那 16 条，段落一条都没进来）。
+            blocks.append(("p", "".join(buf), list(buf_page)))
             buf.clear()
+            buf_page.clear()
+            buf_len[0] = 0
 
     for (pi, li) in stream[start:]:
         L = cleaned[pi][li]
@@ -1096,7 +1114,7 @@ def assemble(pages, cleaned, stream, matched, toc_ids, bw, bh, start=0,
             if mm:
                 title = mm.group(1) + "　" + title[mm.end():]
             if title.strip():
-                blocks.append(("h", m["level"], title))
+                blocks.append(("h", m["level"], title, pi + 1))
             prev = None
             continue
         if pi in toc_ids or (pi, li) in consumed:
@@ -1130,6 +1148,8 @@ def assemble(pages, cleaned, stream, matched, toc_ids, bw, bh, start=0,
                 if nid not in used:
                     used.add(nid)
                     pend.append(nid)
+        buf_page.append((buf_len[0], pi))
+        buf_len[0] += len(t)
         buf.append(t)
         prev = (pi, L)
     flush()
@@ -1138,7 +1158,8 @@ def assemble(pages, cleaned, stream, matched, toc_ids, bw, bh, start=0,
     stray = [it for items in (notes or {}).values() for it in items
              if it["id"] not in used and it["id"] not in emitted]
     if stray:
-        blocks.append(("pn", [(it.get("mark") or "", it["text"]) for it in stray]))
+        blocks.append(("pn", [(it.get("mark") or "", it["text"]) for it in stray],
+                       [note_page.get(it["id"]) for it in stray]))
     return blocks
 
 
@@ -1149,36 +1170,88 @@ def to_markdown(blocks, meta):
     EPUB 侧由 epub3.py 渲染成 <a epub:type="noteref"> + <aside epub:type="footnote">，
     这是 EPUB3 标准的弹窗脚注结构，阅读器据此弹出注文并可跳回原处。
     """
+    text, _ = to_markdown_with_pages(blocks, meta)
+    return text
+
+
+def to_markdown_with_pages(blocks, meta):
+    """同 to_markdown，额外返回「md 字符偏移 → PDF 页码」映射。
+
+    校对清单必须能让人**直接翻到原书那一页**：只给 book.md 里的字符位置，
+    人工复核时无从下手（成书 1957 个段落，逐段找等于重读一遍）。
+    块里带的页码是 assemble() 记下的（1 基，即 PDF 第几页），这里记下每个块
+    在 md 里的起始偏移，audit 就能把命中位置换算成页码。
+
+    返回 (md_text, page_map)，page_map 为 [(char_offset, page_no), ...] 升序。
+    """
     out = []
+    page_map = []
+    pos = [0]                 # 当前已输出字符数（out 拼接后的长度）
+
+    def emit(s):
+        # join("\n") 会在相邻片段之间插入分隔符，pos 必须把它算进去。
+        # 漏算时偏移会随块数单调偏小（1100 个块 × 每个两次 emit ≈ 2200 个分隔符），
+        # 最终页码整体偏 3 页——这是实测「土气」记成 p360、实为 p357 的原因。
+        if out:
+            pos[0] += 1
+        out.append(s)
+        pos[0] += len(s)
     # 书名走 EPUB 元数据，不在正文里再放一个 h1，否则章节切分会把整本书当成一章
     for b in blocks:
         if b[0] == "h":
-            out.append("#" * min(b[1], 6) + " " + b[2])
-            out.append("")
+            pg = b[3] if len(b) > 3 else None
+            if pg:
+                page_map.append((pos[0], pg))
+            emit("#" * min(b[1], 6) + " " + b[2])
+            emit("")
         elif b[0] == "def":
             # 定义必须自成一段（前后各一个空行），否则会被并进上一段正文
             txt = (b[2] or "").strip().replace("\n", " ")
             if not txt:
                 continue
-            out.append("[^%s]: %s" % (b[1], txt))
-            out.append("")
+            emit("[^%s]: %s" % (b[1], txt))
+            emit("")
         elif b[0] == "pn":
             # 没能锚定的注：排成引用块（视觉上区隔于正文），形如「① 《晋书》卷九五…」
-            for mark, txt in b[1]:
+            # 每条注各自带来源页（b[2] 是 [(mark, text, page)] 或旧式二元组），
+            # 逐条映射才能保证「自白」这种落在第 2 条注里的词被指到正确页。
+            pages_of = b[2] if len(b) > 2 else None
+            for j, item in enumerate(b[1]):
+                mark, txt = item[0], item[1]
                 line = (mark + " " + (txt or "")).strip()
-                if line:
-                    out.append("> " + line)
-                    out.append("")
+                if not line:
+                    continue
+                if pages_of and j < len(pages_of) and pages_of[j]:
+                    page_map.append((pos[0], pages_of[j]))
+                emit("> " + line)
+                emit("")
         else:
-            txt = b[1].strip()
+            raw = b[1]
+            txt = raw.strip()
             if not re.search(r"[0-9A-Za-z\u4e00-\u9fff]", txt):
                 continue          # 纯符号行（OCR 噪声）
             if len(txt) <= 1:
                 continue          # 单字符行一定是版边残留
+            base = pos[0]
+            # strip() 会把开头空白吃掉，段内偏移是按**未 strip** 的串记的，
+            # 必须先换算掉这段前缀，否则整段的页码会整体偏几行（实测偏 4 页）。
+            lead = len(raw) - len(raw.lstrip())
             txt = re.sub(r"^(#+)", r"\\\1", txt)   # 行首 # 会被当成标题，转义并留待人工核对
-            out.append(txt)
-            out.append("")
-    return "\n".join(out)
+            # 段落块带行级 [(段内偏移, 页idx)]，逐行并入 page_map
+            lines_pg = b[2] if len(b) > 2 else None
+            if isinstance(lines_pg, list):
+                for off, pi in lines_pg:
+                    rel = off - lead
+                    if rel < 0:
+                        rel = 0
+                    page_map.append((base + rel, pi + 1))
+            emit(txt)
+            emit("")
+    # page_map 必须升序：audit.page_of() 用二分查找。标题块与段落块的偏移
+    # 是各自追加的，跨块时天然有序；但段落内的 (off, page) 是本段偏移，
+    # 加上 base 后仍升序。这里再排一次兜底，成本可忽略（千级）。
+    page_map.sort(key=lambda x: x[0])
+    return "\n".join(out), page_map
 
 
 BACK_COVER = re.compile(r"ISBN|图书在版编目|定价|责任编辑")
@@ -1274,7 +1347,7 @@ def build(src=None, meta=None):
             subs.setdefault(key, []).extend(v)
     blocks = assemble(pages, cleaned, stream, matched, toc_ids, bw, bh, start,
                       notes=notes, subs=subs, orphan=orphan)
-    md = to_markdown(blocks, meta)
+    md, page_map = to_markdown_with_pages(blocks, meta)
     n_notes = sum(len(v) for v in notes.values())
     n_linked = sum(len(v) for v in subs.values())
     report = {
@@ -1289,6 +1362,9 @@ def build(src=None, meta=None):
         "entries": entries,
         "matched_detail": matched,
         "chars": len(md),
+        # md 字符偏移 → PDF 页码（1 基）。audit.py 用它把命中的字换算成
+        # 「PDF 第几页」，校对的人才能直接翻原书。见 to_markdown_with_pages()。
+        "page_map": page_map,
         "notes": {"total": n_notes, "linked": n_linked,
                   "orphan": n_notes - n_linked,
                   "pages": len(notes)},

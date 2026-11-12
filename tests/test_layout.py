@@ -448,5 +448,55 @@ class TestHeaderRescue(unittest.TestCase):
         self.assertEqual(out, [])
 
 
+class TestPageMap(unittest.TestCase):
+    def test_page_map_offsets_account_for_join_separators(self):
+        """md 偏移必须算上 join 插入的分隔符。
+
+        漏算时偏移随块数单调偏小（实测 1100 个块 ≈ 2200 个分隔符），
+        最终页码整体偏 3 页——「土气」记成 p360、实为 p357。
+        """
+        blocks = [
+            ("p", "甲" * 4, [(0, 4)]),
+            ("p", "乙" * 4, [(0, 5)]),
+        ]
+        md, pm = layout.to_markdown_with_pages(blocks, {"title": "t"})
+        # 每块 emit(txt) + emit("")，join 再插一个 \n：
+        #   块1 "甲甲甲甲" 占 [0,4)，emit("") 再加 1 个分隔 -> 块2 从 5 开始
+        self.assertEqual(md, "甲甲甲甲\n\n乙乙乙乙\n")
+        self.assertEqual(pm[0][0], 0)
+        self.assertEqual(pm[1][0], 5, "第二块起点必须算上分隔符")
+        self.assertEqual(pm[0][1], 5)          # 页 idx 4 -> 页码 5
+        self.assertEqual(pm[1][1], 6)          # 页 idx 5 -> 页码 6
+
+    def test_page_number_is_one_based(self):
+        """块里存的是 0 基页 idx，输出必须 +1（人翻书从 1 开始）。"""
+        blocks = [("p", "正文内容", [(0, 0)])]
+        _, pm = layout.to_markdown_with_pages(blocks, {"title": "t"})
+        self.assertEqual(pm[0][1], 1)
+
+    def test_page_map_is_sorted(self):
+        """audit.page_of 用二分查找，必须升序。"""
+        blocks = [("p", "甲" * 5, [(0, 3), (2, 2)]), ("h", 1, "标题", 9)]
+        _, pm = layout.to_markdown_with_pages(blocks, {"title": "t"})
+        self.assertEqual(pm, sorted(pm, key=lambda x: x[0]))
+
+
+class TestAuditPageLookup(unittest.TestCase):
+    def test_page_of_picks_covering_block(self):
+        """偏移落在哪个块就取哪块的页。"""
+        import audit
+        pm = [(0, 10), (100, 11), (200, 12)]
+        self.assertEqual(audit.page_of(pm, 0), 10)
+        self.assertEqual(audit.page_of(pm, 99), 10)
+        self.assertEqual(audit.page_of(pm, 100), 11)
+        self.assertEqual(audit.page_of(pm, 250), 12)
+
+    def test_page_of_without_map(self):
+        """没有页码映射时返回 None，不能崩。"""
+        import audit
+        self.assertIsNone(audit.page_of(None, 5))
+        self.assertIsNone(audit.page_of([], 5))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

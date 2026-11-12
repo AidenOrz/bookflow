@@ -152,7 +152,8 @@ def stage_audit(a):
     sh([PY, os.path.join(HERE, "audit.py"),
         "--md", os.path.join(out, "book.md"),
         "--out", os.path.join(out, "audit.txt"),
-        "--json", os.path.join(out, "audit.json")])
+        "--json", os.path.join(out, "audit.json"),
+        "--report", os.path.join(out, "report.json")])
     js = os.path.join(out, "audit.json")
     if os.path.exists(js) and os.path.getsize(js) > 2:
         sh([PY, os.path.join(HERE, "make_review.py"),
