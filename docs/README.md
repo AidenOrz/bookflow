@@ -45,9 +45,22 @@ $py = "python"
 | audit | `bookflow.py audit` | 词表+形近字置换找替换型错字，**按 PDF 页码排序**出清单与对照图（不自动改） |
 | epub | `bookflow.py epub` | EPUB3 + 三级目录 + **弹窗脚注** + 自校验 + 封面（`epub3.py`） |
 | prune | `bookflow.py prune` | 删除可重生成的中间产物 |
+| disagree | `bookflow.py disagree --ocr-alt ocr_alt` | 双模型交叉比对，产出候选清单。**不在 `all` 里**：需要第二版 OCR |
+| decisions | `bookflow.py decisions --from disagree` | 把各路候选（disagree/audit/旧队列）归一成 `out/decisions.json` |
+
+裁决闭环（人工/VLM 裁决后回填）：
+
+~~~powershell
+& $py bookflow.py disagree --work ./run1 --ocr-alt ocr_alt   # 产出 out/disagree.json
+& $py bookflow.py decisions --work ./run1 --from disagree      # 归一成 out/decisions.json
+# ... 编辑 decisions.json 的 verdict（A 保留 / B 采用 B / C 用 replacement / ? 待定）...
+& $py apply_decisions.py --work ./run1 --decisions out/decisions.json            # 默认 dry-run
+& $py apply_decisions.py --work ./run1 --decisions out/decisions.json --apply    # 真正落盘
+~~~
 
 常用参数：`--dpi 300`、`--procs 5`、`--device auto|cpu|dml|cuda`、`--model small|medium|server`、
-`--ocr-src`（指定 OCR 结果目录）、`--force`（重跑已有阶段）、`--no-layout`（跳过版面分析）。
+`--ocr-src`（指定 OCR 结果目录）、`--force`（重跑已有阶段）、`--no-layout`（跳过版面分析）、
+`--ocr-alt`（第二版 OCR 目录）、`--conservative-fix`（形近字一律只出候选、正文不动）。
 
 ## 实测规模
 
@@ -174,7 +187,7 @@ EPUB3 有专门的脚注语义，主流阅读器（Apple Books / Thorium / Kobo�
 python -m unittest discover -s tests -v
 ~~~
 
-35 个用例，全部来自真实踩过的坑（正文首行被当书眉删、标题残片漏消费、重复页、
+81 个用例（test_layout 37 + test_epub3 11 + test_decisions 32 + 1），全部来自真实踩过的坑（正文首行被当书眉删、标题残片漏消费、重复页、
 空输入静默成功、fix 规则误伤、脚注误连、EPUB 断链、单页目录判不出、
 「第X部分」被压平到与「第X章」同级、章节撞到分部扉页、星号注错配、
 校对页码因漏算换行符整体偏移等）。

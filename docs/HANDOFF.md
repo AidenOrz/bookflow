@@ -1,8 +1,59 @@
 # HANDOFF — 交接现状
 
-更新时间：2026-11-12
+更新时间：2026-11-13
 
-## 最近一轮：《规训与惩罚》验证暴露的 6 个缺陷
+## 最近一轮：按 IMPROVEMENT-PLAN 落地 P0 + P1（10 项）
+
+以 [IMPROVEMENT-PLAN.md](IMPROVEMENT-PLAN.md) 为输入，完成 P0 全部 5 项与 P1 全部 5 项。
+计划本身是对一份外部审阅意见**逐条核实**后重排的产物，其中 2 条建议被实测证伪
+（跨页缩进优先、阈值外部化），详见该文 §5.1 / §5.3。
+
+### P0（止血）
+
+| # | 问题 | 修法 | 验证 |
+|---|---|---|---|
+| P0-1 | **fix.py 已把成书 3 处正确原文改错**：「引人人胜→引入人胜」「税收人说→税收入说」「不引人怀疑→不引入怀疑」，均已落盘在规训成书 | 规则分两级：AUTO_RULES（整词级，错写法本身不是词）+ CAND_RULES（单字级，带排除表）。默认两级都落笔但**先补掉排除表的已知漏洞**（新增「引人人胜」对子、「引人」排除表加「人/怀疑」、「收人」排除表加「说」）；--conservative-fix 可退回「单字级只出候选、正文不动」 | 规训重跑后三个错词均为 0；相对旧成书**只差 3 行，3 行全是修复** |
+| P0-2 | ocr_layout 静默反压 ocr_merged；stage_layout 读自己上一次输出 | ocr_dir() 增加 mtime 新鲜度比较并告警；stage_layout 源排除 ocr_layout 自身；失败时列出每个候选目录的 [缺失]/[空]/[N json] | 造旧 mtime → 打印「ocr_layout 比 ocr_merged 旧」；layout 源自动改用 ocr_merged |
+| P0-3 | check_env 漏检 rapid_layout，缺依赖时抛内部 traceback；md 阶段被误拦 | 改 BASE_PKGS + STAGE_PKGS 按阶段表；新增 check_dict()（jieba）与 check_pdftoppm() | anaconda 下 layout 得到人话提示（rc=1、无 Traceback）；md 不再被误拦（rc=0） |
+| P0-4 | 无目录页时静默产出无章节结构的书，rc=0 | layout.build() 在 entries==[] 时打醒目告警并写入 report.json 的 toc_warning | 合成无目录书 → 告警 3 行 + toc_warning 字段存在 |
+| P0-5 | --author/--publisher 在 md 阶段被丢弃 | make_md 传全三参数并把 book{title,author,publisher} 写进 report.json；stage_epub 缺参数时回落到它 | epub 不传 author/publisher 仍产出正确 dc:creator/dc:publisher |
+
+### P1（结构）
+
+| # | 事项 | 结果 |
+|---|---|---|
+| P1-1 | elen 统一 | repair.py / disagree.py 删本地副本，改 from layout import elen。实测统一后 repair 可疑行 49/33/15（唯一翻转在目录页、被 assemble 跳过），对成书零影响 |
+| P1-2 | epub3 属性转义 + validate 扩展 + 独立测试 | 新增 esc_attr()，属性位（fnref href/id、img src、封面 alt）全部转义；validate() 补反向 fnref 配对、id 唯一、aside 注文非空、nav/ncx 锚点、img src 存在性。新建 tests/test_epub3.py 11 例 |
+| P1-3 | apply_decisions 配置化 | 读 out/decisions.json，key=page@y0 稳定主键取代列表下标，verdict=C 支持整行覆盖（修掉 #3/#18 多差异段静默丢失），**默认 dry-run**，备份改时间戳目录只含本次改的页，三态判定（apply/already/missing）实现幂等 |
+| P1-4 | disagree 接入 CLI | 新增 disagree 子命令 + --ocr-alt。**刻意不进 all**：需要第二版 OCR、带 --apply 会改 md 输入源、需 jieba。all 末尾检出 ocr_alt 时给提示 |
+| P1-5 | decisions.py 适配层 | from_disagree/from_audit/from_queue/merge/load_any，把两套互不兼容的候选格式统一成 decisions.json；定位不到的 hit 保留为 ?+L3 不丢证据 |
+
+### 本轮数字
+
+| 项 | 值 |
+|---|---|
+| 测试 | **81/81 通过**（原 35 → layout 37 + epub3 11 + decisions 32 + 1） |
+| 黑格尔 | 264,439 字符 / 233,812 汉字 / 44-44 目录 / EPUB 754.7 KB / validate 0 |
+| 规训 | 250,812 字符 / 195,751 汉字 / 16-16 目录 / 95 注（75 弹窗 + 20 页尾）/ EPUB 473.2 KB / validate 0 |
+| 僧官 | 200,230 字符 / 163,090 汉字 / 103-103 目录 / 453 注（165 弹窗 + 288 页尾）/ EPUB 557.1 KB / validate 0 |
+| 三本书可复现 | 重跑 make_md.py 与现存 book.md **逐字节一致** |
+
+### 清除的过时产物
+
+out/book_before_fix.md、out/book_before_repair.md（旧 fix/repair 前快照，逻辑已换）、
+out/review_ai.png（一次性人工裁决图，结论已进 decisions.json）、
+out/review_queue.json（一次性队列，已由 out/decisions.json 取代）。
+out/decisions.json 现为根目录那本书的正式裁决表（--export-legacy 从旧硬编码表迁移，20 条已逐条核对等价）。
+
+### 下一步
+
+1. **P2 未动**，优先级见 [IMPROVEMENT-PLAN.md](IMPROVEMENT-PLAN.md) §6：tools/bench.py（最高）→ 脚注 a′/c2 → logging 12 处 → 阈值常量集中。
+2. out/report.json 现已是新版（含 page_map），旧书 audit 页码链路已恢复；建议顺手重跑一次 bookflow.py audit --work . 让 audit.json 也带上 PDF 页码。
+3. --apply 会回写 decisions.json 的 status（幂等实现方式），CI 里复用同一份文件时要知道它有状态。
+
+---
+
+## 更早一轮：《规训与惩罚》验证暴露的 6 个缺陷
 
 用一本**排版结构完全不同**的 383 页扫描书（2012 三联修订译本，`Pdg2Pic` 制作，
 无文本层，每个部分有扉页重列章名，脚注用星号 `*` 而非圈号）做端到端验证。
@@ -68,7 +119,7 @@
   纯增量设计：没有 `region` 字段的老 JSON 行为完全不变。
 - **`--ocr-src`** 显式指定 OCR 来源；**`--no-layout`** 跳过版面分析。
 - **`prune` 阶段**：删可重生成的中间产物（新书 `pages/` 约 520 MB）。
-- **测试套件** `tests/test_layout.py`：17 个用例，全部来自真实踩坑。
+- **测试套件** `tests/test_layout.py`：全部来自真实踩坑（本轮已扩到 81 个用例，见文首）。
 - **`jsonio.py`**、**`requirements.txt`**、**`.gitignore`**。
 - **文档迁移到 `docs/`**：architecture / README / HANDOFF / MEMORY。
 - **弹窗脚注**（本轮）：`extract_notes`/`plan_notes`/`epub3.py`/`assets/style.css`，
