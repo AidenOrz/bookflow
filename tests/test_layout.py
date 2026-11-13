@@ -6,7 +6,7 @@
 - test_title_residue_keeps_body：收紧判据后，正文末尾的「的。」不能被当成残片
 - test_dup_pages_removed：新书源 PDF 末尾 19 页重复，去重后不能成段重复
 - test_empty_src_exits：空输入必须报错，不能静默产出 0 字节成书
-- test_fix_rules：fix.py 的 29 条正负例
+- test_fix_rules：fix.py 的两级规则（整词级自动改 / 单字级带排除表）
 
 运行：python -m unittest discover -s tests -v
 """
@@ -234,47 +234,96 @@ class TestEpubNotes(unittest.TestCase):
                 self.assertEqual(z.namelist()[0], "mimetype")
 
     def test_validate_catches_dangling_ref(self):
-        """validate() 必须能发现"引用存在、注文缺失"这种断链。"""
+        """validate() 必须能发现"引用存在、注文缺失"这种断链。
+
+        旧版这里断言 validate==0——那正是被漏检的缺陷本身（引用无定义时
+        aside 注文为空，阅读器弹出一个空浮层）。现在 validate 必须报错。
+        """
         import epub3
         with tempfile.TemporaryDirectory() as d:
             out = os.path.join(d, "t.epub")
-            # 只有引用没有定义 → epub3 仍会渲染 aside（内容为空），但引用编号存在
             epub3.build("# 章\n\n正文[^nope]。\n", out, title="t")
-            # 这里只断言不会抛异常且结构自洽：缺定义时 aside 仍成对出现
-            self.assertIn(epub3.validate(out), (0,))
+            self.assertGreater(epub3.validate(out), 0,
+                               "引用无定义必须被 validate 检出，不能静默放过")
 
 
 class TestFix(unittest.TestCase):
-    CASES = [
+    """fix.py 分两级：整词级自动改，单字级只出候选。
+
+    分级理由（实测）：单字级「引人/收人」的排除表是开放集，堵不住「引人人胜」
+    「税收人说」「不引人怀疑」——这三处曾在《规训与惩罚》成书里被改坏并落盘。
+    """
+
+    # 自动组：错写法本身不是中文词，改是安全的
+    AUTO_CASES = [
+        ("人门课程", "入门课程"),
+        ("异已", "异己"),
+        ("陶治情操", "陶冶情操"),
+        ("推祟", "推崇"),
+        ("自已", "自己"),
+        ("时侯", "时候"),
+        # 「引人人胜」只有一个正确写法；必须先于「引人→引入」候选生效，
+        # 否则会被建议改成更不存在的「引入人胜」。
+        ("这本引人人胜的小册子", "这本引人入胜的小册子"),
+    ]
+
+    # 非自动组：只出候选，正文必须原样不动
+    KEEP_CASES = [
         ("辨证论治是中医的核心", "辨证论治是中医的核心"),
         ("射人先射马，擒贼先擒王", "射人先射马，擒贼先擒王"),
         ("中国人口处于世界首位", "中国人口处于世界首位"),
-        ("你在人口处等我", "你在入口处等我"),
         ("这一幕引人发笑", "这一幕引人发笑"),
         ("成绩引人侧目", "成绩引人侧目"),
-        ("他引人了新方法", "他引入了新方法"),
+        ("他引人了新方法", "他引人了新方法"),
         ("他自己经常承认", "他自己经常承认"),
-        ("他己经被选上了", "他已经被选上了"),
+        ("他己经被选上了", "他己经被选上了"),
         ("知己经常来看他", "知己经常来看他"),
         ("陷人于不义的圈套", "陷人于不义的圈套"),
-        ("陷人错误的深渊", "陷入错误的深渊"),
         ("收人钱财替人消灾", "收人钱财替人消灾"),
-        ("收人很高", "收入很高"),
-        ("异已", "异己"),
-        ("陶治情操", "陶冶情操"),
-        ("人门课程", "入门课程"),
-        ("深人研究", "深入研究"),
         ("容纳人情", "容纳人情"),
+        ("不引人怀疑", "不引人怀疑"),
+        ("税收人说", "税收人说"),
     ]
 
-    def test_fix_rules(self):
-        for src, want in self.CASES:
+    def test_auto_rules_apply(self):
+        for src, want in self.AUTO_CASES:
             with self.subTest(src=src):
                 out, _, _ = fix.apply(src, verbose=False)
                 self.assertEqual(out, want)
 
+    def test_conservative_never_touches_text(self):
+        """conservative=True 时正文必须原样返回——遇到没见过的排版靠这个兜底。"""
+        for src, want in self.KEEP_CASES:
+            with self.subTest(src=src):
+                out, _, _ = fix.apply(src, verbose=False, conservative=True)
+                self.assertEqual(out, want)
+
+    def test_known_bad_exclusions_are_fixed_by_default(self):
+        """默认模式下，实测踩过的三处误改必须被修好（不是留着当候选）。"""
+        self.assertEqual(fix.apply("那本引人人胜的小册子", verbose=False)[0],
+                         "那本引人入胜的小册子")
+        # 「不引人怀疑」「税收人说」默认不改（它们在候选组里、排除表已能挡住），
+        # 关键是**不能**被改成「不引入怀疑」「税收入说」。
+        self.assertEqual(fix.apply("不引人怀疑", verbose=False)[0], "不引人怀疑")
+        self.assertEqual(fix.apply("税收人说", verbose=False)[0], "税收人说")
+
+    def test_candidates_survive_as_detail(self):
+        """无论改不改，每一处命中都要留痕，供事后核对（suggest 说明会变成什么）。"""
+        _, _, det = fix.apply("他引人了新方法", verbose=False, conservative=True)
+        cand = fix.candidates(det)
+        self.assertEqual(len(cand), 1)
+        self.assertEqual(cand[0]["rule"], "引人→引入")
+        self.assertIn("引入", cand[0]["suggest"])
+        self.assertEqual(fix.auto_detail(det), [], "保守模式不该有 fix 条目")
+
+        # 默认模式下它被真正改掉，明细里 action 变 fix，但 comment 仍保留建议
+        out, stat, det2 = fix.apply("他引人了新方法", verbose=False)
+        self.assertEqual(out, "他引入了新方法")
+        self.assertEqual(stat.get("引人→引入"), 1)
+        self.assertEqual(len(fix.auto_detail(det2)), 1)
+
     def test_fix_counts_net_changes(self):
-        """「己经→已经」这类会自相抵消的规则不能计入统计。"""
+        """「己经→已经」降级为候选后，统计里不能再出现净改动为 0 的条目。"""
         _, stat, _ = fix.apply("他自己经常承认", verbose=False)
         self.assertEqual(sum(stat.values()), 0,
                          "没有净改动就不该记任何修正")
