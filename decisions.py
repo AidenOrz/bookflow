@@ -183,8 +183,13 @@ def page_name(page):
     return page
 
 
-def _page_path(ocr_dir, page):
-    """页名/页码 -> OCR 行级 JSON 路径。兼容 p-015.png.json / p-15.png.json / p-00015.png.json。"""
+def page_path(ocr_dir, page):
+    """页名/页码 -> OCR 行级 JSON 路径。兼容 p-015.png.json / p-15.png.json / p-00015.png.json。
+
+    公开函数：`apply_decisions.py` 回填时必须用同一套补零容错——它原先直接拼
+    `page + ".json"`，遇到 4 位补零或没补零的页文件一律判 missing，而裁决表本身
+    是靠这里的兼容逻辑生成的，两边口径不一致就会「能生成、不能回填」。
+    """
     if page is None or not ocr_dir:
         return None
     pn = page_name(page)
@@ -204,9 +209,13 @@ def _page_path(ocr_dir, page):
     return None
 
 
+# 旧名兼容：外部脚本/旧笔记里可能仍写 _page_path
+_page_path = page_path
+
+
 def _lines_with(ocr_dir, page, wrong):
     """在某一页里找所有含 wrong 的行。返回 (页文件路径, [行])。"""
-    path = _page_path(ocr_dir, page)
+    path = page_path(ocr_dir, page)
     if not path or not wrong:
         return path, []
     doc = jsonio.read(path)

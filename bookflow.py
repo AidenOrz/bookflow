@@ -224,14 +224,20 @@ def stage_layout(a):
     src = ocr_dir(a)
     # 源不能是 ocr_layout 自己：那是上一次本阶段的输出，读它等于原地空转，
     # 而且会让 ocr_layout 的 mtime 永远最新、永久压住更新的 ocr_merged。
-    if os.path.basename(os.path.normpath(src)) == "ocr_layout":
+    # 但显式 --ocr-src 是用户的明确意图（例如拿旧结果做重入实验），不替他改。
+    if not getattr(a, "ocr_src", "") and os.path.basename(os.path.normpath(src)) == "ocr_layout":
         for name in OCR_DIRS[1:]:
             cand = os.path.join(a.work, name)
             if os.path.isdir(cand) and [f for f in os.listdir(cand) if f.endswith(".json")]:
                 print("  布局源改用 %s（避免读自己上一次的输出）" % cand)
                 src = cand
                 break
+    elif getattr(a, "ocr_src", "") and os.path.basename(os.path.normpath(src)) == "ocr_layout":
+        print("  布局源按 --ocr-src 使用 %s（原地重跑，不自动换源）" % src)
     dst = os.path.join(a.work, "ocr_layout")
+    if os.path.abspath(src) == os.path.abspath(dst) and not a.force:
+        print("  提示：源与输出同为 ocr_layout，run_layout 会跳过已存在的页；"
+              "要真正重跑请加 --force")
     cmd = [PY, os.path.join(HERE, "run_layout.py"),
            "--src", src, "--pages", os.path.join(a.work, "pages"),
            "--dst", dst, "--device", a.device]

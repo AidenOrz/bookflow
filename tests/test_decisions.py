@@ -368,6 +368,49 @@ class TestApply(unittest.TestCase):
             self.assertEqual(s2["already_applied"], 2)
             self.assertEqual(s2["applied"], 0)
 
+    def test_page_path_tolerates_padding_mismatch(self):
+        """页名补零位数与磁盘不一致时也必须能回填。
+
+        旧版 plan() 直接拼 page + ".json"，而 decisions.py 生成裁决时走的是带补零
+        容错的 _page_path：裁决表是 p-001.png.json，回填却去找 p-1.png.json，
+        结果"能生成裁决、回填时全部 missing"。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            ocr = os.path.join(d, "ocr_merged")
+            # 磁盘上是 3 位补零，裁决里写的是不补零的页名
+            write_pages(ocr, {"p-001.png": page_json("p-001.png",
+                                                     [(10.0, "他引人了新方法。")])})
+            doc = {"version": 1, "source": {"a": "t"}, "match": {"y_tol": 1.0},
+                   "decisions": [
+                       {"key": "p-1.png@10", "page": "p-1.png", "y0": 10.0,
+                        "A": "他引人了新方法。", "B": "他引入了新方法。",
+                        "verdict": "B", "replacement": None, "level": "L2",
+                        "status": "pending"}]}
+            dp = os.path.join(d, "decisions.json")
+            dec.write(dp, doc)
+            _, out = run_ap("--work", d, "--decisions", dp, "--apply")
+            s = summary(out)
+            self.assertEqual(s["missing"], 0, out)
+            self.assertEqual(s["applied"], 1, out)
+            got = jsonio.read(os.path.join(ocr, "p-001.png.json"))
+            self.assertIn("他引入了新方法。", [L["t"] for L in got["lines"]])
+
+    def test_missing_page_reports_not_crash(self):
+        """页文件真的不存在时，page_path 返回 None，plan 必须报 missing 而不是抛 TypeError。"""
+        with tempfile.TemporaryDirectory() as d:
+            ocr = os.path.join(d, "ocr_merged")
+            os.makedirs(ocr, exist_ok=True)
+            doc = {"version": 1, "source": {"a": "t"}, "match": {"y_tol": 1.0},
+                   "decisions": [
+                       {"key": "p-999.png@10", "page": "p-999.png", "y0": 10.0,
+                        "A": "甲", "B": "乙", "verdict": "B",
+                        "replacement": None, "level": "L2", "status": "pending"}]}
+            dp = os.path.join(d, "decisions.json")
+            dec.write(dp, doc)
+            items, _ = ap.plan(dec.read(dp), ocr)
+            self.assertEqual([it["kind"] for it in items], ["missing"])
+            self.assertIn("找不到页文件", items[0]["reason"])
+
     def test_no_backup(self):
         with tempfile.TemporaryDirectory() as d:
             ocr, dp = _fixture(d)

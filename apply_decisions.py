@@ -178,7 +178,10 @@ def plan(doc, src, y_tol=None, require_single_segment=None):
     claimed = {}        # 页名 -> 已被占用的行下标（同一行不能被两条裁决各改一次）
     for e in entries:
         page = e.get("page")
-        path = os.path.join(src, page + ".json") if page else None
+        # 不能直接拼 page + ".json"：页名可能是 p-1.png / p-0001.png，而磁盘上是
+        # p-001.png.json。decisions.py 生成裁决时走的是 page_path() 的补零容错，
+        # 这里口径必须一致，否则会出现「能生成裁决、回填时全部 missing」。
+        path = dec.page_path(src, page) if page else None
 
         # 先判裁决本身要不要动作：verdict=A/? 只是登记，不该再去关心页在不在，
         # 否则会给"仅登记"的条目刷出误导性的"未定位"。
@@ -192,7 +195,8 @@ def plan(doc, src, y_tol=None, require_single_segment=None):
                               old="", new="", line=None, reason="裁决缺 page 字段"))
             continue
         if page not in pages:
-            if not os.path.exists(path):
+            # page_path 找不到时返回 None，不能直接喂给 os.path.exists（会抛 TypeError）
+            if not path or not os.path.exists(path):
                 items.append(dict(kind="missing", entry=e, page=page, path=path,
                                   old="", new="", line=None,
                                   reason="找不到页文件 %s.json" % page))
