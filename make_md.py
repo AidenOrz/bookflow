@@ -23,11 +23,17 @@ def main():
     ap.add_argument("--title", default="")
     ap.add_argument("--author", default="")
     ap.add_argument("--publisher", default="")
+    ap.add_argument("--conservative-fix", action="store_true",
+                    help="形近字一律只出候选、正文不动。默认会改（排除表的已知漏洞已补），"
+                         "遇到没见过的排版或要逐条人工过 fix_candidates 时用这个")
     a = ap.parse_args()
 
     os.makedirs(a.out, exist_ok=True)
-    md, rep, cleaned, pages = layout.build(a.src, {"title": a.title})
-    md, fixed, fix_detail = fix.apply(md)
+    # 元数据要落进 report.json：下游 epub 阶段没带 --author 时回落到这里，
+    # 否则重打包就得每次重新敲命令行（作者/出版社只存在人的记忆里）。
+    meta = {"title": a.title, "author": a.author, "publisher": a.publisher}
+    md, rep, cleaned, pages = layout.build(a.src, meta)
+    md, fixed, fix_detail = fix.apply(md, conservative=a.conservative_fix)
     q = qa.run(md, pages, cleaned, rep["bw"], rep["bh"])
 
     # 三个产物要么全写出、要么一个都不写：先落 .tmp 再统一 rename。
@@ -42,8 +48,14 @@ def main():
     md_path = os.path.join(a.out, "book.md")
     write_atomic(md_path, md)
     write_atomic(os.path.join(a.out, "qa.txt"), qa.to_text(q))
+    # fix_detail 里混着两种条目：action=fix 已自动改写，action=candidate 只出候选
+    # （单字 + 排除表的上下文规则，排除集是开放集必然漏项，改错比漏改更伤）。
+    # 拆成两块写，report 的读者不用自己过滤。
     write_atomic(os.path.join(a.out, "report.json"), json.dumps(
-        {"fix": fixed, "fix_detail": fix_detail,
+        {"book": meta,
+         "fix": fixed,
+         "fix_detail": fix.auto_detail(fix_detail),
+         "fix_candidates": fix.candidates(fix_detail),
          "layout": {k: v for k, v in rep.items() if k not in ("entries", "matched_detail")},
          "entries": rep["entries"], "matched": rep["matched_detail"],
          "qa": q}, ensure_ascii=False, indent=1))
@@ -52,6 +64,9 @@ def main():
         rep["pages"], [p + 1 for p in rep["toc_pages"]], rep["toc_entries"],
         rep["matched"], rep["levels"]))
     print("字符 %d ｜ 汉字 %d ｜ 修正 %s" % (len(md), q["cjk_chars"], fixed or "无"))
+    n_cand = len(fix.candidates(fix_detail))
+    if n_cand:
+        print("待裁决形近字 %d 处（未改正文，见 report.json 的 fix_candidates）" % n_cand)
     nt = rep["notes"]
     if nt["total"]:
         print("脚注 %d 条 ｜ 可弹窗 %d ｜ 页尾注 %d ｜ 来自 %d 页"
