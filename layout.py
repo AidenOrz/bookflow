@@ -1323,6 +1323,18 @@ def build(src=None, meta=None):
                                    band_top=band_top, band_bot=band_bot)
                for p in pages}
     entries = parse_toc(pages, cleaned, bw, bh, toc_ids)
+    if not entries:
+        # 目录页缺失时整条流水线会"成功"地产出一本无章节结构的书：
+        # 全书拍成一个平面段落流，EPUB 只有一章、没有导航。rc=0、无告警，
+        # 用户拿到成书只会以为"这书本来就这样"——必须显式警告。
+        print("\n" + "!" * 68)
+        print("! 未检测到目录条目：成书将没有章节结构（全书作为一章、无目录导航）。")
+        print("! 如果原书确实有目录页，请检查：")
+        print("!   1) 扫描件前 30 页是否有「目 录 / 目次 / Contents」页；")
+        print("!   2) 目录页是否被 OCR 成了图片或整页乱码；")
+        print("!   3) 目录条目的行尾页码是否被识别出来（parse_toc 靠它判条目）。")
+        print("! 检测到的目录页索引：%s" % (sorted(toc_ids) or "无"))
+        print("!" * 68 + "\n")
     offset = page_offset(pages)
     stream, matched = match_entries(pages, cleaned, entries, toc_ids, bw, bh, offset)
     start = 0
@@ -1359,6 +1371,7 @@ def build(src=None, meta=None):
         "levels": {1: sum(1 for m in matched if m["level"] == 1),
                    2: sum(1 for m in matched if m["level"] == 2),
                    3: sum(1 for m in matched if m["level"] == 3)},
+        "toc_warning": ("未检测到目录条目，成书无章节结构" if not entries else ""),
         "entries": entries,
         "matched_detail": matched,
         "chars": len(md),
