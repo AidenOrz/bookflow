@@ -23,9 +23,11 @@ SUSPECT = 0.62        # 认出比例低于此值视为失败行
 ACCEPT = 0.70         # 重识别结果需达到应有字数的此比例才采纳
 
 
-def elen(t):
-    """按西文半宽折算的视觉字数。"""
-    return sum(1.0 if ord(c) > 127 else 0.5 for c in t)
+# 视觉长度必须与 layout.py 同口径：repair 的 SUSPECT 阈值比较的是
+# "认出的字 / 应有的字"，而"应有字数"来自 layout 那套长度口径。
+# 旧版本地实现把全角标点也算 1.0 字宽（layout 算 0.55），
+# 一条「《高僧传》卷五」在两处能差 20%，同一行会在不同阶段被判成不同长度。
+from layout import elen  # noqa: E402
 
 
 def median_char_width(files):
