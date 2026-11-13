@@ -307,6 +307,26 @@ class TestFix(unittest.TestCase):
         self.assertEqual(fix.apply("不引人怀疑", verbose=False)[0], "不引人怀疑")
         self.assertEqual(fix.apply("税收人说", verbose=False)[0], "税收人说")
 
+    def test_yinren_exclusion_is_char_class_not_phrase_alternation(self):
+        """「引人」的排除表是**字符类**（按后一个字拦），不是词组分支，这是刻意保留的。
+
+        起因是笔误，但实测下来字符类严格更安全：OCR 把「引人注目」认成「引人注日」时，
+        词组分支 `(?:注目|入胜|...)` 拦不住（「注日」不在表里），默认模式会把正确原文
+        改成「引入注日」——实测僧官成书变动 1 处就是这处。字符类按第二字「注」就挡住了。
+        代价是白名单外的搭配一并被放过（引人思乡/引人往返），方向是漏改而非改坏。
+        """
+        pat = [p for p, _, label in fix.CAND_RULES if label == "引人→引入"][0]
+        # 按第二字拦得住 OCR 认错的词
+        self.assertFalse(pat.search("引人注日之处"), "字符类必须挡住 OCR 认错第二字")
+        # 真正该改的仍然命中
+        self.assertTrue(pat.search("他引人了新方法"))
+        # 代价：白名单外的正确搭配被顺带放过（漏改方向，不会改坏正文）。
+        # 「思乡」「往返」不在白名单里；「思考」也不是词组，但「思」是「深思」的首字，
+        # 字符类不看词边界，所以一并放过——这正是可以接受的漏改。
+        self.assertFalse(pat.search("引人思乡"))
+        self.assertFalse(pat.search("引人往返"))
+        self.assertFalse(pat.search("引人思考"))
+
     def test_candidates_survive_as_detail(self):
         """无论改不改，每一处命中都要留痕，供事后核对（suggest 说明会变成什么）。"""
         _, _, det = fix.apply("他引人了新方法", verbose=False, conservative=True)

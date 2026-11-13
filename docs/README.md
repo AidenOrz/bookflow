@@ -187,7 +187,7 @@ EPUB3 有专门的脚注语义，主流阅读器（Apple Books / Thorium / Kobo�
 python -m unittest discover -s tests -v
 ~~~
 
-81 个用例（test_layout 37 + test_epub3 11 + test_decisions 32 + 1），全部来自真实踩过的坑（正文首行被当书眉删、标题残片漏消费、重复页、
+84 个用例（test_layout 39 + test_epub3 11 + test_decisions 34），全部来自真实踩过的坑（正文首行被当书眉删、标题残片漏消费、重复页、
 空输入静默成功、fix 规则误伤、脚注误连、EPUB 断链、单页目录判不出、
 「第X部分」被压平到与「第X章」同级、章节撞到分部扉页、星号注错配、
 校对页码因漏算换行符整体偏移等）。

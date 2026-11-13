@@ -1,8 +1,23 @@
 # HANDOFF — 交接现状
 
-更新时间：2026-11-13
+更新时间：2026-11-14
 
-## 最近一轮：按 IMPROVEMENT-PLAN 落地 P0 + P1（10 项）
+## 最近一轮：代码审阅 3 项缺陷的复核（采纳 2、驳回 1）
+
+docs/CODE_REVIEW_REPORT.md 对 P0/P1 改动集提出 3 处缺陷。逐条实测后：**采纳 2 项、
+实证驳回 1 项**（那一条的建议改法会让成书变坏）。测试 84/84 通过。
+
+| # | 审阅意见 | 处置 | 证据 |
+|---|---|---|---|
+| 1 | `fix.py` 排除表用字符类 `(?![...])` 而非词组分支 `(?!(?:...))`，属笔误，会过度排除 | **实证驳回，改为有意保留 + 补注释** | 换成分支后默认模式会把僧官成书「引人注日」改成「引入注日」（OCR 把「注目」认成「注日」，分支表里没有「注日」）。字符类按第二字「注」就挡住了。代价是「引人思乡/引人往返/引人思考」被顺带放过 = 漏改方向，不会改坏书 |
+| 2 | `apply_decisions.plan()` 直接拼 `page + ".json"`，与 `decisions._page_path` 的补零容错不一致，会出现「能生成裁决、回填全部 missing」 | **采纳** | 复现：裁决页名 `p-1.png` + 磁盘 `p-001.png.json` → `missing`。`_page_path` 已提为公开 `page_path()`（留 `_page_path` 别名），`plan()` 改为复用并处理返回 None |
+| 3 | `stage_layout` 的「排除 ocr_layout 自身」不该覆盖显式 `--ocr-src` | **采纳** | 加了 `not getattr(a, "ocr_src", "")` 前置判断；源与输出同为 ocr_layout 时提示需要 `--force`（run_layout 对已存在的页是跳过的） |
+
+新增回归：`test_yinren_exclusion_is_char_class_not_phrase_alternation`（把"字符类是有意为之"
+钉住，防止后人又"修正"回分支）、`test_page_path_tolerates_padding_mismatch`、
+`test_missing_page_reports_not_crash`。三本书 `fix.apply` 输出仍逐字节一致。
+
+## 上一轮：按 IMPROVEMENT-PLAN 落地 P0 + P1（10 项）
 
 以 [IMPROVEMENT-PLAN.md](IMPROVEMENT-PLAN.md) 为输入，完成 P0 全部 5 项与 P1 全部 5 项。
 计划本身是对一份外部审阅意见**逐条核实**后重排的产物，其中 2 条建议被实测证伪
@@ -32,7 +47,7 @@
 
 | 项 | 值 |
 |---|---|
-| 测试 | **81/81 通过**（原 35 → layout 37 + epub3 11 + decisions 32 + 1） |
+| 测试 | **84/84 通过**（原 35 → layout 39 + epub3 11 + decisions 34） |
 | 黑格尔 | 264,439 字符 / 233,812 汉字 / 44-44 目录 / EPUB 754.7 KB / validate 0 |
 | 规训 | 250,812 字符 / 195,751 汉字 / 16-16 目录 / 95 注（75 弹窗 + 20 页尾）/ EPUB 473.2 KB / validate 0 |
 | 僧官 | 200,230 字符 / 163,090 汉字 / 103-103 目录 / 453 注（165 弹窗 + 288 页尾）/ EPUB 557.1 KB / validate 0 |
@@ -119,7 +134,7 @@ out/decisions.json 现为根目录那本书的正式裁决表（--export-legacy 
   纯增量设计：没有 `region` 字段的老 JSON 行为完全不变。
 - **`--ocr-src`** 显式指定 OCR 来源；**`--no-layout`** 跳过版面分析。
 - **`prune` 阶段**：删可重生成的中间产物（新书 `pages/` 约 520 MB）。
-- **测试套件** `tests/test_layout.py`：全部来自真实踩坑（本轮已扩到 81 个用例，见文首）。
+- **测试套件** `tests/test_layout.py`：全部来自真实踩坑（本轮已扩到 84 个用例，见文首）。
 - **`jsonio.py`**、**`requirements.txt`**、**`.gitignore`**。
 - **文档迁移到 `docs/`**：architecture / README / HANDOFF / MEMORY。
 - **弹窗脚注**（本轮）：`extract_notes`/`plan_notes`/`epub3.py`/`assets/style.css`，
