@@ -21,6 +21,12 @@ import numpy as np
 from PIL import Image
 
 import jsonio
+import pagedoc
+
+# 页级 JSON 的来由标记。run_layout 只**追加** region 字段、不改任何文本，
+# 但它是产生这一版文件的最后一道工序，所以 producer 记它自己；
+# 上一手的来源留在 upstream_producer 里（见 main() 的盖章处）。
+PRODUCER_NAME = "pp_doc_layoutv3"
 
 # 这些区域不进正文流
 DROP_REGIONS = {"footnote", "vision_footnote", "footer", "header",
@@ -89,6 +95,11 @@ def main():
 
     use_dml = a.device in ("auto", "dml")
     engine = load_engine(use_dml)
+    try:
+        import importlib.metadata as md
+        prod_version = md.version("rapid_layout")
+    except Exception:
+        prod_version = None
 
     done = skipped = 0
     stats = {}
@@ -107,7 +118,15 @@ def main():
         regions = page_regions(engine, img)
         tag_lines(d["lines"], regions)
         d["regions"] = regions
-        jsonio.write(out_path, d)
+        # 保留读进来的来源，再盖自己的章：只新增键，既有业务字段
+        # （name/w/h/lines/regions）一个都不动，producer 换成本工序，
+        # 上一手的来源挂到 upstream_producer 上——这样「这份 region 标签
+        # 是打在谁的结果上」可追，而且重跑本阶段不会把源头信息冲掉
+        # （已存在的 upstream_producer 优先于刚读到的 producer）。
+        prev = d.get("upstream_producer") or d.get("producer")
+        extra = {"upstream_producer": prev} if prev else {}
+        pagedoc.stamp(d, pagedoc.producer(PRODUCER_NAME, prod_version), **extra)
+        pagedoc.write(out_path, d)
         for R in regions:
             stats[R["cls"]] = stats.get(R["cls"], 0) + 1
         done += 1

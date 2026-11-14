@@ -35,30 +35,34 @@ PDF ──render──► pages/*.png              300dpi 灰度（pdftoppm）
 
 | 文件 | 职责 | 关键点 |
 |---|---|---|
-| `bookflow.py` | CLI 编排 | 阶段入口、依赖自检、产物校验 |
+| `bookflow.py` | CLI 编排 | 阶段入口（含 `disagree`/`decisions`）、**按阶段**依赖自检、OCR 源新鲜度告警 |
 | `run_ocr.py` | 全量 OCR | 多进程；每进程一份引擎实例；GPU 自动用 DirectML |
 | `repair.py` | 补识别 | 按「认出字数 ÷ 应有字数 < 0.62」找可疑行，单行重识别 |
 | `run_layout.py` | 版面分析 | PP-DocLayoutV3，给每行加 `region` 字段（可选增强） |
 | `layout.py` | 版面与结构 | 去页眉/页码/书脊、同行合并、目录解析、顺序匹配、合段 |
-| `fix.py` | 形近字修正 | 全局规则 + 带排除条件的上下文规则；统计净改动 |
+| `fix.py` | 形近字修正 | `AUTO_RULES`（整词级，错写法本身不是词）+ `CAND_RULES`（单字级，带排除表）；统计净改动；`--conservative-fix` 可让单字级只出候选 |
 | `qa.py` | 质检闸门 | 空缺页、短行、低置信、段落异常、跨页断裂 |
 | `audit.py` | 替换型错字候选 | 词表归属 + 形近字置换 + 边界判据 + 全书高频否决 |
 | `make_review.py` | 候选图 | 把可疑行从原图裁出拼成对照图，供人工/VLM 裁决 |
 | `disagree.py` | 双模型分歧 | 两版 OCR 交叉比对，词频强弱比判胜负 |
-| `apply_decisions.py` | 裁决回填 | 按裁决表改 OCR，只替换单一差异段；有 dry-run 与备份 |
+| `apply_decisions.py` | 裁决回填 | 读 `decisions.json`，`key=page@y0` 稳定主键；**默认 dry-run**；整行覆盖支持多差异段；时间戳备份目录；三态判定（apply/already/missing）保证幂等 |
+| `decisions.py` | 裁决表适配层 | `from_disagree`/`from_audit`/`from_queue`/`merge`，把两套互不兼容的候选格式统一成 `decisions.json` |
 | `cover.py` | 封面 | 从首页裁封面，按墨迹密度去水印带；不合适的页返回 None |
 | `make_md.py` | md 阶段入口 | 调 layout → fix → qa，三个产物原子写 |
 | `epub3.py` | EPUB3 构建 | 章节切分、nav/ncx、封面、**弹窗脚注渲染**、自校验 |
 | `make_epub.py` | epub 阶段入口 | `epub3.py` 的 CLI |
 | `qa.py` / `check_epub.py` | 校验 | 成书前闸门（含脚注完整性）/ EPUB 包结构自校验 |
 | `jsonio.py` | IO 工具 | with 包住句柄；写临时文件再 rename |
+| `pagedoc.py` | **数据契约** | 页级 JSON 与 report.json 的 `schema`/`schema_version`/`producer`；老文件兼容、新版本拒绝；`stamp`/`read`/`check`/`describe` |
 
 ## 4. 数据契约
 
-页级 JSON（`ocr/*.json`、`ocr_fix/*.json`、`ocr_layout/*.json` 同一 schema）：
+页级 JSON（`ocr/*.json`、`ocr_fix/*.json`、`ocr_layout/*.json`、`ocr_text/*.json` 同一 schema）：
 
 ~~~json
 {
+  "schema": "bookflow.pages", "schema_version": 1,
+  "producer": {"name": "rapidocr", "version": "3.10.0"},
   "name": "p-020.png", "w": 2480, "h": 3509,
   "lines": [
     {"x0": 443, "y0": 767, "x1": 2168, "y1": 836,
@@ -70,6 +74,27 @@ PDF ──render──► pages/*.png              300dpi 灰度（pdftoppm）
 
 `region` / `r` / `regions` 是 **可选字段**，只有跑了 `run_layout.py` 才有。
 `layout.py` 对缺失字段的行为与旧版完全一致。
+
+### 4.1 版本字段（`pagedoc.py`）
+
+四个写入方（`run_ocr.py` / `repair.py` / `run_layout.py` / `textlayer.py`）都必须调用
+`pagedoc.stamp(doc, pagedoc.producer(name, version))` 再写盘。`producer.name` 取值：
+`rapidocr` / `rapidocr-repair` / `pp_doc_layoutv3` / `pdftotext`。
+
+`out/report.json` 用 `pagedoc.stamp_report()`，schema 为 `bookflow.report`。
+
+**两条硬约束**：
+
+1. **向后兼容**：没有 `schema` / `schema_version` 的老 JSON 必须照常读，
+   `pagedoc.check()` 返回空列表。三本验证书工作目录里几千个老文件不能因此跑不动。
+2. **版本不认识就拒绝**：`schema_version` 不等于当前值是**错误**而不是警告。
+   本项目头号风险是静默出错，宁可停下来让人升级代码或降级数据。
+
+`producer` 表达**真实生成来源**，任何加载/加工/回填步骤都不得改写它——
+它是判断「这份数据该不该信」的唯一依据（文字层可信度 1.0，OCR 约 0.985）。
+
+为什么不引 Pydantic：只有 4 个写入方、字段少，严格校验会把「兼容旧数据」变成负担。
+只校验版本号能不能认，其余交给各阶段自己的断言。
 
 ## 5. 关键设计决策
 
@@ -89,6 +114,14 @@ PDF ──render──► pages/*.png              300dpi 灰度（pdftoppm）
 | **位置证据优先于区域标签** | 版面模型会把居中大字的章标题标成 `header`（「参考书目」y=20.4%），照标签丢会让整章消失 |
 | 星号注与圈号注**走两条通道** | 星号注的「编号」是星号个数，且注区星号大量丢失（168 行只剩 6 行）；只能从正文侧数、注区按缩进切块，再用「块数相等 + 非末块收句」双校验 |
 | fix 只在**确定性规则**上自动改 | 两种写法都成立的场景，误改比漏改更伤 |
+| fix 的**单字级规则靠排除表兜底** | 「X+人+动词」是开放集，排除表必然漏项：实测漏了「人胜/怀疑/说」，把成书里 3 处正确原文改错。现在补掉已知漏洞，并留 --conservative-fix 一键退回只出候选 |
+| `引人` 排除表用**字符类**而非词组分支 | 看似笔误，实为更安全：OCR 常认错词的第二字（「注目」→「注日」），字符类按第二字拦得住，词组分支拦不住会改坏正文。代价是白名单外搭配被放过 = 漏改，不伤书 |
+| 裁决**生成端与回填端共用 `page_path()`** | 生成端有补零容错、回填端直接拼 `page + ".json"`，会出现「能生成裁决、回填全 missing」。两边口径必须同源 |
+| 跨页合段**只看标点，不引入缩进判据** | 实测「缩进优先」在三本书上翻转 22/32/53 处，且会把章标题（规训 p199「第二章」、p207「规范化裁决」）和页末注文并进上一段。根因是 left 逐页独立计算，跨页时等于拿两页各自的零点相减（黑格尔 75.7% 的页 left 偏离全书基准 >0.6 字宽） |
+| 依赖自检**按阶段**列表 | 一个大元组会让 md 阶段被 rapidocr 误拦，而它根本不 import；layout 阶段真正缺的 rapid_layout 又没检查，用户只看到内部 traceback |
+| OCR 源加**新鲜度告警** | 先跑 layout 再回填 ocr_merged 时，优先级顺序不变但选中的仍是旧 ocr_layout，裁决成果被静默丢弃。顺序不能乱改（会改变两本验证书的选源），所以只加告警 |
+| 裁决表用 **page@y0 稳定主键** | 旧版按列表下标取条目，队列顺序一变裁决整体错位；且多差异段会被静默跳过（20 条硬编码里 2 条从未生效） |
+| 裁决回填**默认 dry-run** | 它会原地覆写 OCR，而重跑一本 383 页的书要 4.3 分钟；一次误跑不可逆的成本远高于多打一个 --apply |
 | 重复页**按内容去重** | 扫描件常见整段页重复；不去重会成段重复正文（实测 19 页） |
 | 产物**原子写** | 中途崩溃不能留下「book.md 有、report.json 没有」的半成品 |
 

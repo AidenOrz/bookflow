@@ -66,7 +66,7 @@ $py = "python"
 | `assets/style.css` | 成书样式表 |
 | `cover.py` / `check_epub.py` | 封面裁切 / EPUB 结构校验 |
 | `jsonio.py` | JSON 读写工具（原子写、句柄安全） |
-| `tests/` | 回归测试（17 个用例，全部来自真实踩坑） |
+| `tests/` | 回归测试（84 个用例，全部来自真实踩坑） |
 | `pages/` `ocr*/` `out/` | 运行产物（已 `.gitignore`，不入库） |
 
 ## 关于扫描书与版权

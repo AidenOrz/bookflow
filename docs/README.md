@@ -38,6 +38,7 @@ $py = "python"
 | 阶段 | 命令 | 做什么 |
 |---|---|---|
 | render | `bookflow.py render` | PDF → 300dpi 灰度 PNG（`pdftoppm`） |
+| **textlayer** | `bookflow.py textlayer` | **PDF 自带文字层 → 页级 JSON**（`pdftotext -bbox`，927 页 7.9 秒） |
 | ocr | `bookflow.py ocr` | RapidOCR PP-OCRv6 small，行级坐标+文本+置信度 |
 | repair | `bookflow.py repair` | 整页识别退化行（整行丢字）逐行重识别 |
 | layout | `bookflow.py layout` | **可选增强**：PP-DocLayoutV3 标出脚注/页眉/页码区域 |
@@ -45,9 +46,41 @@ $py = "python"
 | audit | `bookflow.py audit` | 词表+形近字置换找替换型错字，**按 PDF 页码排序**出清单与对照图（不自动改） |
 | epub | `bookflow.py epub` | EPUB3 + 三级目录 + **弹窗脚注** + 自校验 + 封面（`epub3.py`） |
 | prune | `bookflow.py prune` | 删除可重生成的中间产物 |
+| verify | `bookflow.py verify` | 文字层与 OCR 交叉验证（`disagree.py` 的 A=文字层 / B=OCR），分歧进 `decisions.json` |
+| disagree | `bookflow.py disagree --ocr-alt ocr_alt` | 双模型交叉比对，产出候选清单。**不在 `all` 里**：需要第二版 OCR |
+| decisions | `bookflow.py decisions --from disagree` | 把各路候选（disagree/audit/旧队列）归一成 `out/decisions.json` |
+
+裁决闭环（人工/VLM 裁决后回填）：
+
+~~~powershell
+& $py bookflow.py disagree --work ./run1 --ocr-alt ocr_alt   # 产出 out/disagree.json
+& $py bookflow.py decisions --work ./run1 --from disagree      # 归一成 out/decisions.json
+# ... 编辑 decisions.json 的 verdict（A 保留 / B 采用 B / C 用 replacement / ? 待定）...
+& $py apply_decisions.py --work ./run1 --decisions out/decisions.json            # 默认 dry-run
+& $py apply_decisions.py --work ./run1 --decisions out/decisions.json --apply    # 真正落盘
+~~~
 
 常用参数：`--dpi 300`、`--procs 5`、`--device auto|cpu|dml|cuda`、`--model small|medium|server`、
-`--ocr-src`（指定 OCR 结果目录）、`--force`（重跑已有阶段）、`--no-layout`（跳过版面分析）。
+`--ocr-src`（指定 OCR 结果目录）、`--force`（重跑已有阶段）、`--no-layout`（跳过版面分析）、
+`--ocr-alt`（第二版 OCR 目录）、`--conservative-fix`（形近字一律只出候选、正文不动）、
+`--text-layer verify|only|off`（文字层用法，见下）、`--text-pages 1-60`（只抽这些页，仅 textlayer 单阶段）。
+
+### 文字层（`--text-layer`）
+
+PDF 里**自带的文字层**比 OCR 更快更准，但质量参差不齐，所以默认**两者都跑、交叉验证**：
+
+| 值 | 行为 | 用在什么时候 |
+|---|---|---|
+| `verify`（默认） | 抽文字层 + 跑 OCR，`disagree.py` 比对（A=文字层、B=OCR），分歧进 `decisions.json`；**正文用文字层** | 绝大多数书 |
+| `only` | 只抽文字层，完全不跑 OCR | 确认有完好文字层的书（快 40 倍）；文字层覆盖不足 95% 会拒绝并给出改跑 `verify` 的提示 |
+| `off` | 不碰文字层，行为与本功能上线前**逐字节一致** | 纯扫描书、复现旧结果 |
+
+实测（927 页有文字层的书）：`pdftotext` **7.9 秒 / 623,310 汉字 / 672.4 汉字每页**，
+OCR 同规模约 17.6 秒/页 × 927 ≈ 4.5 小时。抽样 13 页逐字对比，文字层与 OCR 相似度 **98.85%**。
+
+选源优先级 `OCR_DIRS = ocr_layout > ocr_merged > ocr_text > ocr_fix > ocr`：
+`ocr_layout` 多了 region 标签（脚注抽取要它）；`ocr_merged` 是**人工裁决过**的，
+必须压住原始文字层；`ocr_text` 比 OCR 准但不可改（PDF 自带，没法回填）。
 
 ## 实测规模
 
@@ -75,6 +108,54 @@ $py = "python"
 **真正该补的是版面分析**：RapidOCR 只给行框，`layout.py` 只能靠位置猜脚注边界，
 结果是脚注整段混进正文。PP-DocLayoutV3（0.30 s/页）能直接标出 `footnote` / `footer` /
 `number` 区域。在 350 页样本上：加版面分析后，被误判为正文的脚注从 19/20 降到 0/20。
+
+### DocLayout-YOLO 实测：不换（2026-11-14）
+
+`rapid_layout` 1.2.1 已内置 4 个 DocLayout-YOLO 模型（`model_type="doclayout_*"`），
+**不需要新依赖**，所以「试一下」的成本几乎为零。实测结论是**不换、也不接入**。
+
+| 模型 | 类数 | 脚注识别（规训 60 页 × 21 行真值） | 书眉 | 页码 |
+|---|---|---|---|---|
+| **pp_doc_layoutv3（现用）** | 25 | **21/21** | **50/50** | **49/49** |
+| doclayout_docstructbench | 10 | 0/21（全塌缩为 `abandon`） | 塌缩为 `abandon` | 塌缩为 `abandon` |
+| doclayout_docsynth | 11 | 0/21（有 `Footnote` 类但一次没触发，81% 判成 `Text`） | 仅 6% 正确（56% 判成 `Section-header`） | 仅 10% 正确 |
+| doclayout_d4la | 27 | 0/21（判成 `Footer` 43% / `OtherText` 24% / 未标 33%） | 仅 4% 正确 | 86% 正确 |
+
+四个模型单页耗时几乎相同（0.16~0.17 s/页，DML），所以**不是速度问题，是标签体系问题**。
+
+**关键问题：DocLayout-YOLO 的「非正文」是一个类，不是三个。**
+`layout.py` 要分别处理脚注（抽注文、做 `noteref`）、书眉（丢）、页码（做锚定），
+三类语义完全不同。docstructbench 把这三类**全部塞进 `abandon`**（实测构成：
+书眉 39.0% / 页码 38.4% / 脚注 19.2% / 未标 2.3% / 正文 0.6%），拿到 `abandon`
+根本不知道该走哪条后续路径。
+
+实测后果（规训与惩罚 60 页，把 DocLayout 结果**原样**喂给 `layout.extract_notes`）：
+
+~~~
+PP-DocLayoutV3  脚注 11 条   正文行字数 34,894
+DocLayout-YOLO  脚注  0 条   正文行字数 35,948     ← 正文膨胀 +3.0%，书眉页码脚注全回流
+~~~
+
+**唯一的正面发现**：把标签压成「正文 / 非正文」二值后，它和现网的一致率是 **99.49%**
+（规训 120 页 3115 行，分歧仅 16 行 = 0.51%）。但分歧**两个方向都有**：
+
+| 方向 | 行数 | 内容 | 谁对 |
+|---|---|---|---|
+| 现网丢、它留 | 11 | 封面页出版社信息、页码 OCR 残片（`18`/`44`/`102`）、一处脚注 | 现网对（这些确实该丢） |
+| 现网留、它丢 | 5 | 全部在封面页 p-001：「术前沿」「THE FRONTIERS OF ACADEMIA」「福柯作品」「生活·讀書·新知三联书店」、一个孤立 `4` | 它更激进，勉强算对 |
+
+净收益 = 5 行 / 120 页，且只在封面页。代价是第二个 72 MB 模型 + 一套新标签映射
++ 一个「`abandon` 到底当什么」的不可判定问题，**不值得**。
+
+若要再评估，先决条件是：出现某本书 PP-DocLayoutV3 把**正文**误标成 `header` 或
+`footnote`（而不是反过来），此时 DocLayout-YOLO 的 `plain text` 可以充当独立投票。
+目前三本书里没有这种情况。
+
+**现有的那类误判它救不了**：PP-DocLayoutV3 会把居中大字的章级标题标成 `header`
+（`参考书目`出现在 5 个页面顶部、`译者后记`等），这是 `layout.py` 用「位置证据优先于
+区域标签」专门绕开的已知坑。拿这 6 行去问 DocLayout-YOLO：**5 行判 `abandon`、
+仅 1 行判 `title`**——它也认为这 5 行该丢，投不出反对票。所以它不能用来交叉验证
+这个坑，而交叉验证恰恰是引入第二个模型唯一的正当理由。
 
 ## 弹窗脚注
 
@@ -174,7 +255,7 @@ EPUB3 有专门的脚注语义，主流阅读器（Apple Books / Thorium / Kobo�
 python -m unittest discover -s tests -v
 ~~~
 
-35 个用例，全部来自真实踩过的坑（正文首行被当书眉删、标题残片漏消费、重复页、
+84 个用例（test_layout 39 + test_epub3 11 + test_decisions 34），全部来自真实踩过的坑（正文首行被当书眉删、标题残片漏消费、重复页、
 空输入静默成功、fix 规则误伤、脚注误连、EPUB 断链、单页目录判不出、
 「第X部分」被压平到与「第X章」同级、章节撞到分部扉页、星号注错配、
 校对页码因漏算换行符整体偏移等）。
