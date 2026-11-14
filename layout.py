@@ -14,6 +14,7 @@ import glob
 import statistics
 from difflib import SequenceMatcher
 import jsonio
+import pagedoc
 
 CJK = re.compile(r"[\u4e00-\u9fff]")
 PUNCT_END = "。！？；：…”』」）)】》!?.;:"
@@ -23,6 +24,18 @@ TOC_HEAD = re.compile(r"^目\s*录$|^目\s*次$|^contents$", re.I)
 # 版面分析（run_layout.py）标出的、不该进正文的区域类型
 DROP_REGIONS = {"footnote", "vision_footnote", "footer", "header",
                 "page_header", "page_footer", "number", "page_number"}
+
+# 图片/插图区。既不在 DROP_REGIONS 里、也没有任何裁图代码——于是插图整块
+# 消失，区域里的 OCR 行（图注、示意图上的标注字）被当普通正文流式输出。
+FIG_REGIONS = {"image", "figure"}
+# 表格区。同样不在 DROP_REGIONS 里，于是每一行都独立成段：实测《中国僧官
+# 制度史》4 个表格页产出 40 个 ≤6 字的碎片段（「共公僧」「池方僧官」「卜座」）。
+TBL_REGIONS = {"table"}
+# 表明「这一页确实有正文」的区域类型。图版页判定（见 plate_like）要用它：
+# 一页若只有 header/footer/number 这类版式区、正文行全是噪声，那它多半是
+# 整页插图/表格的照片，版面模型没认出来。
+TEXTISH_REGIONS = {"text", "content", "paragraph_title", "doc_title",
+                   "reference_content", "abstract", "figure_title", "algorithm"}
 
 # 脚注区域：同样不进正文流，但要单独抽出来渲染成弹窗脚注
 NOTE_REGIONS = {"footnote", "vision_footnote"}
@@ -305,9 +318,18 @@ def apply_subs(t, subs):
 
 
 def load_pages(src):
+    """读入全部页级 JSON。
+
+    走 pagedoc 的版本检查：版本不认识时**明确报错**而不是带着错误的数据往下跑
+    （下游会用它算 bw/bh、切章、配脚注，静默误读的后果是整本书结构错乱）。
+    老工作目录里的 JSON 没有版本字段，pagedoc 按兼容处理，不会拦。
+    """
     pages = []
-    for f in sorted(glob.glob(os.path.join(src, "*.json"))):
-        d = jsonio.read(f)
+    files = sorted(glob.glob(os.path.join(src, "*.json")))
+    if files:
+        pagedoc.warn_legacy(files, label="%s 下" % os.path.basename(os.path.normpath(src)))
+    for f in files:
+        d = pagedoc.read(f)
         d["idx"] = len(pages)
         pages.append(d)
     return pages
@@ -584,6 +606,377 @@ def unify_title(toc, body):
     if mt and not mb:
         return toc if len(nt) > len(nb) - 2 else body
     return body if len(nb) >= len(nt) else toc
+# ---------------------------------------------------------------- 图 / 表降级
+# 这两块刻意**不做结构重建**（列对齐、合并单元格、公式转 LaTeX 是另一类问题，
+# 而且我们没有任何列对齐证据）。目标只有一条：**别把东西丢了**。
+#
+# 实测依据（《中国僧官制度史》350 页）：table region 4 个（138 行）、image region
+# 4 个（22 行），既不在 DROP_REGIONS 里、也没有任何裁图/聚合代码，于是表格页把
+# 每一行都独立成段，成书 1820 段里冒出 97 个 ≤6 字碎片（「共公僧」「卜座」），占
+# 5.3%；插图页的标注字同样当正文流出去。
+
+
+def page_regions(p):
+    """页 JSON 的 regions 字段，没有就是空表。
+
+    regions 是 run_layout.py 写进去的 [{x0,y0,x1,y1,cls,s}]。老工作目录
+    （没跑过版面分析）没有这个字段，那本书的行为完全不变。
+    """
+    regs = p.get("regions")
+    return regs if isinstance(regs, list) else []
+
+
+def _area(b):
+    return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+
+
+def _region_boxes(p, classes):
+    """p 里 cls 属于 classes 的 region bbox 列表（已排除整页容器框）。
+
+    整页框必须排除：实测封面那个 image region 是 (54,78)-(2415,3394)，几乎就是
+    整张扫描页。照它裁出来是一张重复的封面，还会让书里凭空多一张假插图；
+    照它聚合则会把整页正文并进一个「表格块」。判据取「面积 > 80% 页面积」——
+    真插图再大也留在版心内，实测 (539,1522)-(2134,1708) 只占页面积 6.6%。
+    """
+    page_area = float(p["w"]) * float(p["h"])
+    out = []
+    for R in page_regions(p):
+        if R.get("cls") not in classes:
+            continue
+        b = (float(R["x0"]), float(R["y0"]), float(R["x1"]), float(R["y1"]))
+        if _area(b) <= 0 or _area(b) > 0.80 * page_area:
+            continue
+        out.append(b)
+    out.sort(key=lambda b: (b[1], b[0]))
+    return out
+
+
+def find_figures(p):
+    """这一页要被裁出来的插图区，按版面上从上到下的次序返回 bbox 列表。"""
+    return _region_boxes(p, FIG_REGIONS)
+
+
+def find_tables(p):
+    """这一页的表格区 bbox，按从上到下的次序返回。"""
+    return _region_boxes(p, TBL_REGIONS)
+
+
+def _keep_raw(p, L):
+    """这一行即使落在图/表区里也必须当正文保留吗？
+
+    只有一种情况：region 被标成 header、位置却明显低于页眉带——那是版面模型把
+    居中大字标题误判成书眉（clean_page 里那条同样的例外）。真书眉（页高 10% 上下）
+    不在此列。
+    """
+    if L.get("region") != "header":
+        return False
+    return L["y0"] > 0.14 * float(p["h"])
+
+
+PLATE_MARGIN = 0.02       # 图版页整页裁图时四周留 2% 页宽/页高，避免切到装订线阴影
+
+
+def plate_bbox(p):
+    """整页图版的裁切框（四周留一点边距）。"""
+    W, H = float(p["w"]), float(p["h"])
+    mx, my = PLATE_MARGIN * W, PLATE_MARGIN * H
+    return (mx, my, W - mx, H - my)
+
+
+def extract_figures(pages, cleaned=None):
+    """收集全书插图区，并给每个区分配稳定文件名。
+
+    返回 [{"page": 0 基页 idx, "name": "fig-p143-1.png", "bbox": (...)}]。
+    文件名带页码，人工核对时能直接对回原书；序号按页内自上而下的次序从 1
+    开始，同一页两张图不会互相覆盖。
+
+    cleaned 给出来时，额外把「整页图版」页（见 plate_like）也算成一张插图。
+    不给就只认 region 标签——旧调用方不受影响。
+    """
+    out = []
+    for p in pages:
+        boxes = find_figures(p)
+        rows = (cleaned or {}).get(p["idx"])
+        tagged_plate = False
+        if rows is not None and plate_like(p, rows):
+            boxes = [plate_bbox(p)]
+            tagged_plate = True
+        for k, b in enumerate(boxes, 1):
+            out.append({"page": p["idx"],
+                        "name": "fig-p%03d-%d.png" % (p["idx"] + 1, k),
+                        "bbox": b,
+                        "plate": tagged_plate})
+    return out
+
+
+def _visual_rows(rows, bw, bh):
+    """把一组行聚成「视觉行」，并数出每行的列数。
+
+    同一视觉行 = 中心线相差不超过 0.6 个行高。表格一行里各列是并排的，按 x0
+    排好就是列序——这是聚合所需的全部信息，**不猜哪列是哪列**。
+
+    列数 = 按字宽把 x0 聚类后的簇数。1.6 字宽是实测值：同一列的字常有十几像素
+    的抖动（70 像素的字，「共公僧」x0=1759.6 与「监导」x0=1747.3 差 12px），
+    小于 1.6 字宽必然同列，而真正的不同列至少隔着一个字宽。
+    """
+    rows = sorted(rows, key=lambda L: (L["y0"], L["x0"]))
+    out = []
+    for L in rows:
+        cy = (L["y0"] + L["y1"]) / 2.0
+        if out and abs(cy - out[-1]["cy"]) <= 0.6 * bh:
+            out[-1]["lines"].append(L)
+        else:
+            out.append({"cy": cy, "lines": [L]})
+    for r in out:
+        r["lines"].sort(key=lambda L: L["x0"])
+        cols = []
+        for L in r["lines"]:
+            if cols and L["x0"] - cols[-1][0] <= 1.6 * bw:
+                cols[-1].append(L["x0"])
+            else:
+                cols.append([L["x0"]])
+        r["ncol"] = len(cols)
+        r["x0"] = r["lines"][0]["x0"]
+    return out
+
+
+# 表格行的「收句」判据比正文窄：只认真正的句末/分句标点。
+# 不能直接复用 PUNCT_END——那里含「）」「)」，而表格单元格本来就常以括号收尾
+# （实测 p120 沿革表的「鸿胪寺（崇玄署）」「暂归祠部检校」都带括号），
+# 用宽判据会把表格从中间截成两段。
+TABLE_END = "。！？；…"
+
+
+def _row_is_tableish(row, bw):
+    """这一视觉行像不像表格的一行：≥2 列，且列与列之间隔着一段空白。
+
+    只数「列数」不够：目录页的行尾页码也是第 2 列（实测《规训与惩罚》目录页会
+    被整页判成表格）。目录的页码紧贴着引导点，间隙很小；表格的列之间有明显的
+    空白区。实测列间隙 > 3 字宽能把两者分开：表格行全部成立，目录行全部不到。
+    """
+    if row["ncol"] < 2:
+        return False
+    xs = [L["x0"] for L in row["lines"]]
+    return max(b - a for a, b in zip(xs, xs[1:])) > 3.0 * bw
+
+
+def _table_flags(p, rows, bw, bh):
+    """逐行判定「这行属于表格块」，返回与 rows 等长的布尔列表。
+
+    两路证据，取并集：
+
+    ① region 标签（run_layout.py 给的）。有标签就直接信，这是最硬的证据。
+    ② 没标签时按几何判：连续的「表格行」（多列 + 大列间隙 + 行距紧密 + 行尾
+       不收句），至少 3 行才算一块。
+
+    为什么必须有 ②：table 标签实测只覆盖 4 页 / 138 行，而同一本书里散在正文中
+    的表格（p120 的沿革表、p150/p151 的牒文、p306/p320/p321 的喇嘛表）版面模型
+    全标成了 unassigned，光靠标签会整片漏掉，碎片照旧。
+
+    ② 的阈值是实测出来的，不是拍脑袋：
+      · 行距紧密（> 1.6 行高就断）：正文行距恒定在 1.0~1.1 行高，只有段落之间
+        才留空行；表格行之间几乎不留空。
+      · 行尾不收句：表格单元格里极少出现句号。少了这条，正文里连续几行的短行
+        也会被并进来（实测《规训与惩罚》p006 的章标题页有 3 行「章名 + 页码」）。
+      · 至少 3 行：两行凑不出一个「块」。
+    """
+    tabs = find_tables(p)
+    tagged = []
+    for L in rows:
+        if _keep_raw(p, L):
+            tagged.append(False)
+            continue
+        if L.get("region") in TBL_REGIONS:
+            tagged.append(True)
+            continue
+        cy = (L["y0"] + L["y1"]) / 2.0
+        inside = any(b[1] <= cy <= b[3]
+                     and b[0] - 0.5 * bw <= L["x0"] <= b[2] + 0.5 * bw for b in tabs)
+        tagged.append(bool(inside))
+
+    geo = [False] * len(rows)
+    loose = [L for L, f in zip(rows, tagged) if not f]
+    if loose:
+        vis = _visual_rows(loose, bw, bh)
+        segs, cur, prev_cy = [], [], None
+        for r in vis:
+            t = "".join(L["t"] for L in r["lines"]).strip()
+            closed = bool(t) and t[-1] in TABLE_END
+            tight = prev_cy is None or (r["cy"] - prev_cy) <= 1.6 * bh
+            if _row_is_tableish(r, bw) and not closed and tight:
+                cur.append(r)
+            else:
+                if len(cur) >= 3:
+                    segs.append(cur)
+                cur = []
+            prev_cy = r["cy"]
+        if len(cur) >= 3:
+            segs.append(cur)
+        pos = {id(L): i for i, L in enumerate(rows)}
+        for seg in segs:
+            for r in seg:
+                for L in r["lines"]:
+                    geo[pos[id(L)]] = True
+
+    return [bool(a) or b for a, b in zip(tagged, geo)]
+
+
+
+def table_blocks(p, rows, bw, bh):
+    """一页里被并成「表格块」的行组（每组是一串行对象，按阅读顺序）。
+
+    只有 ≥2 行才成块：单行的「表格」既没有可聚合的东西，也修不掉碎片。
+    目录页在调用方（plan_regions）就整页跳过了——目录行和表格行几何上分不开，
+    见那里的注释。
+    """
+    flag = _table_flags(p, rows, bw, bh)
+    blocks, cur = [], []
+    for L, f in zip(rows, flag):
+        if f:
+            cur.append(L)
+        else:
+            if len(cur) >= 2:
+                blocks.append(cur)
+            cur = []
+    if len(cur) >= 2:
+        blocks.append(cur)
+    return blocks
+
+
+def group_table_text(rows, bw, bh):
+    """把表格区的行聚成一块**整段文字**，不拆碎、也不假装是 Markdown 表格。
+
+    按视觉行分段，同一行内的单元格之间插一个全角空格（表格的列边界），行与行
+    之间用换行——读者能看出这是个表，我们又没有伪造列对齐。
+    行内用全角空格而不是空串拼接：单元格是独立的词（「共公僧」「池方僧官」），
+    直接粘起来会造出「共公僧池方僧官」这种书里不存在的词。
+    """
+    lines = []
+    for r in _visual_rows(rows, bw, bh):
+        parts = [L["t"].strip() for L in r["lines"]]
+        parts = [t for t in parts if t]
+        if parts:
+            lines.append("　".join(parts))
+    return "\n".join(lines)
+
+
+def plate_like(p, rows):
+    """这一页是不是「一整页都是图/表」的图版，但版面模型没认出来？
+
+    实测《中国僧官制度史》p053：页 JSON 里只有一个 header region，33 行 OCR
+    结果全是噪声（t-- / J. / 二 / ÷），没有一行带 text/content/paragraph_title
+    之类的正文区标签。这不是正文，是一整页插图的照片——照正文输出会在成书里
+    留下 12 个 ≤6 字碎片。
+
+    判据刻意保守（三条都要满足），因为误判会把整页正文换成一张图，那比丢字
+    更糟：
+      ① 页 JSON 确实跑过版面分析（有 regions 字段）。没跑过的老工作目录根本
+         没有证据，一律不当图版。
+      ② 清洗后的行里没有任何一行的 region 属于 TEXTISH_REGIONS。只要有一行
+         被标成正文，就说明这页有真文字。
+      ③ 清洗后至少 8 行。少于 8 行多半是空白页/章节扉页，不是图版。
+      ④ 页内几乎没有「长行」（≥12 个汉字）。图版的 OCR 结果全是符号和单字；
+         正文页即使整页被标成 unassigned，也必然有一批长行。这一条是兜底：
+         万一版面模型整页失效，也不能把正文换掉。
+
+    实测这条只命中僧官 1 页（p053），《规训与惩罚》0 页、黑格尔 0 页。
+    """
+    if not page_regions(p):
+        return False
+    if any(L.get("region") in TEXTISH_REGIONS for L in rows):
+        return False
+    if len(rows) < 8:
+        return False
+    # 再加一层：图版的 OCR 结果全是符号/单字（实测 p053 最长的一行只有 5 个字）。
+    # 正文页即使全部被标成 unassigned，也必然有一批 ≥12 汉字的长行——
+    # 少了这条保护，一次版面模型全军覆没就会把整页正文换成一张图。
+    long_cjk = sum(1 for L in rows if len(CJK.findall(L["t"])) >= 12)
+    return long_cjk <= 1
+
+
+def _rows_of(pairs, cleaned):
+    """[(页idx, 行idx), ...] → 行对象列表（保持顺序）。"""
+    out = []
+    for pi, li in pairs:
+        rows = (cleaned or {}).get(pi) or []
+        if 0 <= li < len(rows):
+            out.append(rows[li])
+    return out
+
+
+def plan_regions(pages, cleaned, bw, bh, toc_ids=None):
+    """把图 / 表区变成「在原文位置插入的块」，返回 (ins, report)。
+
+      ins    {(页idx, 行idx): [块, ...]}，表示「在清洗后的这一行之前插入」。
+             块是 ("fig"|"tbl", 内容, 页idx, [(页idx, 行idx), ...])，最后一项是
+             这个块**取代**了哪些行。为什么把消费行塞进块里而不是单独返回一个
+             集合：裁图可能失败，失败时这些行必须留在正文里（见 build()），
+             调用方要能按块决定丢不丢。
+      report 计数，写进 report.json 供核对。
+
+    行索引按 **clean_page 之后** 的行序，因为 assemble 遍历的正是那份行。
+    """
+    ins = {}
+    report = {"figures": 0, "tables": 0, "table_lines": 0, "figure_lines": 0,
+              "plates": 0}
+
+    def anchor_before(rows, y):
+        """第一个 y0 >= y 的清洗行索引；没有就返回 len(rows)（= 插在页末）。"""
+        for i, L in enumerate(rows):
+            if L["y0"] >= y:
+                return i
+        return len(rows)
+
+    toc_ids = toc_ids or set()
+    for p in pages:
+        pi = p["idx"]
+        rows = cleaned.get(pi) or []
+        if not rows:
+            continue
+        # 目录页整页跳过：目录本身是「一串短行 + 行尾页码」，几何上跟表格一模一样
+        # （实测《规训与惩罚》目录页会被判成 2 块表，整个目录被并成两坨文字，
+        # 章节结构直接消失）。这是零成本就能避开的误判——目录页本来就被单独处理。
+        if pi in toc_ids:
+            continue
+        pos = {id(L): i for i, L in enumerate(rows)}
+
+        # ---- 表格：整块聚成一段文字，插在块首行原来的位置
+        for blk in table_blocks(p, rows, bw, bh):
+            idxs = [pos[id(L)] for L in blk if id(L) in pos]
+            if not idxs:
+                continue
+            text = group_table_text(blk, bw, bh).strip()
+            if not text:
+                continue
+            rows_gone = [(pi, i) for i in idxs]
+            ins.setdefault((pi, min(idxs)), []).append(("tbl", text, pi, rows_gone))
+            report["tables"] += 1
+            report["table_lines"] += len(idxs)
+
+        # ---- 插图：把区域里的 OCR 行换成裁出来的图
+        boxes = find_figures(p)
+        if not boxes and plate_like(p, rows):
+            # 整页图版：版面模型没打 image 标签，但这一页没有任何正文区，
+            # 行全是噪声。整页裁成一张图，比往成书里灌 33 行乱码强。
+            boxes = [plate_bbox(p)]
+            report["plates"] = report.get("plates", 0) + 1
+        for k, b in enumerate(boxes, 1):
+            inside = []
+            for i, L in enumerate(rows):
+                cy = (L["y0"] + L["y1"]) / 2.0
+                cx = (L["x0"] + L["x1"]) / 2.0
+                if b[1] <= cy <= b[3] and b[0] <= cx <= b[2] and not _keep_raw(p, L):
+                    inside.append(i)
+            a = inside[0] if inside else anchor_before(rows, b[3])
+            ins.setdefault((pi, a), []).append(
+                ("fig", "fig-p%03d-%d.png" % (pi + 1, k), pi,
+                 [(pi, i) for i in inside]))
+            report["figures"] += 1
+            report["figure_lines"] += len(inside)
+
+    return ins, report
+
+
 def char_width(L):
     return L["w"] / elen(L["t"])
 
@@ -952,12 +1345,18 @@ def match_entries(pages, cleaned, entries, toc_ids, bw, bh, offset=None):
 
 # ---------------------------------------------------------------- 组装
 def assemble(pages, cleaned, stream, matched, toc_ids, bw, bh, start=0,
-             notes=None, subs=None, orphan=None):
-    """把正文行拼成块：标题块 + 段落块 + 章末脚注块。
+             notes=None, subs=None, orphan=None, ins=None, gone=None):
+    """把正文行拼成块：标题块 + 段落块 + 章末脚注块 + 图/表块。
 
     notes/subs/orphan 来自 extract_notes() + plan_notes()。三者全为空时（没跑
     run_layout.py 的工作目录就是如此）输出与从前逐字节一致。
+
+    ins 来自 plan_regions()：{(页idx, 行idx): [块, ...]}，表示「在这一行之前插入
+    图/表块」；gone 是「文字已被图/表块取代」的行。两者都为空（没有 regions
+    字段的老工作目录）时整条路径不生效，输出与从前逐字节一致——这是硬回归的落点。
     """
+    ins = ins or {}
+    gone = gone or set()
     head_at = {}
     for m in matched:
         head_at[(m["page"], m["line"])] = m
@@ -965,7 +1364,9 @@ def assemble(pages, cleaned, stream, matched, toc_ids, bw, bh, start=0,
     # 标题被拆成多行时，其余片段标记为已消费。
     # 印刷标题常折成 2~3 行（如「第五讲 / 黑格尔辩证法的逻辑学… / 论的统一」），
     # 命中行可能是中间那行，所以前后都要扫，不能只看前半截，也不能只管 level 1。
-    consumed = set()
+    # 图/表块已经吃掉了这些行：它们不再进正文流。set 里放的是 (页idx, 行idx)，
+    # 与标题残片用的是同一套消费机制，跳过逻辑不必再写一遍。
+    consumed = set(gone)
     pos_of = {p: i for i, p in enumerate(stream)}
     for m in matched:
         k = pos_of.get((m["page"], m["line"]))
@@ -1099,9 +1500,33 @@ def assemble(pages, cleaned, stream, matched, toc_ids, bw, bh, start=0,
             buf_page.clear()
             buf_len[0] = 0
 
+    placed = set()
+
+    def put_regions(pi, li):
+        """把「本来该在这一行之前」的图/表块落盘。
+
+        位置必须按**行**算，不能按页批量后置：插图常夹在段落中间（实测 p143 的
+        示意图在页面中部），表格后面紧跟的就是讨论该表的正文。整页后置会让图
+        跑到下一章去。
+
+        插入块会**主动断段**：图/表是块级元素，前后文本来就不连着。
+        """
+        items = ins.get((pi, li))
+        if not items:
+            return
+        flush()
+        for b in items:
+            if b[0] == "fig":
+                blocks.append(("img", b[1], b[2] + 1))
+            else:
+                blocks.append(("tbl", b[1], b[2] + 1))
+        placed.add((pi, li))
+
     for (pi, li) in stream[start:]:
         L = cleaned[pi][li]
         m = head_at.get((pi, li))
+        if ins:
+            put_regions(pi, li)
         if m is not None:
             flush()
             # 章边界：把本章已引用的注和锚不上的注一次性落盘
@@ -1152,6 +1577,12 @@ def assemble(pages, cleaned, stream, matched, toc_ids, bw, bh, start=0,
         buf_len[0] += len(t)
         buf.append(t)
         prev = (pi, L)
+    flush()
+    # 清洗后行数为 0 的页不在 stream 里，它的锚点遍历不到——补一遍，
+    # 否则那些页的图/表会静默丢失（这正是本次要修的病）。
+    for key in sorted(ins, key=lambda k: (k[0], k[1])):
+        if key not in placed:
+            put_regions(*key)
     flush()
     emit_notes()
     # 收尾：计划内联、但落点那一行被跳过的注，补成页尾注。
@@ -1210,6 +1641,27 @@ def to_markdown_with_pages(blocks, meta):
             if not txt:
                 continue
             emit("[^%s]: %s" % (b[1], txt))
+            emit("")
+        elif b[0] == "img":
+            # 图：md 里就是标准的 ![](images/xxx.png)。页码放进 page_map，
+            # 让 audit 也能把插图换算成原书页。
+            pg = b[2] if len(b) > 2 else None
+            if pg:
+                page_map.append((pos[0], pg))
+            emit("![](images/%s)" % b[1])
+            emit("")
+        elif b[0] == "tbl":
+            # 表：整块文字放进 ```table 围栏。**不假装是 Markdown 表格**——
+            # 我们没有列对齐证据，把单元格用 | 拼起来等于凭空造结构。
+            # 围栏里逐行原样保留（行内全角空格就是列边界），epub3 渲染成
+            # <pre class="table-block">，等宽字体显示。
+            pg = b[2] if len(b) > 2 else None
+            if pg:
+                page_map.append((pos[0], pg))
+            emit("```table")
+            for ln in (b[1] or "").split("\n"):
+                emit(ln)
+            emit("```")
             emit("")
         elif b[0] == "pn":
             # 没能锚定的注：排成引用块（视觉上区隔于正文），形如「① 《晋书》卷九五…」
@@ -1270,6 +1722,114 @@ def drop_back_cover(pages):
         else:
             break
     return pages
+
+
+# 裁图的外扩边距，与 make_review.py 保持一致（8px 左右、6px 上下）。
+# 不另写一套：同一本书的审查图与成书插图用同一个边距，人工比对时位置才对得上。
+CROP_PAD_X = 8
+CROP_PAD_Y = 6
+
+
+def crop_figure(page_png, bbox, dst, page_wh=None):
+    """按 region bbox 从整页 PNG 裁出插图，写到 dst。返回 (宽, 高) 或 None。
+
+    边距逻辑直接复用 make_review.py 的那两行：外扩 8/6 像素后夹到图像范围内。
+    不外扩的话，插图四周的细线会被切掉半像素，看着像被裁残了。
+
+    page_wh 是页 JSON 里的 (w, h)，即 bbox 所在的坐标系。实际 PNG 的分辨率
+    可能与它不同（换过 DPI 重渲、或工作目录是分几次跑出来的），此时必须按比例
+    换算——否则裁出来的是「差不多位置的一张图」，肉眼很难发现裁歪了。
+    实测：ocr_merged 的页 JSON 是 2480×3508，同目录的 pages/*.png 是 2594×3588，
+    差 4.6%，不换算就会偏出去几十像素。
+
+    裁剪失败（缺页面图 / PIL 装不上 / bbox 退化）返回 None，**绝不抛异常**：
+    一张图裁不出来不该让整本书的成书阶段失败。调用方负责报数。
+    """
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    if not page_png or not os.path.exists(page_png):
+        return None
+    try:
+        img = Image.open(page_png).convert("RGB")
+    except Exception:
+        return None
+    x0, y0, x1, y1 = bbox
+    if page_wh:
+        sw = img.width / float(page_wh[0] or img.width)
+        sh = img.height / float(page_wh[1] or img.height)
+        if abs(sw - 1.0) > 0.01 or abs(sh - 1.0) > 0.01:
+            x0, x1 = x0 * sw, x1 * sw
+            y0, y1 = y0 * sh, y1 * sh
+    box = (max(0, int(x0) - CROP_PAD_X), max(0, int(y0) - CROP_PAD_Y),
+           min(img.width, int(x1) + CROP_PAD_X), min(img.height, int(y1) + CROP_PAD_Y))
+    if box[2] - box[0] < 8 or box[3] - box[1] < 8:
+        return None
+    d = os.path.dirname(os.path.abspath(dst))
+    if d:
+        os.makedirs(d, exist_ok=True)
+    img.crop(box).save(dst, "PNG", optimize=True)
+    return box[2] - box[0], box[3] - box[1]
+
+
+def _find_pages_dir(src, meta):
+    """页面 PNG 所在目录：优先 meta["pages_dir"]，否则 src 旁边/下面的 pages/。"""
+    if meta.get("pages_dir"):
+        return meta["pages_dir"]
+    base = os.path.dirname(os.path.abspath(src))
+    for cand in (os.path.join(base, "pages"), os.path.join(src, "pages"),
+                 os.path.join(base, os.path.basename(os.path.normpath(src)), "pages")):
+        if os.path.isdir(cand):
+            return cand
+    return os.path.join(base, "pages")
+
+
+def _images_dir(src, meta):
+    """插图落盘目录。
+
+    优先 meta["out_dir"]（make_md.py 传的 --out），让图片和 book.md 落在同一个
+    产物目录下，md 里写 images/xxx.png 就能直接相对引用；没给时退到
+    <src 的父目录>/out/images（bookflow 的工作目录布局正是 <work>/out）。
+    """
+    if meta.get("images_dir"):
+        return meta["images_dir"]
+    if meta.get("out_dir"):
+        return os.path.join(meta["out_dir"], "images")
+    base = os.path.dirname(os.path.abspath(src))
+    return os.path.join(base, "out", "images")
+
+
+def emit_images(pages, src, meta, report, cleaned=None):
+    """把每个插图区裁成 PNG，返回要插入 md 的 [(页idx, 裁图文件名)]。
+
+    页面 PNG 用的是**未清洗的原始页**（p["name"]）：clean_page 会把页眉页脚删掉，
+    但裁图要的是原始扫描像素，两者无关。
+    """
+    outdir = _images_dir(src, meta)
+    pagesdir = _find_pages_dir(src, meta)
+    made, failed = [], []
+    for f in extract_figures(pages, cleaned):
+        p = pages[f["page"]]
+        png = os.path.join(pagesdir, p.get("name") or ("p-%03d.png" % (f["page"] + 1)))
+        dst = os.path.join(outdir, f["name"])
+        size = crop_figure(png, f["bbox"], dst, (p["w"], p["h"]))
+        if size is None:
+            failed.append({"page": f["page"] + 1, "name": f["name"],
+                           "reason": "缺页面图或裁剪失败"})
+            continue
+        made.append(f)
+    report["images"] = {
+        "dir": outdir, "made": len(made), "failed": len(failed),
+        "files": [f["name"] for f in made], "failed_detail": failed,
+    }
+    if failed:
+        # 静默丢图正是这次要修的病，裁不出来必须吭声（但不中断成书）。
+        print("  警告：%d 个插图区裁剪失败（缺页面图？），这些位置不会出现图片："
+              % len(failed))
+        for x in failed[:10]:
+            print("    p%03d %s（%s）" % (x["page"], x["name"], x["reason"]))
+    return made
 
 
 def dedupe_pages(pages, min_dup=3):
@@ -1357,8 +1917,39 @@ def build(src=None, meta=None):
         notes.update(star_notes)
         for key, v in star_subs.items():
             subs.setdefault(key, []).extend(v)
+    # 图 / 表：不再静默丢弃。plan_regions 决定「插在哪、吃掉哪些行」，
+    # emit_images 负责真正把插图裁出来落盘。两者都只在页 JSON 带 regions 字段
+    # 时有产出——没跑过版面分析的老工作目录，这一步是空操作（硬回归靠这个）。
+    ins, reg_report = plan_regions(pages, cleaned, bw, bh, toc_ids)
+    figs = emit_images(pages, src, meta, reg_report, cleaned)
+    made = {f["name"] for f in figs}
+    gone = set()
+    for key in list(ins):
+        kept = []
+        for b in ins[key]:
+            if b[0] == "fig" and b[1] not in made:
+                # 图没裁出来（缺页面图 / PIL 不可用）。这时有两条烂路：
+                #   ① 仍插 ![](images/xxx.png) → 成书里一串碎图占位符；
+                #   ② 把这些行丢掉 → 图没出来、字也没了，两头落空。
+                # 走第三条：把该区的 OCR 行按表格的方式**聚成一块**，
+                # 既保住文字，又不再散成 30 个独立段落。
+                plate = _rows_of(b[3], cleaned)
+                text = group_table_text(plate, bw, bh).strip() if plate else ""
+                if not text:
+                    continue
+                kept.append(("tbl", text, b[2]))
+                reg_report["uncropped_figures"] = \
+                    reg_report.get("uncropped_figures", 0) + 1
+                gone.update(b[3])
+                continue
+            gone.update(b[3])
+            kept.append(b[:3])
+        if kept:
+            ins[key] = kept
+        else:
+            del ins[key]
     blocks = assemble(pages, cleaned, stream, matched, toc_ids, bw, bh, start,
-                      notes=notes, subs=subs, orphan=orphan)
+                      notes=notes, subs=subs, orphan=orphan, ins=ins, gone=gone)
     md, page_map = to_markdown_with_pages(blocks, meta)
     n_notes = sum(len(v) for v in notes.values())
     n_linked = sum(len(v) for v in subs.values())
@@ -1381,5 +1972,15 @@ def build(src=None, meta=None):
         "notes": {"total": n_notes, "linked": n_linked,
                   "orphan": n_notes - n_linked,
                   "pages": len(notes)},
+        # 图 / 表降级的明细：裁了几张、并了几块表、各自吃掉多少行。
+        # 这几项是「这次成书为什么和图版对得上」的唯一证据，必须进 report。
+        "regions": {
+            "figures": reg_report.get("figures", 0),
+            "plates": reg_report.get("plates", 0),
+            "figure_lines": reg_report.get("figure_lines", 0),
+            "tables": reg_report.get("tables", 0),
+            "table_lines": reg_report.get("table_lines", 0),
+            "images": reg_report.get("images", {}),
+        },
     }
     return md, report, cleaned, pages

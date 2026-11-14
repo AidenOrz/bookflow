@@ -567,5 +567,194 @@ class TestAuditPageLookup(unittest.TestCase):
         self.assertIsNone(audit.page_of([], 5))
 
 
+class TestFigureRegions(unittest.TestCase):
+    """图 / 表区：不再静默丢弃。
+
+    实测背景（《中国僧官制度史》350 页）：table region 138 行、image region 22 行，
+    既不在 DROP_REGIONS 里、也没有任何裁图/聚合代码，于是 4 个表格页把每一行都
+    独立成段，成书 1820 段里冒出 97 个 ≤6 字碎片（「共公僧」「卜座」），占 5.3%；
+    3 个插图页的标注字同样当正文流出去。下面每条用例都钉一个具体缺陷。
+    """
+
+    def _page(self, idx, lines, regions=None, w=2480, h=3508):
+        p = synth_page(idx, lines, w, h)
+        if regions is not None:
+            p["regions"] = regions
+        return p
+
+    def _run(self, pages, meta=None, **kw):
+        """把页写进临时目录跑 layout.build，返回 (md, report, 输出目录)。"""
+        import json
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        src = os.path.join(d, "ocr_layout")
+        os.makedirs(src)
+        for p in pages:
+            q = dict(p)
+            del q["idx"]
+            with open(os.path.join(src, q["name"] + ".json"), "w", encoding="utf-8") as f:
+                json.dump(q, f, ensure_ascii=False)
+        meta = dict(meta or {})
+        meta.setdefault("title", "t")
+        meta.setdefault("out_dir", os.path.join(d, "out"))
+        pages_dir = kw.pop("pages_dir", None)
+        if pages_dir:
+            meta["pages_dir"] = pages_dir
+        md, rep, cleaned, ps = layout.build(src, meta)
+        return md, rep, os.path.join(d, "out")
+
+    def test_whole_page_region_is_not_an_illustration(self):
+        """整页容器框不算插图：实测封面 image region 是 (54,78)-(2415,3394)。
+
+        照它裁出来是一张重复的封面，还让书里凭空多一张假插图。
+        """
+        p = self._page(0, [(300, 400, 2100, 480, "封面上的字。")],
+                       regions=[{"x0": 54, "y0": 78, "x1": 2415, "y1": 3394,
+                                 "cls": "image", "s": 0.97}])
+        self.assertEqual(layout.find_figures(p), [])
+
+    def test_inline_illustration_is_cropped_and_placed(self):
+        """正文中间的插图：裁成文件、并在**原来的位置**插 ![](...)。
+
+        位置必须按行插，不能按页批量后置——插图常夹在段落中间，
+        整页后置会让图跑到下一章去。
+        """
+        from PIL import Image
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        imgs = os.path.join(d, "pages")
+        os.makedirs(imgs)
+        Image.new("RGB", (2480, 3508), "white").save(os.path.join(imgs, "p-001.png"))
+        p = self._page(0, [
+            (300, 400, 2100, 480, "插图前面的正文一行。"),
+            (400, 900, 2000, 1400, "图里的标注字"),
+            (300, 2000, 2100, 2080, "插图后面的正文一行。"),
+        ], regions=[{"x0": 350, "y0": 850, "x1": 2050, "y1": 1450,
+                     "cls": "image", "s": 0.9}])
+        md, rep, out = self._run([p], pages_dir=imgs)
+        self.assertEqual(rep["regions"]["figures"], 1)
+        self.assertEqual(rep["regions"]["images"]["made"], 1)
+        self.assertTrue(os.path.exists(os.path.join(out, "images", "fig-p001-1.png")))
+        lines = [l for l in md.split("\n") if l.strip()]
+        img_at = next(i for i, l in enumerate(lines) if l.startswith("![]("))
+        before = next(i for i, l in enumerate(lines) if "插图前面" in l)
+        after = next(i for i, l in enumerate(lines) if "插图后面" in l)
+        self.assertLess(before, img_at, "图必须在「插图前面」那段之后")
+        self.assertLess(img_at, after, "图必须在「插图后面」那段之前")
+        self.assertNotIn("图里的标注字", md, "图区里的 OCR 行不能再当正文流出去")
+
+    def test_missing_page_png_does_not_emit_dangling_image(self):
+        """裁不出图时**不能**在 md 里留下指向不存在文件的死链。
+
+        epub3.validate 会把死链报成「图片不存在」，成品里是一串碎图占位符。
+        宁可这张图缺席并告警，也不能产出坏链。
+        """
+        p = self._page(0, [(300, 400, 2100, 480, "正文。")],
+                       regions=[{"x0": 350, "y0": 850, "x1": 2050, "y1": 1450,
+                                 "cls": "image", "s": 0.9}])
+        md, rep, out = self._run([p], pages_dir=os.path.join(tempfile.gettempdir(),
+                                                            "no-such-pages-dir"))
+        self.assertNotIn("![](", md)
+        self.assertEqual(rep["regions"]["images"]["made"], 0)
+        self.assertEqual(len(rep["regions"]["images"]["failed_detail"]), 1)
+
+    def test_table_region_grouped_not_split(self):
+        """表格区必须聚成一块，不能一行一段（这正是 97 个碎片的来源）。"""
+        rows = [(300, 1900 + i * 80, 600, 1960 + i * 80, t)
+                for i, t in enumerate(["共公僧", "池方僧官", "监导", "左街僧录"])]
+        rows += [(1100, 1900 + i * 80, 1500, 1960 + i * 80, t)
+                 for i, t in enumerate(["承玄署", "州郡僧正", "卜座", "州僧王"])]
+        p = self._page(0, [(300, 400, 2100, 480, "上表说明如下。")] + rows,
+                       regions=[{"x0": 250, "y0": 1850, "x1": 2200, "y1": 2260,
+                                 "cls": "table", "s": 0.9}])
+        md, rep, _ = self._run([p])
+        self.assertEqual(rep["regions"]["tables"], 1)
+        # 表格块里的行必须带全角空格连成一整块，而不是各自成段
+        self.assertIn("共公僧　承玄署", md)
+        # 被合并的行不再作为独立段落出现
+        paras = [l.strip() for l in md.split("\n") if l.strip()]
+        self.assertNotIn("共公僧", paras)
+
+    def test_no_regions_means_no_change(self):
+        """没有 regions 字段的老工作目录：一个图表都不该产出（硬回归的落点）。"""
+        p = synth_page(0, [(300, 400, 2100, 480, "正文第一行足够长。"),
+                           (300, 500, 2100, 580, "唐初"),
+                           (300, 600, 2100, 680, "祠部")])
+        md, rep, out = self._run([p])
+        self.assertEqual(rep["regions"]["figures"], 0)
+        self.assertEqual(rep["regions"]["tables"], 0)
+        self.assertNotIn("![](", md)
+        self.assertFalse(os.path.isdir(os.path.join(out, "images")))
+        self.assertIn("唐初", md, "没有版面证据时短行仍是正文，不许擅自吞掉")
+
+    def test_plate_page_becomes_one_image(self):
+        """整页图版：页内没有任何正文区、行全是噪声 → 整页裁成一张图。
+
+        实测 p053 就是这样一整页插图，33 行 OCR 噪声全被当正文流出去。
+        """
+        from PIL import Image
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        imgs = os.path.join(d, "pages")
+        os.makedirs(imgs)
+        Image.new("RGB", (2480, 3508), "white").save(os.path.join(imgs, "p-001.png"))
+        noise = [(300 + i * 40, 400 + i * 90, 380 + i * 40, 460 + i * 90, t)
+                 for i, t in enumerate(["t--", "J.", "II", "±二", "M片L", "1:",
+                                        "主三", "25", "iv"])]
+        p = self._page(0, noise, regions=[{"x0": 1193, "y0": 114, "x1": 1590,
+                                           "y1": 181, "cls": "header", "s": 0.9}])
+        md, rep, out = self._run([p], pages_dir=imgs)
+        self.assertEqual(rep["regions"]["plates"], 1)
+        self.assertTrue(os.path.exists(os.path.join(out, "images", "fig-p001-1.png")))
+        self.assertNotIn("t--", md)
+
+    def test_plate_rule_does_not_eat_body_page(self):
+        """保护：即使版面模型整页失效，也不能把一页正文换成一张图。"""
+        p = self._page(0, [(300, 400 + i * 80, 2100, 480 + i * 80,
+                            "第%d行这是一段足够长的正文内容，不该被当成图版。" % i)
+                           for i in range(10)],
+                       regions=[{"x0": 1193, "y0": 114, "x1": 1590, "y1": 181,
+                                 "cls": "header", "s": 0.9}])
+        self.assertFalse(layout.plate_like(p, layout.clean_page(p, 63.0, 62.6, set())))
+
+    def test_toc_page_is_not_a_table(self):
+        """目录页整页跳过：目录行「标题 + 行尾页码」几何上和表格行完全一样。
+
+        实测《规训与惩罚》目录页会被判成 2 块表，整个目录被并成两坨文字。
+        """
+        # 带上「目 录」标题才算目录页（detect_toc_pages 的判据），
+        # 这正是生产路径：目录页先被识别出来，plan_regions 才会整页跳过。
+        rows = [(400, 400, 1200, 470, "目 录")]
+        for i, (title, pg) in enumerate([("第一章　犯人的肉体", 35),
+                                        ("第二章　断头台的场面", 81),
+                                        ("第三章　全景敞视主义", 219),
+                                        ("第四章　非法活动", 290)]):
+            y = 1200 + i * 90
+            rows.append((300, y, 1500, y + 60, title))
+            rows.append((1790, y, 1880, y + 60, str(pg)))
+        p = self._page(0, rows, regions=[{"x0": 280, "y0": 1150, "x1": 1900,
+                                          "y1": 1600, "cls": "table", "s": 0.9}])
+        md, rep, _ = self._run([p])
+        self.assertEqual(rep["regions"]["tables"], 0)
+
+    def test_crop_scales_when_png_size_differs(self):
+        """页 JSON 的坐标系与页面 PNG 分辨率不一致时必须按比例换算。
+
+        实测：ocr_merged 的页 JSON 是 2480×3508，同目录 pages/*.png 是 2594×3588，
+        差 4.6%，不换算就裁偏几十像素——而这种偏移肉眼几乎看不出来。
+        """
+        from PIL import Image
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        big = os.path.join(d, "big.png")
+        Image.new("RGB", (2480 * 2, 3508 * 2), "white").save(big)
+        dst = os.path.join(d, "crop.png")
+        size = layout.crop_figure(big, (100, 100, 300, 250), dst, (2480, 3508))
+        self.assertIsNotNone(size)
+        # bbox 宽 200、高 150；2 倍图上是 400x300，再加 8/6 的边距
+        self.assertEqual(size[0], 400 + 2 * layout.CROP_PAD_X)
+        self.assertEqual(size[1], 300 + 2 * layout.CROP_PAD_Y)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

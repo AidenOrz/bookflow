@@ -68,10 +68,12 @@ def esc_attr(s):
 
 # ------------------------------------------------------------------ 解析
 def parse_md(text):
-    """Markdown → [(kind, payload)]。kind ∈ h / p / q / def / img。
+    """Markdown → [(kind, payload)]。kind ∈ h / p / q / def / img / tbl。
 
     `q` 是引用块（我们用它承载"锚不上正文的注文"），`def` 是脚注定义。
     连续的引用行合并成一条，避免每条注文各占一个 blockquote。
+    `tbl` 是中文表格区（layout 用三反引号 + table 标注包起来），渲染成
+    `<pre class="table-block">`；围栏内的空行属于表格行距，不能当分段符。
     """
     blocks, cur = [], []
 
@@ -80,8 +82,27 @@ def parse_md(text):
             blocks.append(("p", "".join(cur)))
             del cur[:]
 
+    in_tbl = [False]
     for raw in text.split("\n"):
         line = raw.rstrip()
+        # ```table 围栏：layout 把表格区的文字整块放在这里。
+        # 围栏内的空行不能 flush（那是表格的行间距），所以要在通用的
+        # 「空行即分段」判断**之前**处理。围栏外的一切照旧。
+        if line.strip().startswith("```"):
+            if in_tbl[0]:
+                in_tbl[0] = False
+                blocks.append(("tbl", "\n".join(cur)))
+                del cur[:]
+            elif line.strip() == "```table":
+                flush()
+                in_tbl[0] = True
+            else:
+                # 别的围栏我们不认识：按普通文本收，不猜。
+                cur.append(line)
+            continue
+        if in_tbl[0]:
+            cur.append(line)
+            continue
         if not line.strip():
             flush()
             continue
@@ -106,6 +127,11 @@ def parse_md(text):
             blocks.append(("q", m.group(1).strip()))
             continue
         cur.append(line)
+    if in_tbl[0]:
+        # 围栏没闭合（md 被截断 / 手改坏了）：把已收到的内容原样落成表格块。
+        # 直接丢会静默吞掉这一段——那正是这次要修的病。
+        blocks.append(("tbl", "\n".join(cur)))
+        del cur[:]
     flush()
     return blocks
 
@@ -182,6 +208,13 @@ def render_chapter(ch, fid, lang, toc_depth):
         elif k == "img":
             # src 是属性位；图片名可能含 " 或 &，必须 esc_attr
             body.append('<figure><img src="%s" alt="插图"/></figure>' % esc_attr(b[1]))
+        elif k == "tbl":
+            # 表格区：整块原文放进 <pre class="table-block">。
+            # 为什么是 pre 而不是 <table>：我们没有列对齐证据，硬拼成表格等于
+            # 凭空造结构；pre 保留原样的列边界（行内全角空格）且等宽对齐，
+            # 读者能看出这是张表，我们又没伪造任何东西。
+            body.append('<pre class="table-block">%s</pre>'
+                        % esc(b[1].strip("\n")))
         # def 在文件末尾统一渲染
 
     # 脚注区：只渲染本文件真正引用到的注，且按引用顺序编号
@@ -229,14 +262,53 @@ aside.endnote{display:block;font-size:.86em;color:#333;margin:.3em 0 .3em 1.2em;
 aside.endnote p{text-indent:0;margin:.2em 0;}
 figure{margin:1.2em auto;text-align:center;page-break-inside:avoid;break-inside:avoid;}
 figure img{max-width:100%;height:auto;}
+/* 表格区：不重建结构，只保证「不拆碎」。pre 保留原样列边界，等宽对齐。 */
+pre.table-block{font-family:"Source Han Serif SC","Noto Serif CJK SC","Songti SC",serif;
+ font-size:.86em;line-height:1.5;margin:1em 0;padding:.5em .6em;
+ white-space:pre-wrap;word-break:break-all;background:#f7f7f7;
+ border-left:3px solid #ccc;page-break-inside:avoid;break-inside:avoid;}
 .cover-page{margin:0;padding:0;text-align:center;}
 .cover-page img{max-width:100%;height:auto;}
 """
 
 
+def find_images(blocks, base_dir):
+    """md 里引用到的图片 → {包内文件名: 磁盘路径}。
+
+    只认相对路径（`images/fig-p143-1.png`），不认 http/data URI——那些不是
+    包内资源，硬拷进来反而会造出坏包。找不到的图**不在这里报错**：
+    validate() 会逐条报「图片不存在」，而 build 不该因为缺一张图就整体失败。
+
+    base_dir 是 md 所在目录。不是「当前工作目录」：make_epub.py 从别处调用时
+    cwd 与 md 所在目录常常不是同一个，用 cwd 会一整天找不到图。
+    """
+    got = {}
+    for b in blocks:
+        if b[0] != "img":
+            continue
+        src = (b[1] or "").strip()
+        if not src or src.startswith(("http:", "https:", "data:", "mailto:")):
+            continue
+        if os.path.isabs(src):
+            continue
+        p = os.path.normpath(os.path.join(base_dir or ".", src))
+        if os.path.exists(p):
+            got[src.replace(os.sep, "/")] = p
+    return got
+
+
+MEDIA_BY_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".gif": "image/gif", ".svg": "image/svg+xml",
+                ".webp": "image/webp"}
+
+
 def build(md_text, out, title="", author="", publisher="", lang="zh-CN",
-          toc_depth=3, cover_jpg=None, css_path=None):
-    """Markdown → EPUB3 文件。返回统计字典。"""
+          toc_depth=3, cover_jpg=None, css_path=None, base_dir=None):
+    """Markdown → EPUB3 文件。返回统计字典。
+
+    base_dir：md 里相对图片路径的基准目录（通常是 md 所在目录）。给 None 时
+    按当前工作目录解析——旧调用方不传也照旧能用。
+    """
     blocks = parse_md(md_text)
     chapters = split_chapters(blocks)
     if not chapters:
@@ -252,6 +324,17 @@ def build(md_text, out, title="", author="", publisher="", lang="zh-CN",
         manifest.append('<item id="c%03d" href="%s" media-type="application/xhtml+xml"/>' % (i, fn))
         spine.append('<itemref idref="c%03d"/>' % i)
         nav_items.append((esc(ch["title"] or "正文"), fn, nav))
+
+    # 图片：md 里 ![](images/fig-p143-1.png) 引用的文件必须真的进包，
+    # 否则成书里就是一个个碎图占位符（旧版正是这样：parse_md 认了 img，
+    # build 却从没把文件塞进 files，OPF manifest 里也没有条目）。
+    imgs = find_images(blocks, base_dir)
+    for i, (rel, path) in enumerate(sorted(imgs.items()), 1):
+        with open(path, "rb") as f:
+            files[rel] = f.read()
+        ext = os.path.splitext(rel)[1].lower()
+        manifest.append('<item id="img%03d" href="%s" media-type="%s"/>'
+                        % (i, esc_attr(rel), MEDIA_BY_EXT.get(ext, "application/octet-stream")))
 
     if css_path and os.path.exists(css_path):
         with open(css_path, "rb") as f:

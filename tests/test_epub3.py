@@ -382,5 +382,108 @@ class TestTocDepth(unittest.TestCase):
                     self.assertEqual(epub3.validate(out), 0)
 
 
+class TestImagesAndTables(unittest.TestCase):
+    """epub3：md 里引用的图片必须真的进包，表格围栏必须渲染成一块。
+
+    修之前 build() 的 files 只有 xhtml/css/cover.jpg：parse_md 认了 ![](x.png)，
+    但文件从没进 zip、OPF manifest 也没有条目——成品里是一串碎图占位符。
+    """
+
+    def test_md_images_packed_and_in_manifest(self):
+        """md 里引用的图片：文件进 zip，OPF 有 manifest 条目，src 可达。"""
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "images"))
+            Image.new("RGB", (40, 30), "white").save(
+                os.path.join(d, "images", "fig-p001-1.png"))
+            md = "# 第一章\n\n上文。\n\n![](images/fig-p001-1.png)\n\n下文。\n"
+            out = os.path.join(d, "t.epub")
+            st = epub3.build(md, out, title="t", base_dir=d)
+            with zipfile.ZipFile(out) as z:
+                names = set(z.namelist())
+                opf = z.read("content.opf").decode("utf-8")
+                x = z.read("c001.xhtml").decode("utf-8")
+            self.assertIn("images/fig-p001-1.png", names)
+            self.assertIn('href="images/fig-p001-1.png"', opf)
+            self.assertIn('media-type="image/png"', opf)
+            self.assertIn('<figure><img src="images/fig-p001-1.png"', x)
+            self.assertEqual(epub3.validate(out), 0)
+
+    def test_missing_image_stays_detectable(self):
+        """图不在磁盘上时：不硬塞进包，validate 必须报「图片不存在」。
+
+        这是刻意的行为分界——build 不因为缺一张图整体失败，但也不能假装没事。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            md = "# 第一章\n\n![](images/nope.png)\n"
+            out = os.path.join(d, "t.epub")
+            epub3.build(md, out, title="t", base_dir=d)
+            with zipfile.ZipFile(out) as z:
+                self.assertNotIn("images/nope.png", set(z.namelist()))
+            self.assertGreater(epub3.validate(out), 0)
+
+    def test_table_fence_renders_as_pre(self):
+        """```table 围栏 → <pre class="table-block">，围栏内空行不当分段。
+
+        表格的行距会留下空行；若按普通 md 处理，空行会把一块表切成 N 个段落，
+        那正是 layout 花力气聚合掉的东西，不能在渲染端又拆回去。
+        """
+        B3 = "`" * 3
+        md = "\n".join([
+            "# 第一章", "",
+            "上表说明如下。", "",
+            B3 + "table",
+            "唐初　鸿胪寺（崇玄署）",
+            "武则天延载元年（694）　祠部",
+            "",
+            "玄宗开元二十四年（736）　鸿胪寺（崇玄署）",
+            B3, "",
+            "表后正文。", "",
+        ])
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "t.epub")
+            st = epub3.build(md, out, title="t")
+            with zipfile.ZipFile(out) as z:
+                x = z.read("c001.xhtml").decode("utf-8")
+            self.assertEqual(x.count('<pre class="table-block">'), 1,
+                             "空行不能把一块表拆成两个 pre")
+            block = x.split('<pre class="table-block">', 1)[1].split("</pre>", 1)[0]
+            self.assertIn("唐初", block)
+            self.assertIn("玄宗开元二十四年", block, "空行之后的单元格必须还在块里")
+            self.assertEqual(epub3.validate(out), 0)
+            self.assertEqual(st["chapters"], 1)
+
+    def test_unclosed_table_fence_not_swallowed(self):
+        """围栏没闭合（md 被截断）：内容仍要落成表格块，不能被静默吞掉。"""
+        B3 = "`" * 3
+        md = "# 第一章\n\n" + B3 + "table\n共公僧　承玄署\n池方僧官　州郡僧正\n"
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "t.epub")
+            epub3.build(md, out, title="t")
+            with zipfile.ZipFile(out) as z:
+                x = z.read("c001.xhtml").decode("utf-8")
+            self.assertIn("共公僧", x)
+            self.assertIn("州郡僧正", x)
+
+    def test_book_without_figures_unchanged(self):
+        """无图无表的书：产物里不能出现 img / table-block，校验仍为 0。
+
+        这是硬回归在 epub 侧的落点（规训/黑格尔两本书都是这种）。
+        """
+        md = "# 第一章\n\n正文一段。\n\n正文二段。\n"
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "t.epub")
+            st = epub3.build(md, out, title="t", base_dir=d)
+            with zipfile.ZipFile(out) as z:
+                x = z.read("c001.xhtml").decode("utf-8")
+                names = set(z.namelist())
+            self.assertNotIn("<img", x)
+            self.assertNotIn("table-block", x)
+            self.assertFalse([n for n in names if n.startswith("images/")])
+            self.assertEqual(epub3.validate(out), 0)
+            self.assertEqual(st["files"], 6,
+                             "无图时文件数不变（xhtml/css/nav/ncx/opf/container）")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
