@@ -53,13 +53,16 @@ PDF ──render──► pages/*.png              300dpi 灰度（pdftoppm）
 | `make_epub.py` | epub 阶段入口 | `epub3.py` 的 CLI |
 | `qa.py` / `check_epub.py` | 校验 | 成书前闸门（含脚注完整性）/ EPUB 包结构自校验 |
 | `jsonio.py` | IO 工具 | with 包住句柄；写临时文件再 rename |
+| `pagedoc.py` | **数据契约** | 页级 JSON 与 report.json 的 `schema`/`schema_version`/`producer`；老文件兼容、新版本拒绝；`stamp`/`read`/`check`/`describe` |
 
 ## 4. 数据契约
 
-页级 JSON（`ocr/*.json`、`ocr_fix/*.json`、`ocr_layout/*.json` 同一 schema）：
+页级 JSON（`ocr/*.json`、`ocr_fix/*.json`、`ocr_layout/*.json`、`ocr_text/*.json` 同一 schema）：
 
 ~~~json
 {
+  "schema": "bookflow.pages", "schema_version": 1,
+  "producer": {"name": "rapidocr", "version": "3.10.0"},
   "name": "p-020.png", "w": 2480, "h": 3509,
   "lines": [
     {"x0": 443, "y0": 767, "x1": 2168, "y1": 836,
@@ -71,6 +74,27 @@ PDF ──render──► pages/*.png              300dpi 灰度（pdftoppm）
 
 `region` / `r` / `regions` 是 **可选字段**，只有跑了 `run_layout.py` 才有。
 `layout.py` 对缺失字段的行为与旧版完全一致。
+
+### 4.1 版本字段（`pagedoc.py`）
+
+四个写入方（`run_ocr.py` / `repair.py` / `run_layout.py` / `textlayer.py`）都必须调用
+`pagedoc.stamp(doc, pagedoc.producer(name, version))` 再写盘。`producer.name` 取值：
+`rapidocr` / `rapidocr-repair` / `pp_doc_layoutv3` / `pdftotext`。
+
+`out/report.json` 用 `pagedoc.stamp_report()`，schema 为 `bookflow.report`。
+
+**两条硬约束**：
+
+1. **向后兼容**：没有 `schema` / `schema_version` 的老 JSON 必须照常读，
+   `pagedoc.check()` 返回空列表。三本验证书工作目录里几千个老文件不能因此跑不动。
+2. **版本不认识就拒绝**：`schema_version` 不等于当前值是**错误**而不是警告。
+   本项目头号风险是静默出错，宁可停下来让人升级代码或降级数据。
+
+`producer` 表达**真实生成来源**，任何加载/加工/回填步骤都不得改写它——
+它是判断「这份数据该不该信」的唯一依据（文字层可信度 1.0，OCR 约 0.985）。
+
+为什么不引 Pydantic：只有 4 个写入方、字段少，严格校验会把「兼容旧数据」变成负担。
+只校验版本号能不能认，其余交给各阶段自己的断言。
 
 ## 5. 关键设计决策
 
