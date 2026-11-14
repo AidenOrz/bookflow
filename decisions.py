@@ -33,6 +33,7 @@ import os
 import re
 
 import jsonio
+import pagedoc
 
 SCHEMA_VERSION = 1
 VERDICTS = ("A", "B", "C", "?")
@@ -218,7 +219,7 @@ def _lines_with(ocr_dir, page, wrong):
     path = page_path(ocr_dir, page)
     if not path or not wrong:
         return path, []
-    doc = jsonio.read(path)
+    doc = pagedoc.read(path)
     return path, [L for L in (doc.get("lines") or []) if wrong in (L.get("t") or "")]
 
 

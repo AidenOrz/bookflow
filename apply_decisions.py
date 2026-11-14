@@ -41,6 +41,7 @@ sys.path.insert(0, HERE)
 
 import jsonio                     # noqa: E402
 import decisions as dec           # noqa: E402
+import pagedoc                    # noqa: E402
 
 # 回填目标目录：相对 --work
 DEFAULT_SRC = "ocr_merged"
@@ -201,7 +202,9 @@ def plan(doc, src, y_tol=None, require_single_segment=None):
                                   old="", new="", line=None,
                                   reason="找不到页文件 %s.json" % page))
                 continue
-            pages[page] = (path, jsonio.read(path))
+            # 走 pagedoc：要写回页级 JSON，版本不认识时必须在读的时候就停，
+            # 不能「用 A 版本的坐标去改 B 版本的行」。
+            pages[page] = (path, pagedoc.read(path))
         pd = pages[page][1]
         lines = pd.get("lines") or []
         y0 = e.get("y0")

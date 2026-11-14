@@ -20,6 +20,7 @@ PUNCT = re.compile(r"[，。、；：！？“”‘’（）《》〈〉—…�
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from audit import load_dict, DICT_PATH
 import jsonio
+import pagedoc
 
 WORD_MIN = 200          # 判定"是常用词"的词频门槛
 RATIO = 3.0             # 两侧词频差多少倍才算分出胜负
@@ -107,8 +108,8 @@ def main():
 
     cands = []
     for name in common:
-        da = jsonio.read(fa[name])
-        db = jsonio.read(fb[name])
+        da = pagedoc.read(fa[name])
+        db = pagedoc.read(fb[name])
         la, lb = da["lines"], db["lines"]
         ta = [L["t"] for L in la]
         tb = [L["t"] for L in lb]
