@@ -18,9 +18,24 @@ import numpy as np
 from PIL import Image
 from rapidocr import RapidOCR
 import jsonio
+import pagedoc
 
 SUSPECT = 0.62        # 认出比例低于此值视为失败行
 ACCEPT = 0.70         # 重识别结果需达到应有字数的此比例才采纳
+
+# 页级 JSON 的来由标记。repair 是"在 OCR 结果上做单行重识别"，产出仍属 OCR 家族，
+# 所以 producer.name 用 rapidocr-repair 而不是 rapidocr——下游据此知道这一版
+# 经过补识别，排查"某页为什么和 ocr/ 不一样"时不必再猜。
+PRODUCER_NAME = "rapidocr-repair"
+
+
+def rapidocr_version():
+    """RapidOCR 版本；取不到返回 None（producer.version 允许为 null）。"""
+    try:
+        import importlib.metadata as md
+        return md.version("rapidocr")
+    except Exception:
+        return None
 
 
 # 视觉长度必须与 layout.py 同口径：repair 的 SUSPECT 阈值比较的是
@@ -99,8 +114,16 @@ def main():
             n_fix += changed
             n_page += 1
         if not a.dry:
-            json.dump(d, open(os.path.join(a.dst, os.path.basename(f)), "w",
-                              encoding="utf-8"), ensure_ascii=False)
+            # 只**新增**字段，其余（name/w/h/lines/region/regions）原样带过去。
+            # producer 在这里必须改写：这份数据的内容已经被 repair 改过，
+            # 再标 rapidocr 就是谎报来由。上一手的来源记到 upstream_producer，
+            # 否则「这页原文是哪个模型认的」这条线索就永久丢了。
+            # 已存在 upstream_producer 时以它为准（重复跑 repair 不冲掉源头）。
+            prev = d.get("upstream_producer") or d.get("producer")
+            extra = {"upstream_producer": prev} if prev else {}
+            pagedoc.stamp(d, pagedoc.producer(PRODUCER_NAME, rapidocr_version()),
+                          **extra)
+            pagedoc.write(os.path.join(a.dst, os.path.basename(f)), d)
     print("修复 %d 行，涉及 %d 页%s" % (n_fix, n_page, "（dry run，未写文件）" if a.dry else ""))
 
 

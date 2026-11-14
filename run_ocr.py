@@ -2,6 +2,8 @@
 import os, sys, json, glob, time
 from multiprocessing import Pool
 
+import pagedoc
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "pages")
 DST = os.path.join(HERE, "ocr")
@@ -9,6 +11,20 @@ PROCS = 5
 THREADS = 4
 DEVICE = os.environ.get("BOOKFLOW_DEVICE", "auto")
 MODEL = os.environ.get("BOOKFLOW_MODEL", "small")
+
+# 页级 JSON 的来由标记（名字已登记在 pagedoc.KNOWN_PRODUCERS）。
+# 版本要在子进程里现取——父进程的 import 结果不跨 spawn，而且换过模型/设备时
+# 真正干活的是子进程里那个 RapidOCR。
+PRODUCER_NAME = "rapidocr"
+
+
+def rapidocr_version():
+    """RapidOCR 版本；取不到返回 None（producer.version 允许为 null）。"""
+    try:
+        import importlib.metadata as md
+        return md.version("rapidocr")
+    except Exception:
+        return None
 
 
 def engine_params(device, model="small"):
@@ -79,8 +95,12 @@ def work(job):
             })
     lines.sort(key=lambda L: (round(L["y0"] / 10), L["x0"]))
     out = os.path.join(dst_dir, os.path.basename(path) + ".json")
-    json.dump({"name": os.path.basename(path), "w": w, "h": h, "lines": lines},
-              open(out, "w", encoding="utf-8"), ensure_ascii=False)
+    # 盖 schema 章：schema/schema_version/producer 三个新键，name/w/h/lines 一个不动。
+    # 老工作目录里的 JSON 没有这三个键，读取方一律按兼容处理（见 pagedoc.check）。
+    doc = pagedoc.stamp({"name": os.path.basename(path), "w": w, "h": h,
+                         "lines": lines},
+                        pagedoc.producer(PRODUCER_NAME, rapidocr_version()))
+    pagedoc.write(out, doc)      # 原子写：中途被杀不会留下半个 JSON
     return os.path.basename(path), len(lines)
 
 

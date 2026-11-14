@@ -38,6 +38,7 @@ $py = "python"
 | 阶段 | 命令 | 做什么 |
 |---|---|---|
 | render | `bookflow.py render` | PDF → 300dpi 灰度 PNG（`pdftoppm`） |
+| **textlayer** | `bookflow.py textlayer` | **PDF 自带文字层 → 页级 JSON**（`pdftotext -bbox`，927 页 7.9 秒） |
 | ocr | `bookflow.py ocr` | RapidOCR PP-OCRv6 small，行级坐标+文本+置信度 |
 | repair | `bookflow.py repair` | 整页识别退化行（整行丢字）逐行重识别 |
 | layout | `bookflow.py layout` | **可选增强**：PP-DocLayoutV3 标出脚注/页眉/页码区域 |
@@ -45,6 +46,7 @@ $py = "python"
 | audit | `bookflow.py audit` | 词表+形近字置换找替换型错字，**按 PDF 页码排序**出清单与对照图（不自动改） |
 | epub | `bookflow.py epub` | EPUB3 + 三级目录 + **弹窗脚注** + 自校验 + 封面（`epub3.py`） |
 | prune | `bookflow.py prune` | 删除可重生成的中间产物 |
+| verify | `bookflow.py verify` | 文字层与 OCR 交叉验证（`disagree.py` 的 A=文字层 / B=OCR），分歧进 `decisions.json` |
 | disagree | `bookflow.py disagree --ocr-alt ocr_alt` | 双模型交叉比对，产出候选清单。**不在 `all` 里**：需要第二版 OCR |
 | decisions | `bookflow.py decisions --from disagree` | 把各路候选（disagree/audit/旧队列）归一成 `out/decisions.json` |
 
@@ -60,7 +62,25 @@ $py = "python"
 
 常用参数：`--dpi 300`、`--procs 5`、`--device auto|cpu|dml|cuda`、`--model small|medium|server`、
 `--ocr-src`（指定 OCR 结果目录）、`--force`（重跑已有阶段）、`--no-layout`（跳过版面分析）、
-`--ocr-alt`（第二版 OCR 目录）、`--conservative-fix`（形近字一律只出候选、正文不动）。
+`--ocr-alt`（第二版 OCR 目录）、`--conservative-fix`（形近字一律只出候选、正文不动）、
+`--text-layer verify|only|off`（文字层用法，见下）、`--text-pages 1-60`（只抽这些页，仅 textlayer 单阶段）。
+
+### 文字层（`--text-layer`）
+
+PDF 里**自带的文字层**比 OCR 更快更准，但质量参差不齐，所以默认**两者都跑、交叉验证**：
+
+| 值 | 行为 | 用在什么时候 |
+|---|---|---|
+| `verify`（默认） | 抽文字层 + 跑 OCR，`disagree.py` 比对（A=文字层、B=OCR），分歧进 `decisions.json`；**正文用文字层** | 绝大多数书 |
+| `only` | 只抽文字层，完全不跑 OCR | 确认有完好文字层的书（快 40 倍）；文字层覆盖不足 95% 会拒绝并给出改跑 `verify` 的提示 |
+| `off` | 不碰文字层，行为与本功能上线前**逐字节一致** | 纯扫描书、复现旧结果 |
+
+实测（927 页有文字层的书）：`pdftotext` **7.9 秒 / 623,310 汉字 / 672.4 汉字每页**，
+OCR 同规模约 17.6 秒/页 × 927 ≈ 4.5 小时。抽样 13 页逐字对比，文字层与 OCR 相似度 **98.85%**。
+
+选源优先级 `OCR_DIRS = ocr_layout > ocr_merged > ocr_text > ocr_fix > ocr`：
+`ocr_layout` 多了 region 标签（脚注抽取要它）；`ocr_merged` 是**人工裁决过**的，
+必须压住原始文字层；`ocr_text` 比 OCR 准但不可改（PDF 自带，没法回填）。
 
 ## 实测规模
 
