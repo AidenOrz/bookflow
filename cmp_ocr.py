@@ -1,5 +1,5 @@
 """对照两套 OCR 结果：行级差异、字形级差异，并给出可疑修正清单。"""
-import json, glob, os, sys, re
+import glob, os, sys, re
 from difflib import SequenceMatcher
 import jsonio
 
@@ -74,7 +74,7 @@ for (o, n), lst in sorted(kinds.items(), key=lambda kv: -len(kv[1]))[:25]:
         continue
     print("  %-4s -> %-4s  %2d 次   例：%s" % (repr(o), repr(n), len(lst), lst[0][1][:32]))
 
-json.dump([{"page": p, "small": x, "medium": y, "s_small": sa, "s_medium": sb}
-           for p, x, y, sa, sb in charfix],
-          open("cmp_medium.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+jsonio.write("cmp_medium.json",
+            [{"page": p, "small": x, "medium": y, "s_small": sa, "s_medium": sb}
+             for p, x, y, sa, sb in charfix], indent=1)
 print("\n明细已写入 cmp_medium.json")

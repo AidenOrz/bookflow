@@ -46,6 +46,13 @@ from layout import elen  # noqa: E402
 
 
 def median_char_width(files):
+    """长行的中位字宽（px）。**没有样本时返回 None，不抛**。
+
+    空样本不是"不可能事件"：目录页、整页插图、纯扫描件的行高/行宽全都不满足
+    条件，一本书前几十页全中招时会一个样本都收不到。旧版直接 statistics.median([])
+    → StatisticsError: no median for empty data，函数自己的返回值约定都还没机会生效。
+    这里改成返回 None，由调用方决定是报错退出还是降级。
+    """
     ws = []
     for f in files:
         d = jsonio.read(f)
@@ -54,6 +61,8 @@ def median_char_width(files):
             n = elen(L["t"])
             if n >= 10 and L["x1"] - L["x0"] > 0.55 * W:
                 ws.append((L["x1"] - L["x0"]) / n)
+    if not ws:
+        return None
     return statistics.median(ws)
 
 
@@ -73,7 +82,9 @@ def main():
         raise SystemExit("源目录没有页级 JSON：%s（先跑 ocr 阶段）" % a.src)
     cw = median_char_width(files)
     if not cw:
-        raise SystemExit("找不到足够的长行来估计字宽（%s），无法判断可疑行" % a.src)
+        raise SystemExit("找不到足够的长行来估计字宽（%s），无法判断可疑行。\n"
+                         "  多半是源目录里没有正文页（只有目录/插图/空白页），或 --src 指错了。"
+                         % a.src)
     print("正文字符宽度 %.1f px ｜ 扫描 %d 页 ｜ 可疑阈值 %.2f" % (cw, len(files), SUSPECT))
 
     params = {}

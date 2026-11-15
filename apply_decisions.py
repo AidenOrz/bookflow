@@ -99,7 +99,6 @@ LEGACY_NEEDS_HUMAN = {
 # 留这个口子是为了让"换一本书"的迁移不改代码——但新书该走 decisions.json，
 # 这里只是一次性迁移通道。
 LEGACY_TABLE = "out/legacy_decisions.json"
-LEGACY_TABLE = "out/legacy_decisions.json"
 
 
 # ---------------------------------------------------------------------------

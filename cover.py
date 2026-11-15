@@ -14,7 +14,8 @@ import os
 import sys
 import zipfile
 
-from PIL import Image
+import epub3                      # 属性转义只认 epub3.esc_attr 一个口径
+
 
 COVER_XHTML = '''<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
@@ -76,6 +77,9 @@ def _trim_bottom_watermark(a, x0, x1, y1, H, ink_ratio=0.35):
 
 def make_cover(page_path, out_jpg, size=(1200, 1600)):
     """裁出封面本体。返回输出路径；判定这页不适合当封面时返回 None。"""
+    # PIL/numpy 只在裁图这条路上用，所以放在函数内 import：inject() 是纯 zip/xml，
+    # 单测要能直接 import cover 去验属性转义，不该为了这个先把 Pillow 拖进来。
+    from PIL import Image
     import numpy as np
     im0 = Image.open(page_path).convert("RGB")
     a = np.array(im0.convert("L"), dtype=float)
@@ -132,7 +136,12 @@ def inject(epub, title, cover_jpg):
     opf = opf.replace('<spine toc="ncx">', '<spine toc="ncx"><itemref idref="coverpage"/>')
     opf = opf.replace("</metadata>", '<meta name="cover" content="cover-image"/></metadata>')
     data["content.opf"] = opf.encode("utf-8")
-    data["cover.xhtml"] = COVER_XHTML.format(title=title).encode("utf-8")
+    # title 进的是 XML **属性**（alt="..."），不是纯文本：书名里出现 & < > " 之一，
+    # cover.xhtml 就是坏 XML（实测书名带双引号时属性被提前闭合）。
+    # 转义口径复用 epub3.esc_attr：它已经是本项目的属性位唯一入口（esc() 刻意
+    # quote=False，专供正文文本节点），这里再自己写一套只会分叉。
+    data["cover.xhtml"] = COVER_XHTML.format(
+        title=epub3.esc_attr(title or "")).encode("utf-8")
     with open(cover_jpg, "rb") as f:
         data["cover.jpg"] = f.read()
 

@@ -16,7 +16,7 @@
 只输出清单，不自动改。形近字对是双向的，误报集中在"两个词都成立"的情况
 （如「反映/反应」），需人工或模型裁决。
 """
-import re, json, os, argparse
+import re, os, argparse
 from collections import defaultdict
 import jsonio
 
@@ -214,8 +214,10 @@ def main():
     txt = "\n".join(lines)
     print(txt[:4000])
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
-    open(a.out, "w", encoding="utf-8").write(txt)
-    json.dump(hits, open(a.json, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    # 走 jsonio：这里的 open() 都不带 with，句柄靠 GC 收，Windows 上紧跟的
+    # 读取/删除会偶发 PermissionError；json 也没有原子写，中途崩就是半个文件。
+    jsonio.write_text(a.out, txt)
+    jsonio.write(a.json, hits, indent=1)
     print("\n共 %d 处；明细 -> %s" % (len(hits), a.json))
 
 
