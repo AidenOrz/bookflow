@@ -472,6 +472,61 @@ def _script_name(cmd):
     return "子进程"
 
 
+# Ctrl+C 收尸时的时间上限。两个都不是"性能参数"，是**安全阀**：
+# taskkill 在 RPC/WMI 受限的机器上会挂住，没上限等于把自己锁死在中断路径上。
+TASKKILL_TIMEOUT = 10.0   # 等 taskkill 自己退出
+KILL_WAIT = 3.0           # taskkill 报成功后，等目标进程真正消失
+
+
+def _reap(proc):
+    """兜底：直接 kill 一次，绝不抛。
+
+    清理路径会被重复进入（kill_tree 收尾也会调它），所以 proc 可能已经退出，
+    也可能已经被 wait 收过尸——两种都不能炸。
+    """
+    try:
+        if proc.poll() is None:
+            proc.kill()
+    except (OSError, ValueError):
+        pass
+
+
+def _kill_tree_nt(proc):
+    """Windows：taskkill /T /F 杀整棵树，但**不许把自己挂死**。
+
+    这一版补了三个洞，每个都是真实环境里踩得到的：
+
+    1. **taskkill 本身可能挂住**。原版 subprocess.run(...) 没给 timeout，
+       taskkill 一旦卡在 WMI/RPC 上（安全软件拦截、远程会话、RPC 被裁剪的沙箱），
+       调用方那条「Ctrl+C 收尸」路径就永远回不来——比子进程变孤儿更糟，
+       用户既停不掉也退不出。这里给上限，超时连 taskkill 一起杀掉。
+    2. **非 0 退出码原版静默吞掉**。check=False 且只有 OSError 进 except，
+       等于「权限不足 / 找不到进程 / taskkill 不存在」时**什么都不做**，
+       直接子进程照样活着。现在非 0 一律交给 _reap 兜底。
+    3. **taskkill 返回 0 也要验一下**。它可能在树还没死透时就报成功，
+       所以再给 proc 一个很短的等待窗口，等不到就兜底 kill。
+
+    「先杀树、再兜底杀直接子进程」的顺序不能反：反了的话直接子进程先死，
+    树结构断开，taskkill /T 就找不到孙进程了（pdftoppm 派生的正是孙进程）。
+    """
+    try:
+        r = subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           check=False, timeout=TASKKILL_TIMEOUT)
+        rc = r.returncode
+    except subprocess.TimeoutExpired:
+        rc = -1
+    except (OSError, ValueError):
+        rc = -1
+    if rc != 0:
+        _reap(proc)
+        return
+    try:
+        proc.wait(timeout=KILL_WAIT)
+    except subprocess.TimeoutExpired:
+        _reap(proc)
+
+
 def kill_tree(proc):
     """杀掉子进程**及其派生的所有进程**。
 
@@ -485,22 +540,20 @@ def kill_tree(proc):
     """
     if proc is None or proc.poll() is not None:
         return
-    try:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           check=False)
-        else:
+    if os.name == "nt":
+        _kill_tree_nt(proc)
+    else:
+        try:
             proc.terminate()
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
-    except (OSError, ValueError):
-        try:
-            proc.kill()
-        except OSError:
-            pass
+                _reap(proc)
+        except (OSError, ValueError):
+            _reap(proc)
+    # 最后一道：不管上面走哪条路，直接子进程都不许活下来。
+    # （_reap 里先 poll() 再 kill()，poll 顺带把已退出的进程收尸。）
+    _reap(proc)
 
 
 def sh(cmd, **kw):

@@ -11,7 +11,7 @@
 用法：
   python disagree.py --a ocr_fix --b ocr_alt --out out/disagree.json
 """
-import os, json, glob, sys, argparse, re
+import os, glob, sys, argparse, re
 from difflib import SequenceMatcher
 
 # 标点/符号差异不是错字，直接剔除（第二版模型偏好半角标点，这类分歧有 150+ 处）
@@ -142,13 +142,16 @@ def main():
     print("不一致 %d 处：词表判 A 对 %d，判 B 对 %d，需裁决 %d" % (n, va, vb, vq))
 
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
-    json.dump(cands, open(a.out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    # 一律走 jsonio：先落 .tmp 再 os.replace。直接把 json 写进 open() 的产物文件会
+    # ① 句柄不给 with 收（Windows 上紧跟的删除/改名会 PermissionError）；
+    # ② 中途崩就留下半个 JSON，下游 audit/decisions 读到的是截断文件。
+    jsonio.write(a.out, cands, indent=1)
 
     lines = ["两版 OCR 分歧 %d 处（A=%s，B=%s）" % (n, a.a, a.b), ""]
     for c in cands[:400]:
         lines.append("  [%s] %-12s %s\n        A: %s\n        B: %s" %
                      (c["verdict"], c["page"], c["why"], c["A"][:60], c["B"][:60]))
-    open(a.txt, "w", encoding="utf-8").write("\n".join(lines))
+    jsonio.write_text(a.txt, "\n".join(lines))
     print("明细 -> %s" % a.out)
 
     if a.apply:
@@ -164,8 +167,7 @@ def main():
                 if k in fixed:
                     L["t"] = fixed[k]
                     n_apply += 1
-            json.dump(d, open(os.path.join(a.apply, name), "w", encoding="utf-8"),
-                      ensure_ascii=False)
+            pagedoc.write(os.path.join(a.apply, name), d)   # 页级 JSON 一律走契约层
         print("回填 %d 处（词表判定 B 对）-> %s" % (n_apply, a.apply))
 
 

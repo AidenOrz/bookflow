@@ -2,7 +2,106 @@
 
 更新时间：2026-11-16
 
-## 最近一轮：修掉「页顶短行吃正文」，顺带修好 notes.linked 口径（2026-11-16）
+## 最近一轮：六个「不会立刻炸但会咬人」的缺陷（2026-11-16）
+
+上一轮之后的一份静态审阅提了 6 条。逐条都核过、都改了，且**每条新用例都在改前代码上实测通红**。
+
+### 1. `kill_tree` 在受限 Windows 上会挂死，taskkill 失败时子进程还会逃逸
+
+原实现两个洞：
+
+- **`subprocess.run` 没有 `timeout`**：taskkill 一旦卡在 WMI/RPC 上（安全软件拦截、
+  远程会话、RPC 被裁剪的沙箱），调用方那条「Ctrl+C 收尸」路径就**永远回不来**。
+  比子进程变孤儿更糟——用户既停不掉也退不出。
+- **`check=False` 且只捕 `OSError`**：taskkill 返回非 0（权限不足 / 进程已消失 /
+  taskkill 根本不存在）时静默什么都不做，直接子进程照样活着逃逸。
+
+改成 `_kill_tree_nt()`，四道保险：`timeout=TASKKILL_TIMEOUT`（10s）→ 非 0 走 `_reap`
+兜底 `proc.kill()` → 返回 0 也要 `proc.wait(timeout=3)` 确认真的死了 → `kill_tree` 收尾
+再无条件 `_reap` 一次。POSIX 分支同样把 `terminate` 超时后接上 `_reap`。
+
+**顺序不能反**：必须先 taskkill /T 杀树、再兜底杀直接子进程。反了的话直接子进程先死、
+树结构断开，`/T` 就找不到孙进程了——而 `pdftoppm` 派生的正是孙进程。
+### 2. 那条测试本身也依赖了网络栈
+
+`test_kill_tree_stops_child` 原来用 `ping -n 60 127.0.0.1` 当「不会自己退出的靶子进程」。
+在禁用网络栈/虚拟适配器的沙箱里 ping 会**瞬间以 1 退出**（`Unable to contact IP driver.`），
+于是断言在调用 `kill_tree` **之前**就挂了，测试永远红。
+
+靶子改成 `[sys.executable, "-c", "import time; time.sleep(60)"]`——不依赖任何外部
+系统工具，也不碰网络。
+
+顺手把这一组从 4 个用例扩到 8 个，补上原先完全没覆盖的路径：
+
+| 用例 | 验什么 | 改前代码 |
+|---|---|---|
+| `test_taskkill_is_called_with_timeout` | `subprocess.run` 收到 `timeout` | **FAIL**（kwargs 里没有 timeout） |
+| `test_taskkill_failure_still_kills_direct_child` | taskkill 返 1 时子进程必须死 | **ERROR**（逃逸） |
+| `test_taskkill_hang_does_not_hang_kill_tree` | taskkill 超时不能把调用方挂死 | **ERROR**（`TimeoutExpired` 直接冒出） |
+| `test_kill_tree_also_kills_grandchild` | **孙进程**也要死 | 见下 |
+
+孙进程那条是这组里唯一不 mock 的：拉一个「python 再拉 python」的两层进程，
+`kill_tree` 之后用 `OpenProcess`+`GetExitCodeProcess` 查孙进程是否还活着。
+**先证明它有鉴别力**：单独 `p.kill()` 父进程（等价于旧代码没走兜底的情形），实测孙进程
+仍然存活（`活着 = True`），说明这条用例确实能抓住「只杀直接子进程」。
+
+判断存活不能用 `os.kill(pid, 0)`：Windows 上它对任意合法 pid 几乎都不报错，拿它探活是假阳性。
+
+### 3. 封面 `alt` 属性没转义（`cover.py`）
+
+`COVER_XHTML.format(title=title)` 把书名直接塞进 `alt="..."`。书名里有双引号时属性被提前
+闭合，`cover.xhtml` 是坏 XML；有 `&` `<` `>` 同理。
+
+**转义口径不另起一套**：复用 `epub3.esc_attr()`——它本来就是本项目属性位的唯一入口
+（`epub3.esc()` 刻意 `quote=False`，专供正文文本节点）。`cover.py` 自己再写一套只会分叉。
+
+为了能单测 `inject()`（纯 zip/xml），把 `from PIL import Image` 挪进了 `make_cover()` 函数内。
+顺手验了回归：真实扫描页 p-001 仍能裁出 283 KB 封面，三本 EPUB 重建后 `validate()` 仍为 0。
+### 4. `repair.median_char_width` 对空列表抛未捕获异常
+
+空样本不是不可能事件：目录页、整页插图、纯扫描件的行宽全都不满足「≥10 字 且 宽 > 0.55W」
+条件时，一个样本都收不到。旧版直接 `statistics.median([])` → `StatisticsError`，
+`main()` 里那句「找不到足够的长行，无法判断可疑行」的友好提示**根本轮不到执行**。
+改成返回 `None`，提示语补上成因（源目录没有正文页 / `--src` 指错）。
+
+### 5. `disagree.py` 三处裸写
+
+`json.dump(cands, open(...))` 两处 + `open(...).write(...)` 一处：句柄不给 `with` 收
+（Windows 上紧跟的改名/删除会 `PermissionError`），且没有原子写（中途崩就是半个 JSON，
+下游 `decisions` 读到截断文件）。三处全改走 `jsonio.write` / `jsonio.write_text`，
+回填那处改走 `pagedoc.write`（页级 JSON 该走契约层）。
+
+**顺带扫出同一模式的两处**：`audit.py`（`audit.txt` + `audit.json`）和 `cmp_ocr.py`
+（`cmp_medium.json`）。同一个病根，一起改掉，并在用例里用一条通用断言锁住这两个脚本。
+
+**产物逐字节回归**（不能靠「看起来没问题」）：
+
+| 脚本 | 输入 | 产物 | 前后 |
+|---|---|---|---|
+| `disagree.py` | 僧官 40 页，B 版每页改 3 行 | 42 个文件（json/txt/40 页回填） | **42/42 逐字节一致** |
+| `audit.py` | 规训 `book.md` | `audit.txt` + `audit.json` | **两个都逐字节一致** |
+
+### 6. `apply_decisions.py` 同一常量赋值两遍
+
+`LEGACY_TABLE = "out/legacy_decisions.json"` 连写两行。改成一行，并用断言 `^LEGACY_TABLE\s*=`
+只出现 1 次锁住——这类重复的害处是「早晚会有一次只改了其中一处」。
+
+### 结果
+
+- **227/227 测试通过**（改前 212，新增 15 个）。其中 **4 个在改前代码上实测 FAIL、
+  2 个 ERROR**，不是「怎么改都绿」的假测试。`test_textlayer_cli` 34 → 38（+4 个 kill_tree 用例），
+  新增 `tests/test_smallfixes.py` 11 个。
+- **三本 EPUB 全部重建**，`epub3.validate()` 均为 0；`book.md` 三本哈希与上一轮完全一致
+  （`0BA1E017…` / `E5053BDD…` / `320A586E…`），说明这一轮没碰任何版面/成书逻辑。
+- `disagree.py` / `audit.py` 产物逐字节不变（见上表），是「纯写法改动、零行为变化」的硬证据。
+### 遗留：`layout.py` 要拆，但不在本轮
+
+`layout.py` 现在 **2013 行 / 41 个函数**，是全项目唯一的单体大模块。拆法和验收标准写在
+`docs/architecture.md` 的「模块拆分计划」——按阶段切、`layout.py` 保留为门面（对外 API 不变），
+分三步走，每步都能用三本书的 `book.md` 哈希验证零回归。**排在「注号识别率」之后**：
+它属于结构调整，不影响任何当前产出，而按哈希对账的方式可以让它随时安全的做。
+
+## 上一轮：修掉「页顶短行吃正文」，顺带修好 notes.linked 口径（2026-11-16）
 
 上一轮留了一个待办：`assemble()` 里 `w < 0.55·W and elen ≤ 16 and (y1 < 0.18H or y0 > 0.90H)`
 这条「书眉残留」判据会丢真正文。本轮把它查清并修掉。
