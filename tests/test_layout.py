@@ -6,7 +6,7 @@
 - test_title_residue_keeps_body：收紧判据后，正文末尾的「的。」不能被当成残片
 - test_dup_pages_removed：新书源 PDF 末尾 19 页重复，去重后不能成段重复
 - test_empty_src_exits：空输入必须报错，不能静默产出 0 字节成书
-- test_fix_rules：fix.py 的 29 条正负例
+- test_fix_rules：fix.py 的两级规则（整词级自动改 / 单字级带排除表）
 
 运行：python -m unittest discover -s tests -v
 """
@@ -234,47 +234,116 @@ class TestEpubNotes(unittest.TestCase):
                 self.assertEqual(z.namelist()[0], "mimetype")
 
     def test_validate_catches_dangling_ref(self):
-        """validate() 必须能发现"引用存在、注文缺失"这种断链。"""
+        """validate() 必须能发现"引用存在、注文缺失"这种断链。
+
+        旧版这里断言 validate==0——那正是被漏检的缺陷本身（引用无定义时
+        aside 注文为空，阅读器弹出一个空浮层）。现在 validate 必须报错。
+        """
         import epub3
         with tempfile.TemporaryDirectory() as d:
             out = os.path.join(d, "t.epub")
-            # 只有引用没有定义 → epub3 仍会渲染 aside（内容为空），但引用编号存在
             epub3.build("# 章\n\n正文[^nope]。\n", out, title="t")
-            # 这里只断言不会抛异常且结构自洽：缺定义时 aside 仍成对出现
-            self.assertIn(epub3.validate(out), (0,))
+            self.assertGreater(epub3.validate(out), 0,
+                               "引用无定义必须被 validate 检出，不能静默放过")
 
 
 class TestFix(unittest.TestCase):
-    CASES = [
+    """fix.py 分两级：整词级自动改，单字级只出候选。
+
+    分级理由（实测）：单字级「引人/收人」的排除表是开放集，堵不住「引人人胜」
+    「税收人说」「不引人怀疑」——这三处曾在《规训与惩罚》成书里被改坏并落盘。
+    """
+
+    # 自动组：错写法本身不是中文词，改是安全的
+    AUTO_CASES = [
+        ("人门课程", "入门课程"),
+        ("异已", "异己"),
+        ("陶治情操", "陶冶情操"),
+        ("推祟", "推崇"),
+        ("自已", "自己"),
+        ("时侯", "时候"),
+        # 「引人人胜」只有一个正确写法；必须先于「引人→引入」候选生效，
+        # 否则会被建议改成更不存在的「引入人胜」。
+        ("这本引人人胜的小册子", "这本引人入胜的小册子"),
+    ]
+
+    # 非自动组：只出候选，正文必须原样不动
+    KEEP_CASES = [
         ("辨证论治是中医的核心", "辨证论治是中医的核心"),
         ("射人先射马，擒贼先擒王", "射人先射马，擒贼先擒王"),
         ("中国人口处于世界首位", "中国人口处于世界首位"),
-        ("你在人口处等我", "你在入口处等我"),
         ("这一幕引人发笑", "这一幕引人发笑"),
         ("成绩引人侧目", "成绩引人侧目"),
-        ("他引人了新方法", "他引入了新方法"),
+        ("他引人了新方法", "他引人了新方法"),
         ("他自己经常承认", "他自己经常承认"),
-        ("他己经被选上了", "他已经被选上了"),
+        ("他己经被选上了", "他己经被选上了"),
         ("知己经常来看他", "知己经常来看他"),
         ("陷人于不义的圈套", "陷人于不义的圈套"),
-        ("陷人错误的深渊", "陷入错误的深渊"),
         ("收人钱财替人消灾", "收人钱财替人消灾"),
-        ("收人很高", "收入很高"),
-        ("异已", "异己"),
-        ("陶治情操", "陶冶情操"),
-        ("人门课程", "入门课程"),
-        ("深人研究", "深入研究"),
         ("容纳人情", "容纳人情"),
+        ("不引人怀疑", "不引人怀疑"),
+        ("税收人说", "税收人说"),
     ]
 
-    def test_fix_rules(self):
-        for src, want in self.CASES:
+    def test_auto_rules_apply(self):
+        for src, want in self.AUTO_CASES:
             with self.subTest(src=src):
                 out, _, _ = fix.apply(src, verbose=False)
                 self.assertEqual(out, want)
 
+    def test_conservative_never_touches_text(self):
+        """conservative=True 时正文必须原样返回——遇到没见过的排版靠这个兜底。"""
+        for src, want in self.KEEP_CASES:
+            with self.subTest(src=src):
+                out, _, _ = fix.apply(src, verbose=False, conservative=True)
+                self.assertEqual(out, want)
+
+    def test_known_bad_exclusions_are_fixed_by_default(self):
+        """默认模式下，实测踩过的三处误改必须被修好（不是留着当候选）。"""
+        self.assertEqual(fix.apply("那本引人人胜的小册子", verbose=False)[0],
+                         "那本引人入胜的小册子")
+        # 「不引人怀疑」「税收人说」默认不改（它们在候选组里、排除表已能挡住），
+        # 关键是**不能**被改成「不引入怀疑」「税收入说」。
+        self.assertEqual(fix.apply("不引人怀疑", verbose=False)[0], "不引人怀疑")
+        self.assertEqual(fix.apply("税收人说", verbose=False)[0], "税收人说")
+
+    def test_yinren_exclusion_is_char_class_not_phrase_alternation(self):
+        """「引人」的排除表是**字符类**（按后一个字拦），不是词组分支，这是刻意保留的。
+
+        起因是笔误，但实测下来字符类严格更安全：OCR 把「引人注目」认成「引人注日」时，
+        词组分支 `(?:注目|入胜|...)` 拦不住（「注日」不在表里），默认模式会把正确原文
+        改成「引入注日」——实测僧官成书变动 1 处就是这处。字符类按第二字「注」就挡住了。
+        代价是白名单外的搭配一并被放过（引人思乡/引人往返），方向是漏改而非改坏。
+        """
+        pat = [p for p, _, label in fix.CAND_RULES if label == "引人→引入"][0]
+        # 按第二字拦得住 OCR 认错的词
+        self.assertFalse(pat.search("引人注日之处"), "字符类必须挡住 OCR 认错第二字")
+        # 真正该改的仍然命中
+        self.assertTrue(pat.search("他引人了新方法"))
+        # 代价：白名单外的正确搭配被顺带放过（漏改方向，不会改坏正文）。
+        # 「思乡」「往返」不在白名单里；「思考」也不是词组，但「思」是「深思」的首字，
+        # 字符类不看词边界，所以一并放过——这正是可以接受的漏改。
+        self.assertFalse(pat.search("引人思乡"))
+        self.assertFalse(pat.search("引人往返"))
+        self.assertFalse(pat.search("引人思考"))
+
+    def test_candidates_survive_as_detail(self):
+        """无论改不改，每一处命中都要留痕，供事后核对（suggest 说明会变成什么）。"""
+        _, _, det = fix.apply("他引人了新方法", verbose=False, conservative=True)
+        cand = fix.candidates(det)
+        self.assertEqual(len(cand), 1)
+        self.assertEqual(cand[0]["rule"], "引人→引入")
+        self.assertIn("引入", cand[0]["suggest"])
+        self.assertEqual(fix.auto_detail(det), [], "保守模式不该有 fix 条目")
+
+        # 默认模式下它被真正改掉，明细里 action 变 fix，但 comment 仍保留建议
+        out, stat, det2 = fix.apply("他引人了新方法", verbose=False)
+        self.assertEqual(out, "他引入了新方法")
+        self.assertEqual(stat.get("引人→引入"), 1)
+        self.assertEqual(len(fix.auto_detail(det2)), 1)
+
     def test_fix_counts_net_changes(self):
-        """「己经→已经」这类会自相抵消的规则不能计入统计。"""
+        """「己经→已经」降级为候选后，统计里不能再出现净改动为 0 的条目。"""
         _, stat, _ = fix.apply("他自己经常承认", verbose=False)
         self.assertEqual(sum(stat.values()), 0,
                          "没有净改动就不该记任何修正")
@@ -496,6 +565,340 @@ class TestAuditPageLookup(unittest.TestCase):
         import audit
         self.assertIsNone(audit.page_of(None, 5))
         self.assertIsNone(audit.page_of([], 5))
+
+
+class TestFigureRegions(unittest.TestCase):
+    """图 / 表区：不再静默丢弃。
+
+    实测背景（《中国僧官制度史》350 页）：table region 138 行、image region 22 行，
+    既不在 DROP_REGIONS 里、也没有任何裁图/聚合代码，于是 4 个表格页把每一行都
+    独立成段，成书 1820 段里冒出 97 个 ≤6 字碎片（「共公僧」「卜座」），占 5.3%；
+    3 个插图页的标注字同样当正文流出去。下面每条用例都钉一个具体缺陷。
+    """
+
+    def _page(self, idx, lines, regions=None, w=2480, h=3508):
+        p = synth_page(idx, lines, w, h)
+        if regions is not None:
+            p["regions"] = regions
+        return p
+
+    def _run(self, pages, meta=None, **kw):
+        """把页写进临时目录跑 layout.build，返回 (md, report, 输出目录)。"""
+        import json
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        src = os.path.join(d, "ocr_layout")
+        os.makedirs(src)
+        for p in pages:
+            q = dict(p)
+            del q["idx"]
+            with open(os.path.join(src, q["name"] + ".json"), "w", encoding="utf-8") as f:
+                json.dump(q, f, ensure_ascii=False)
+        meta = dict(meta or {})
+        meta.setdefault("title", "t")
+        meta.setdefault("out_dir", os.path.join(d, "out"))
+        pages_dir = kw.pop("pages_dir", None)
+        if pages_dir:
+            meta["pages_dir"] = pages_dir
+        md, rep, cleaned, ps = layout.build(src, meta)
+        return md, rep, os.path.join(d, "out")
+
+    def test_whole_page_region_is_not_an_illustration(self):
+        """整页容器框不算插图：实测封面 image region 是 (54,78)-(2415,3394)。
+
+        照它裁出来是一张重复的封面，还让书里凭空多一张假插图。
+        """
+        p = self._page(0, [(300, 400, 2100, 480, "封面上的字。")],
+                       regions=[{"x0": 54, "y0": 78, "x1": 2415, "y1": 3394,
+                                 "cls": "image", "s": 0.97}])
+        self.assertEqual(layout.find_figures(p), [])
+
+    def test_inline_illustration_is_cropped_and_placed(self):
+        """正文中间的插图：裁成文件、并在**原来的位置**插 ![](...)。
+
+        位置必须按行插，不能按页批量后置——插图常夹在段落中间，
+        整页后置会让图跑到下一章去。
+        """
+        from PIL import Image
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        imgs = os.path.join(d, "pages")
+        os.makedirs(imgs)
+        Image.new("RGB", (2480, 3508), "white").save(os.path.join(imgs, "p-001.png"))
+        p = self._page(0, [
+            (300, 400, 2100, 480, "插图前面的正文一行。"),
+            (400, 900, 2000, 1400, "图里的标注字"),
+            (300, 2000, 2100, 2080, "插图后面的正文一行。"),
+        ], regions=[{"x0": 350, "y0": 850, "x1": 2050, "y1": 1450,
+                     "cls": "image", "s": 0.9}])
+        md, rep, out = self._run([p], pages_dir=imgs)
+        self.assertEqual(rep["regions"]["figures"], 1)
+        self.assertEqual(rep["regions"]["images"]["made"], 1)
+        self.assertTrue(os.path.exists(os.path.join(out, "images", "fig-p001-1.png")))
+        lines = [l for l in md.split("\n") if l.strip()]
+        img_at = next(i for i, l in enumerate(lines) if l.startswith("![]("))
+        before = next(i for i, l in enumerate(lines) if "插图前面" in l)
+        after = next(i for i, l in enumerate(lines) if "插图后面" in l)
+        self.assertLess(before, img_at, "图必须在「插图前面」那段之后")
+        self.assertLess(img_at, after, "图必须在「插图后面」那段之前")
+        self.assertNotIn("图里的标注字", md, "图区里的 OCR 行不能再当正文流出去")
+
+    def test_missing_page_png_does_not_emit_dangling_image(self):
+        """裁不出图时**不能**在 md 里留下指向不存在文件的死链。
+
+        epub3.validate 会把死链报成「图片不存在」，成品里是一串碎图占位符。
+        宁可这张图缺席并告警，也不能产出坏链。
+        """
+        p = self._page(0, [(300, 400, 2100, 480, "正文。")],
+                       regions=[{"x0": 350, "y0": 850, "x1": 2050, "y1": 1450,
+                                 "cls": "image", "s": 0.9}])
+        md, rep, out = self._run([p], pages_dir=os.path.join(tempfile.gettempdir(),
+                                                            "no-such-pages-dir"))
+        self.assertNotIn("![](", md)
+        self.assertEqual(rep["regions"]["images"]["made"], 0)
+        self.assertEqual(len(rep["regions"]["images"]["failed_detail"]), 1)
+
+    def test_table_region_grouped_not_split(self):
+        """表格区必须聚成一块，不能一行一段（这正是 97 个碎片的来源）。"""
+        rows = [(300, 1900 + i * 80, 600, 1960 + i * 80, t)
+                for i, t in enumerate(["共公僧", "池方僧官", "监导", "左街僧录"])]
+        rows += [(1100, 1900 + i * 80, 1500, 1960 + i * 80, t)
+                 for i, t in enumerate(["承玄署", "州郡僧正", "卜座", "州僧王"])]
+        p = self._page(0, [(300, 400, 2100, 480, "上表说明如下。")] + rows,
+                       regions=[{"x0": 250, "y0": 1850, "x1": 2200, "y1": 2260,
+                                 "cls": "table", "s": 0.9}])
+        md, rep, _ = self._run([p])
+        self.assertEqual(rep["regions"]["tables"], 1)
+        # 表格块里的行必须带全角空格连成一整块，而不是各自成段
+        self.assertIn("共公僧　承玄署", md)
+        # 被合并的行不再作为独立段落出现
+        paras = [l.strip() for l in md.split("\n") if l.strip()]
+        self.assertNotIn("共公僧", paras)
+
+    def test_no_regions_means_no_change(self):
+        """没有 regions 字段的老工作目录：一个图表都不该产出（硬回归的落点）。"""
+        p = synth_page(0, [(300, 400, 2100, 480, "正文第一行足够长。"),
+                           (300, 500, 2100, 580, "唐初"),
+                           (300, 600, 2100, 680, "祠部")])
+        md, rep, out = self._run([p])
+        self.assertEqual(rep["regions"]["figures"], 0)
+        self.assertEqual(rep["regions"]["tables"], 0)
+        self.assertNotIn("![](", md)
+        self.assertFalse(os.path.isdir(os.path.join(out, "images")))
+        self.assertIn("唐初", md, "没有版面证据时短行仍是正文，不许擅自吞掉")
+
+    def test_plate_page_becomes_one_image(self):
+        """整页图版：页内没有任何正文区、行全是噪声 → 整页裁成一张图。
+
+        实测 p053 就是这样一整页插图，33 行 OCR 噪声全被当正文流出去。
+        """
+        from PIL import Image
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        imgs = os.path.join(d, "pages")
+        os.makedirs(imgs)
+        Image.new("RGB", (2480, 3508), "white").save(os.path.join(imgs, "p-001.png"))
+        noise = [(300 + i * 40, 400 + i * 90, 380 + i * 40, 460 + i * 90, t)
+                 for i, t in enumerate(["t--", "J.", "II", "±二", "M片L", "1:",
+                                        "主三", "25", "iv"])]
+        p = self._page(0, noise, regions=[{"x0": 1193, "y0": 114, "x1": 1590,
+                                           "y1": 181, "cls": "header", "s": 0.9}])
+        md, rep, out = self._run([p], pages_dir=imgs)
+        self.assertEqual(rep["regions"]["plates"], 1)
+        self.assertTrue(os.path.exists(os.path.join(out, "images", "fig-p001-1.png")))
+        self.assertNotIn("t--", md)
+
+    def test_plate_rule_does_not_eat_body_page(self):
+        """保护：即使版面模型整页失效，也不能把一页正文换成一张图。"""
+        p = self._page(0, [(300, 400 + i * 80, 2100, 480 + i * 80,
+                            "第%d行这是一段足够长的正文内容，不该被当成图版。" % i)
+                           for i in range(10)],
+                       regions=[{"x0": 1193, "y0": 114, "x1": 1590, "y1": 181,
+                                 "cls": "header", "s": 0.9}])
+        self.assertFalse(layout.plate_like(p, layout.clean_page(p, 63.0, 62.6, set())))
+
+    def test_toc_page_is_not_a_table(self):
+        """目录页整页跳过：目录行「标题 + 行尾页码」几何上和表格行完全一样。
+
+        实测《规训与惩罚》目录页会被判成 2 块表，整个目录被并成两坨文字。
+        """
+        # 带上「目 录」标题才算目录页（detect_toc_pages 的判据），
+        # 这正是生产路径：目录页先被识别出来，plan_regions 才会整页跳过。
+        rows = [(400, 400, 1200, 470, "目 录")]
+        for i, (title, pg) in enumerate([("第一章　犯人的肉体", 35),
+                                        ("第二章　断头台的场面", 81),
+                                        ("第三章　全景敞视主义", 219),
+                                        ("第四章　非法活动", 290)]):
+            y = 1200 + i * 90
+            rows.append((300, y, 1500, y + 60, title))
+            rows.append((1790, y, 1880, y + 60, str(pg)))
+        p = self._page(0, rows, regions=[{"x0": 280, "y0": 1150, "x1": 1900,
+                                          "y1": 1600, "cls": "table", "s": 0.9}])
+        md, rep, _ = self._run([p])
+        self.assertEqual(rep["regions"]["tables"], 0)
+
+    def test_crop_scales_when_png_size_differs(self):
+        """页 JSON 的坐标系与页面 PNG 分辨率不一致时必须按比例换算。
+
+        实测：ocr_merged 的页 JSON 是 2480×3508，同目录 pages/*.png 是 2594×3588，
+        差 4.6%，不换算就裁偏几十像素——而这种偏移肉眼几乎看不出来。
+        """
+        from PIL import Image
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        big = os.path.join(d, "big.png")
+        Image.new("RGB", (2480 * 2, 3508 * 2), "white").save(big)
+        dst = os.path.join(d, "crop.png")
+        size = layout.crop_figure(big, (100, 100, 300, 250), dst, (2480, 3508))
+        self.assertIsNotNone(size)
+        # bbox 宽 200、高 150；2 倍图上是 400x300，再加 8/6 的边距
+        self.assertEqual(size[0], 400 + 2 * layout.CROP_PAD_X)
+        self.assertEqual(size[1], 300 + 2 * layout.CROP_PAD_Y)
+
+
+class TestEdgeShortLines(unittest.TestCase):
+    """页顶/页底边缘短行的处置。
+
+    历史包袱：这里曾用「窄(w<0.55W) + 短(≤16 字) + 在页顶 18%/页底 10%」
+    当书眉判据，实测吃掉《中国僧官制度史》61 行 / 453 汉字、《黑格尔辩证法
+    讲演录》20 行——正文折行后只占半页宽、又恰好落在页顶，就中招。
+    真书眉在上游已被 learn_running_heads + head_band 删干净，这一层只该
+    拦「非文字碎片」（孤立页码、OCR 符号）。
+    """
+
+    def _run(self, pages):
+        import json
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        src = os.path.join(d, "ocr")
+        os.makedirs(src)
+        for p in pages:
+            q = dict(p)
+            del q["idx"]
+            with open(os.path.join(src, q["name"] + ".json"), "w", encoding="utf-8") as f:
+                json.dump(q, f, ensure_ascii=False)
+        md, rep, cleaned, ps = layout.build(src, {"title": "t", "out_dir": os.path.join(d, "out")})
+        return md, rep
+
+    def _body_pages(self, first_page_lines):
+        """第 1 页用给定行，后两页各不相同（避免被当成跨页重复的书眉）。"""
+        pages = [synth_page(0, first_page_lines)]
+        for i in (1, 2):
+            pages.append(synth_page(i, [
+                (300, 400, 2100, 480, "第%d页的第一行正文内容，长度正常。" % i),
+                (300, 520, 2100, 600, "第%d页的第二行正文内容，长度正常。" % i),
+            ]))
+        return pages
+
+    def test_body_short_line_at_page_top_survives(self):
+        """正文折行后只剩半页宽、又落在页顶——必须保留。
+
+        真实案例：僧官 p039「基层僧官之自然是没有疑义的。」（w=0.40W、
+        elen≈14.6、y1=0.133H）被那条位置判据整行删掉，上下文硬接成
+        「……去领导长沙寺使之成为符」+「维那是梵语……」的错乱。
+        """
+        short = "基层僧官之自然是没有疑义的。"
+        pages = self._body_pages([
+            (300, 400, 1000, 456, short),              # w=700<0.55W, y1=0.13H
+            (300, 520, 2100, 580, "下一行是正常宽度的正文，用来承接上文。"),
+        ])
+        md, rep = self._run(pages)
+        self.assertIn(short, md, "页顶的正文短折行被当成书眉删掉了")
+
+    def test_body_short_line_at_page_bottom_survives(self):
+        """页底同理：正文末行的短折行不能被当成书眉残留删掉。"""
+        short = "乏真正的人文关怀。这个扯得远了。"
+        pages = self._body_pages([
+            (300, 400, 2100, 460, "这一页的正文第一行，宽度正常，内容完整。"),
+            (300, 3180, 1200, 3240, short),            # y0=0.906H>0.90H, w=900<0.55W
+        ])
+        md, rep = self._run(pages)
+        self.assertIn(short, md, "页底的正文短折行被当成书眉删掉了")
+
+    def test_isolated_page_number_at_page_top_still_dropped(self):
+        """孤立页码仍要丢：它留在流里会粘进上一段末尾（实测「……都归他管11」）。
+
+        y1 取 0.13H —— 高于 clean_page 的页码门限（0.12H），所以只能靠
+        assemble 这一层的碎片判据拦下。
+        """
+        pages = self._body_pages([
+            (300, 400, 2100, 460, "这一页的正文第一行，宽度正常，内容完整。"),
+            (1840, 400, 1900, 456, "11"),              # w=60, y1=0.13H
+        ])
+        md, rep = self._run(pages)
+        paras = [l for l in md.split("\n") if l.strip()]
+        self.assertNotIn("11", paras)
+        self.assertNotIn("内容完整。11", md)
+
+    def test_symbol_fragment_at_page_top_still_dropped(self):
+        """OCR 吐出的单符号（实测僧官 p240 的「°」）同样不能进正文。"""
+        pages = self._body_pages([
+            (300, 400, 2100, 460, "这一页的正文第一行，宽度正常，内容完整。"),
+            (300, 400, 360, 456, "°"),                 # elen=0.55<=1
+        ])
+        md, rep = self._run([pages[0]])
+        self.assertNotIn("°", md)
+
+
+class TestHeadLearnWindow(unittest.TestCase):
+    """learn_running_heads 的扫描窗口与「窄行守门」。
+
+    《规训与惩罚》的章节书眉落在 y1=10.1%~13.4% 页高，旧窗口 0.11H 只学到
+    「书名」那一条，11 条章节书眉漏掉 9 条；而 head_band 有 0.09 硬上限，
+    这些书眉在带状区里也无处可拦，于是「第二章 断头台的场面第一章」这种
+    残片拼进了正文。窗口放宽到 0.18H 后能全部学到。
+    """
+
+    def _pages_with_head(self, head, y1, n=6, w=700):
+        """n 页，每页顶部都有同一窄行书眉，正文各不相同。"""
+        pages = []
+        for i in range(n):
+            pages.append(synth_page(i, [
+                (300, y1 - 56, 300 + w, y1, head),
+                (300, 700, 2100, 780, "第%d页的正文第一行，长度正常。" % i),
+                (300, 820, 2100, 900, "第%d页的正文第二行，长度正常。" % i),
+            ]))
+        return pages
+
+    def test_low_running_head_is_learned(self):
+        """书眉落在 y1=13% 页高也要学到（旧窗口 0.11H 会漏）。"""
+        pages = self._pages_with_head("第一部分第一章 犯人的肉体", 456)  # 456/3508=0.13
+        bw, bh = layout.metrics(pages)
+        heads = layout.learn_running_heads(pages, bh)
+        self.assertIn(layout.norm("第一部分第一章 犯人的肉体"), heads)
+
+    def test_learned_low_head_is_removed_from_body(self):
+        """学到之后，这条书眉要真的从正文流里消失（学而不删等于没学）。
+
+        它不在带状区里（band_top 有 0.09 硬上限），只能靠「文本命中」删掉。
+        """
+        head = "第一部分第一章 犯人的肉体"
+        pages = self._pages_with_head(head, 456)
+        bw, bh = layout.metrics(pages)
+        heads = layout.learn_running_heads(pages, bh)
+        bt, bb = layout.head_band(pages, heads, bh)
+        self.assertLess(bt, 456 / 3508, "书眉不在带状区内——本用例的前提")
+        cl = layout.clean_page(pages[0], bw, bh, heads, band_top=bt, band_bot=bb)
+        texts = [L["t"] for L in cl]
+        self.assertNotIn(head, texts)
+        self.assertIn("第0页的正文第一行，长度正常。", texts)
+
+    def test_wide_line_is_never_learned_as_head(self):
+        """宽行哪怕跨页重复也不能学成书眉。
+
+        学到的文本在 clean_page 里是**不看位置一律删**的，误学一个正文长句
+        就是全书丢句。书眉实测占 0.23~0.44 页宽，正文整行占 0.67~0.75。
+        """
+        wide = "这一行是正文整行，占满版心，跨页重复也只可能是正文。"
+        pages = []
+        for i in range(6):
+            pages.append(synth_page(i, [
+                (300, 400, 2200, 460, wide),           # w=1900 > 0.55*2480
+                (300, 700, 2100, 780, "第%d页的正文第一行，长度正常。" % i),
+            ]))
+        bw, bh = layout.metrics(pages)
+        heads = layout.learn_running_heads(pages, bh)
+        self.assertNotIn(layout.norm(wide), heads)
 
 
 if __name__ == "__main__":

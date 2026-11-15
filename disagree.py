@@ -20,14 +20,16 @@ PUNCT = re.compile(r"[，。、；：！？“”‘’（）《》〈〉—…�
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from audit import load_dict, DICT_PATH
 import jsonio
+import pagedoc
 
 WORD_MIN = 200          # 判定"是常用词"的词频门槛
 RATIO = 3.0             # 两侧词频差多少倍才算分出胜负
 CTX = 2                 # 差异点左右各取几字做窗口
 
 
-def elen(t):
-    return sum(1.0 if ord(c) > 127 else 0.5 for c in t)
+# 与 layout.py 同口径（全角标点算 0.55 而非 1.0）。分歧过滤用 elen 的
+# max_diff 闸门，口径不一会让「……」「①②③」这类标点密集行被误判为长度差超限。
+from layout import elen  # noqa: E402
 
 
 def best_word(s, lo, hi, dic):
@@ -106,8 +108,8 @@ def main():
 
     cands = []
     for name in common:
-        da = jsonio.read(fa[name])
-        db = jsonio.read(fb[name])
+        da = pagedoc.read(fa[name])
+        db = pagedoc.read(fb[name])
         la, lb = da["lines"], db["lines"]
         ta = [L["t"] for L in la]
         tb = [L["t"] for L in lb]
