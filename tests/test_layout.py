@@ -756,5 +756,150 @@ class TestFigureRegions(unittest.TestCase):
         self.assertEqual(size[1], 300 + 2 * layout.CROP_PAD_Y)
 
 
+class TestEdgeShortLines(unittest.TestCase):
+    """页顶/页底边缘短行的处置。
+
+    历史包袱：这里曾用「窄(w<0.55W) + 短(≤16 字) + 在页顶 18%/页底 10%」
+    当书眉判据，实测吃掉《中国僧官制度史》61 行 / 453 汉字、《黑格尔辩证法
+    讲演录》20 行——正文折行后只占半页宽、又恰好落在页顶，就中招。
+    真书眉在上游已被 learn_running_heads + head_band 删干净，这一层只该
+    拦「非文字碎片」（孤立页码、OCR 符号）。
+    """
+
+    def _run(self, pages):
+        import json
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        src = os.path.join(d, "ocr")
+        os.makedirs(src)
+        for p in pages:
+            q = dict(p)
+            del q["idx"]
+            with open(os.path.join(src, q["name"] + ".json"), "w", encoding="utf-8") as f:
+                json.dump(q, f, ensure_ascii=False)
+        md, rep, cleaned, ps = layout.build(src, {"title": "t", "out_dir": os.path.join(d, "out")})
+        return md, rep
+
+    def _body_pages(self, first_page_lines):
+        """第 1 页用给定行，后两页各不相同（避免被当成跨页重复的书眉）。"""
+        pages = [synth_page(0, first_page_lines)]
+        for i in (1, 2):
+            pages.append(synth_page(i, [
+                (300, 400, 2100, 480, "第%d页的第一行正文内容，长度正常。" % i),
+                (300, 520, 2100, 600, "第%d页的第二行正文内容，长度正常。" % i),
+            ]))
+        return pages
+
+    def test_body_short_line_at_page_top_survives(self):
+        """正文折行后只剩半页宽、又落在页顶——必须保留。
+
+        真实案例：僧官 p039「基层僧官之自然是没有疑义的。」（w=0.40W、
+        elen≈14.6、y1=0.133H）被那条位置判据整行删掉，上下文硬接成
+        「……去领导长沙寺使之成为符」+「维那是梵语……」的错乱。
+        """
+        short = "基层僧官之自然是没有疑义的。"
+        pages = self._body_pages([
+            (300, 400, 1000, 456, short),              # w=700<0.55W, y1=0.13H
+            (300, 520, 2100, 580, "下一行是正常宽度的正文，用来承接上文。"),
+        ])
+        md, rep = self._run(pages)
+        self.assertIn(short, md, "页顶的正文短折行被当成书眉删掉了")
+
+    def test_body_short_line_at_page_bottom_survives(self):
+        """页底同理：正文末行的短折行不能被当成书眉残留删掉。"""
+        short = "乏真正的人文关怀。这个扯得远了。"
+        pages = self._body_pages([
+            (300, 400, 2100, 460, "这一页的正文第一行，宽度正常，内容完整。"),
+            (300, 3180, 1200, 3240, short),            # y0=0.906H>0.90H, w=900<0.55W
+        ])
+        md, rep = self._run(pages)
+        self.assertIn(short, md, "页底的正文短折行被当成书眉删掉了")
+
+    def test_isolated_page_number_at_page_top_still_dropped(self):
+        """孤立页码仍要丢：它留在流里会粘进上一段末尾（实测「……都归他管11」）。
+
+        y1 取 0.13H —— 高于 clean_page 的页码门限（0.12H），所以只能靠
+        assemble 这一层的碎片判据拦下。
+        """
+        pages = self._body_pages([
+            (300, 400, 2100, 460, "这一页的正文第一行，宽度正常，内容完整。"),
+            (1840, 400, 1900, 456, "11"),              # w=60, y1=0.13H
+        ])
+        md, rep = self._run(pages)
+        paras = [l for l in md.split("\n") if l.strip()]
+        self.assertNotIn("11", paras)
+        self.assertNotIn("内容完整。11", md)
+
+    def test_symbol_fragment_at_page_top_still_dropped(self):
+        """OCR 吐出的单符号（实测僧官 p240 的「°」）同样不能进正文。"""
+        pages = self._body_pages([
+            (300, 400, 2100, 460, "这一页的正文第一行，宽度正常，内容完整。"),
+            (300, 400, 360, 456, "°"),                 # elen=0.55<=1
+        ])
+        md, rep = self._run([pages[0]])
+        self.assertNotIn("°", md)
+
+
+class TestHeadLearnWindow(unittest.TestCase):
+    """learn_running_heads 的扫描窗口与「窄行守门」。
+
+    《规训与惩罚》的章节书眉落在 y1=10.1%~13.4% 页高，旧窗口 0.11H 只学到
+    「书名」那一条，11 条章节书眉漏掉 9 条；而 head_band 有 0.09 硬上限，
+    这些书眉在带状区里也无处可拦，于是「第二章 断头台的场面第一章」这种
+    残片拼进了正文。窗口放宽到 0.18H 后能全部学到。
+    """
+
+    def _pages_with_head(self, head, y1, n=6, w=700):
+        """n 页，每页顶部都有同一窄行书眉，正文各不相同。"""
+        pages = []
+        for i in range(n):
+            pages.append(synth_page(i, [
+                (300, y1 - 56, 300 + w, y1, head),
+                (300, 700, 2100, 780, "第%d页的正文第一行，长度正常。" % i),
+                (300, 820, 2100, 900, "第%d页的正文第二行，长度正常。" % i),
+            ]))
+        return pages
+
+    def test_low_running_head_is_learned(self):
+        """书眉落在 y1=13% 页高也要学到（旧窗口 0.11H 会漏）。"""
+        pages = self._pages_with_head("第一部分第一章 犯人的肉体", 456)  # 456/3508=0.13
+        bw, bh = layout.metrics(pages)
+        heads = layout.learn_running_heads(pages, bh)
+        self.assertIn(layout.norm("第一部分第一章 犯人的肉体"), heads)
+
+    def test_learned_low_head_is_removed_from_body(self):
+        """学到之后，这条书眉要真的从正文流里消失（学而不删等于没学）。
+
+        它不在带状区里（band_top 有 0.09 硬上限），只能靠「文本命中」删掉。
+        """
+        head = "第一部分第一章 犯人的肉体"
+        pages = self._pages_with_head(head, 456)
+        bw, bh = layout.metrics(pages)
+        heads = layout.learn_running_heads(pages, bh)
+        bt, bb = layout.head_band(pages, heads, bh)
+        self.assertLess(bt, 456 / 3508, "书眉不在带状区内——本用例的前提")
+        cl = layout.clean_page(pages[0], bw, bh, heads, band_top=bt, band_bot=bb)
+        texts = [L["t"] for L in cl]
+        self.assertNotIn(head, texts)
+        self.assertIn("第0页的正文第一行，长度正常。", texts)
+
+    def test_wide_line_is_never_learned_as_head(self):
+        """宽行哪怕跨页重复也不能学成书眉。
+
+        学到的文本在 clean_page 里是**不看位置一律删**的，误学一个正文长句
+        就是全书丢句。书眉实测占 0.23~0.44 页宽，正文整行占 0.67~0.75。
+        """
+        wide = "这一行是正文整行，占满版心，跨页重复也只可能是正文。"
+        pages = []
+        for i in range(6):
+            pages.append(synth_page(i, [
+                (300, 400, 2200, 460, wide),           # w=1900 > 0.55*2480
+                (300, 700, 2100, 780, "第%d页的正文第一行，长度正常。" % i),
+            ]))
+        bw, bh = layout.metrics(pages)
+        heads = layout.learn_running_heads(pages, bh)
+        self.assertNotIn(layout.norm(wide), heads)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

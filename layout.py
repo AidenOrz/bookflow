@@ -357,18 +357,34 @@ def learn_running_heads(pages, bh):
     长度上限放宽到 60：扫描件常带整行水印（如
     「PDF 文件使用 "pdfFactory" 试用版本创建 www.fineprint.com.cn」约 40 字），
     旧上限 30 会把它们漏掉，于是水印漏进正文。
+
+    顶部扫描窗口从 0.11H 放宽到 0.18H：书眉坐得多低因书而异，《规训与惩罚》
+    的章节书眉 y1 最高到 13.4% 页高，0.11H 只学到「书名」那一条，11 条章节
+    书眉漏掉 9 条——它们在 head_band 那条 0.09 硬上限之下也无处可拦，于是
+    「第二章 断头台的场面第一章」这种残片会拼进正文。
+
+    但顶部这 0.18H 里绝大多数行是**正文**（正文首行常落在 8%~18%），所以顶部
+    必须配「窄行」守门：书眉实测占 0.23~0.44 页宽，正文整行占 0.67~0.75。
+    这个守门不能省——学到的文本在 clean_page 里是**不看位置一律删**的
+    （norm(t) in heads 那条），误学一个正文长句就是全书丢句。
+    页脚 0.90H 以下不加宽度守门：水印本来就是整行宽的。
     """
     from collections import defaultdict
     seen = defaultdict(set)
     for p in pages:
-        H = p["h"]
+        H, W = p["h"], p["w"]
         for L in p["lines"]:
-            if L["y1"] < 0.11 * H or L["y0"] > 0.90 * H:
-                t = L["t"].strip()
-                k = norm(t)
-                # 纯符号/单字的归一化结果不可靠，跳过
-                if 2 <= len(k) <= 60 and len(t) <= 80:
-                    seen[k].add(p["idx"])
+            top = L["y1"] < 0.18 * H
+            bot = L["y0"] > 0.90 * H
+            if not (top or bot):
+                continue
+            if top and not bot and L["x1"] - L["x0"] > 0.55 * W:
+                continue
+            t = L["t"].strip()
+            k = norm(t)
+            # 纯符号/单字的归一化结果不可靠，跳过
+            if 2 <= len(k) <= 60 and len(t) <= 80:
+                seen[k].add(p["idx"])
     return {k for k, s in seen.items() if len(s) >= 5}
 
 
@@ -1549,10 +1565,21 @@ def assemble(pages, cleaned, stream, matched, toc_ids, bw, bh, start=0,
                 and last_head and last_head[0] == pi
                 and norm(L["t"]) in norm(last_head[1])):
             continue
-        # 页顶/页底窄短行：书名、章名的书眉残留，未命中目录则丢弃
+        # 页顶/页底边缘带里只剩**非文字碎片**要丢：孤立页码、OCR 吐出的符号。
+        # 它们留在流里会粘进上一段末尾（实测僧官 p128 的「11」、p240 的「°」，
+        # 规训 p010 的「4」），把正文污染成「……都归他管11」。
+        #
+        # 早先这里用「窄(w<0.55W) + 短(≤16 字) + 在边缘」当书眉判据，实测把
+        # 正文折行的短行也一起杀了：《中国僧官制度史》丢 61 行 / 453 汉字
+        # （「基层僧官之自然是没有疑义的。」），《黑格尔辩证法讲演录》丢 20 行。
+        # 关键在于**书眉是文本属性，不是位置属性**：真书眉在上游已经被
+        # learn_running_heads（跨页重复）+ head_band（自适应带状区）删干净，
+        # 漏到这一层的边缘短行实测与「书眉/章名/书名」的最大相似度只有 0.60
+        # （阈值 0.75 一行都过不了），全是正文。所以这里不再做书眉判断。
         H = pages[pi]["h"]
-        if (L["w"] < 0.55 * pages[pi]["w"] and elen(L["t"]) <= 16
-                and (L["y1"] < 0.18 * H or L["y0"] > 0.90 * H)):
+        if ((L["y1"] < 0.18 * H or L["y0"] > 0.90 * H)
+                and (not norm(L["t"]) or PAGE_NO.match(L["t"].strip())
+                     or elen(L["t"]) <= 1)):
             continue
         ind = L["x0"] - left.get(pi, L["x0"])
         newp = False
