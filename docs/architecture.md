@@ -50,12 +50,12 @@ PDF ──render──► pages/*.png              300dpi 灰度（pdftoppm）
 | `disagree.py` | 双模型分歧 | 两版 OCR 交叉比对，词频强弱比判胜负 |
 | `apply_decisions.py` | 裁决回填 | 读 `decisions.json`，`key=page@y0` 稳定主键；**默认 dry-run**；整行覆盖支持多差异段；时间戳备份目录；三态判定（apply/already/missing）保证幂等 |
 | `decisions.py` | 裁决表适配层 | `from_disagree`/`from_audit`/`from_queue`/`merge`，把两套互不兼容的候选格式统一成 `decisions.json` |
-| `cover.py` | 封面 | 从首页裁封面，按墨迹密度去水印带；不合适的页返回 None |
+| `cover.py` | 封面 | 从首页裁封面，按墨迹密度去水印带；不合适的页返回 None；`alt` 属性走 `epub3.esc_attr` |
 | `make_md.py` | md 阶段入口 | 调 layout → fix → qa，三个产物原子写 |
 | `epub3.py` | EPUB3 构建 | 章节切分、nav/ncx、封面、**弹窗脚注渲染**、自校验 |
 | `make_epub.py` | epub 阶段入口 | `epub3.py` 的 CLI |
 | `qa.py` / `check_epub.py` | 校验 | 成书前闸门（含脚注完整性）/ EPUB 包结构自校验 |
-| `jsonio.py` | IO 工具 | with 包住句柄；写临时文件再 rename |
+| `jsonio.py` | IO 工具 | with 包住句柄；写临时文件再 rename。**所有**产物写入都该走它（含 `audit` / `disagree` / `cmp_ocr`），页级 JSON 走 `pagedoc.write` |
 | `pagedoc.py` | **数据契约** | 页级 JSON 与 report.json 的 `schema`/`schema_version`/`producer`；老文件兼容、新版本拒绝；`stamp`/`read`/`check`/`describe` |
 
 ## 4. 数据契约
@@ -127,6 +127,9 @@ PDF ──render──► pages/*.png              300dpi 灰度（pdftoppm）
 | 裁决回填**默认 dry-run** | 它会原地覆写 OCR，而重跑一本 383 页的书要 4.3 分钟；一次误跑不可逆的成本远高于多打一个 --apply |
 | 重复页**按内容去重** | 扫描件常见整段页重复；不去重会成段重复正文（实测 19 页） |
 | 产物**原子写** | 中途崩溃不能留下「book.md 有、report.json 没有」的半成品 |
+| 清理路径**必须带超时且有兜底** | `taskkill` 卡在 WMI/RPC 上会让「Ctrl+C 收尸」永远回不来（比子进程变孤儿更糟）；而 `check=False` 又会让权限不足/进程已消失时静默什么都不做。两个失败方向相反，所以既要 `timeout`，也要在非 0 时补一次 `proc.kill()` |
+| 属性位转义**只有一个入口** | `epub3.esc_attr()`。`cover.py` 曾自己 `format(title=...)` 拼进 `alt=""`，书名带引号就产出坏 XML；`esc()` 刻意 `quote=False`，专供文本节点，两者不能混用 |
+| 「空样本」当成必然事件 | `statistics.median` / `max()` / `[0]` 都假设非空。`repair.median_char_width` 收不到样本时抛 `StatisticsError`，把 `main()` 里那句友好提示截胡了。统计函数返回 `None`，由调用方决定报错还是降级 |
 | 文字层默认 **verify**（抽 + 跑 OCR 对账），而非只抽或不用 | 书的文字层质量参差不齐：完好的那批快 40 倍且有 0 识别错误，残缺的那批（只有页眉页码）直接用会让正文清空。对账是唯一同时拿到「快」和「不静默出错」的办法；`only` / `off` 留给确认过质量的书 |
 | 交叉验证的 **A 侧必须是文字层** | `disagree.py` 的 verdict 是「倾向哪侧对」，`apply_decisions` 的 verdict=A 是「保留 A 侧不动作」。两侧对调会让更准的来源被判成该被覆盖 |
 | 只有 **≥95% 页有正文**的书才让 `ocr_text` 参与选源 | 「部分页有文字」当正文 = 另一半页直接消失；且两套分行口径混在一本书里，跨页合段会在混源页边界误判 |
@@ -166,3 +169,45 @@ pandoc 3.8 本机可用，实测同一份 `book.md`（556 KB EPUB，0.68 s）它
 - 版面分析（PP-DocLayoutV3）不是 100% 准，作为辅助判据而非真值。
 - 脚注锚定率受 OCR 制约，不是算法问题：新书 110/243 个有脚注的页面，正文里
   一个圈号都没被识别出来，这些注只能整章排在末尾。
+
+## 8. 模块拆分计划：`layout.py`
+
+`layout.py` 现在 **2013 行 / 41 个函数**，是全项目唯一的单体大模块。它已经是结构瓶颈——
+不是不能跑，而是改任何一个阶段都要先在大脑里维护一整本书的上下文。本轮的静态审阅也点了它。
+
+### 拆法：按流水线阶段切，`layout.py` 只留门面
+
+`build()` 本身就是现成的切分线（第 1897 行起，逐段调用各阶段）。按它切：
+
+| 新模块 | 收哪些函数 | 行数约 |
+|---|---|---|
+| `layout_text.py` | `elen` `norm` `mark_value` `char_width` 与 `CJK` / `PUNCT_END` / `PAGE_NO` 常量（文本口径，被 repair / disagree 反向依赖） | 80 |
+| `layout_heads.py` | `learn_running_heads` `head_band` `clean_page` `detect_toc_pages` `page_regions` `_region_boxes` | 330 |
+| `layout_notes.py` | `split_note_head` `extract_notes` `split_note_blocks` `extract_star_notes` `plan_notes` `apply_subs` 与 `MARK_RE` / `STAR_RE` | 300 |
+| `layout_figures.py` | `find_figures` `find_tables` `plate_bbox` `extract_figures` `plate_like` `table_blocks` `group_table_text` `_visual_rows` `_table_flags` `crop_figure` `emit_images` | 400 |
+| `layout_toc.py` | `parse_toc` `heading_score` `unify_title` `split_marker` `assign_levels` `match_entries` `page_offset` `_looks_entry` `_mk_entry` `_rank` | 450 |
+| `layout_assemble.py` | `assemble` `to_markdown` `to_markdown_with_pages` `plan_regions` | 500 |
+| `layout.py`（保留） | `load_pages` `metrics` `dedupe_pages` `drop_back_cover` `build`，外加各子模块的 re-export | 200 |
+
+### 三条硬规矩
+
+1. **`layout.py` 对外 API 不变**。`from layout import elen`（`repair.py` / `disagree.py`）、
+   `layout.build`（`make_md.py`）、`layout.load_pages`（两个测试文件）都有引用。
+   在 `layout.py` 顶部 `from layout_text import elen, norm  # noqa` 转发即可，**调用方一行都不用改**。
+2. **不拆 `assemble()` 内部**。它 260 行、十几条位置判据交织，「哪条判据先命中」本身就是
+   最关键的信息，硬拆成小函数会把它藏起来。这一轮只挪文件边界，不动函数体。
+3. **每步都用哈希验收**。三本书的 `book.md` 是现成的黄金样本：僧官 `0BA1E017…`、
+   规训 `E5053BDD…`、黑格尔 `320A586E…`（文件字节口径）。拆完三本全部逐字节不变 = 零回归。
+### 分三步走（每步一个提交，各自可回滚）
+
+| 步骤 | 内容 | 验收 |
+|---|---|---|
+| 1 | 抽 `layout_text.py`（纯叶子、零依赖，且被 repair / disagree 反向引用） | 三本哈希不变 + 全量测试绿 |
+| 2 | 抽 `layout_heads.py` / `layout_notes.py` / `layout_figures.py` | 同上 |
+| 3 | 抽 `layout_toc.py` / `layout_assemble.py`，`layout.py` 收敛成门面 | 同上 |
+
+### 为什么现在不做
+
+它**不影响任何当前产出**，属于可读性与可维护性投资。而排在它前面的「注号识别率」是
+**真实质量问题**（僧官 288 条注只能降级成页尾注）。先把收益大的做完。
+另外大面积移动会打断 `git blame` 的连续性——没有明确的重构窗口时，这笔账不划算。

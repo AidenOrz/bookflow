@@ -274,11 +274,12 @@ EPUB3 有专门的脚注语义，主流阅读器（Apple Books / Thorium / Kobo�
 python -m unittest discover -s tests -v
 ~~~
 
-212 个用例（test_layout 55 + test_textlayer 56 + test_textlayer_cli 34 + test_decisions 34 +
-test_pagedoc 17 + test_epub3 16），全部来自真实踩过的坑（正文首行被当书眉删、标题残片漏消费、重复页、
+227 个用例（test_layout 55 + test_textlayer 56 + test_textlayer_cli 38 + test_decisions 34 +
+test_pagedoc 17 + test_epub3 16 + test_smallfixes 11），全部来自真实踩过的坑（正文首行被当书眉删、标题残片漏消费、重复页、
 空输入静默成功、fix 规则误伤、脚注误连、EPUB 断链、单页目录判不出、
 「第X部分」被压平到与「第X章」同级、章节撞到分部扉页、星号注错配、
-校对页码因漏算换行符整体偏移等）。
+校对页码因漏算换行符整体偏移、`taskkill` 挂死 / 失败后子进程逃逸、封面书名未转义、
+空样本让统计函数先炸、产物裸 `open()` 写等）。
 
 ## 已知限制
 
