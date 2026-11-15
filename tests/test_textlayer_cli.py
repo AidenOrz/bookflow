@@ -25,7 +25,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -433,23 +435,128 @@ class TestSubprocessHandling(unittest.TestCase):
             bookflow.sh(["definitely-not-a-real-command-xyz"])
         self.assertIn("启动失败", str(cm.exception.code))
 
+    def spawn_idle(self):
+        """起一个只会睡的进程当靶子。
+
+        为什么不用 ping：早先这里用 `ping -n 60 127.0.0.1` 当「不会自己退出的进程」，
+        在禁用网络栈/虚拟适配器的沙箱里 ping 会瞬间以 1 退出（Unable to contact
+        IP driver），于是断言在调用 kill_tree **之前**就挂了，测试永远红。
+        靶子进程不能依赖任何外部系统工具和网络，python -c sleep 才是可移植的。
+        """
+        return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+
     def test_kill_tree_stops_child(self):
         """Ctrl+C 时子进程必须跟着死——实测 pdftoppm 会变孤儿继续跑 20 分钟、
         占着文件句柄让 pages/ 删不掉。"""
-        import time
-        cmd = (["ping", "-n", "60", "127.0.0.1"] if os.name == "nt"
-               else ["sleep", "60"])
-        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
+        p = self.spawn_idle()
         try:
-            time.sleep(0.3)
-            self.assertIsNone(p.poll())
+            time.sleep(0.5)
+            self.assertIsNone(p.poll(), "靶子进程没起来，后面验不了 kill")
             bookflow.kill_tree(p)
             time.sleep(0.8)
             self.assertIsNotNone(p.poll(), "kill_tree 没杀掉子进程")
         finally:
             if p.poll() is None:
                 p.kill()
+                p.wait()
+
+    @unittest.skipUnless(os.name == "nt", "只在 Windows 上走 taskkill 分支")
+    def test_taskkill_is_called_with_timeout(self):
+        """taskkill 必须带 timeout。没有它，taskkill 卡在 WMI/RPC 上时
+        调用方就永远回不来——比子进程变孤儿更糟，用户既停不掉也退不出。"""
+        p = self.spawn_idle()
+        try:
+            with mock.patch("bookflow.subprocess.run") as run:
+                run.return_value = mock.Mock(returncode=1)   # 假装 taskkill 失败
+                bookflow.kill_tree(p)
+            kw = run.call_args.kwargs
+            self.assertIn("timeout", kw, "taskkill 没有超时上限")
+            self.assertGreater(kw["timeout"], 0)
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+
+    @unittest.skipUnless(os.name == "nt", "只在 Windows 上走 taskkill 分支")
+    def test_taskkill_failure_still_kills_direct_child(self):
+        """taskkill 返回非 0（权限不足/找不到进程/taskkill 不可用）时，
+        旧版因为 check=False 且只捕 OSError，什么都不做，直接子进程照样活着。
+        兜底 kill 必须补上。"""
+        p = self.spawn_idle()
+        try:
+            with mock.patch("bookflow.subprocess.run") as run:
+                run.return_value = mock.Mock(returncode=1)
+                bookflow.kill_tree(p)
+            p.wait(timeout=5)
+            self.assertIsNotNone(p.poll(), "taskkill 失败后子进程逃逸了")
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+
+    @unittest.skipUnless(os.name == "nt", "taskkill /T 才有的行为；POSIX 上只杀直接子进程")
+    def test_kill_tree_also_kills_grandchild(self):
+        """真正要验的是**孙进程**：pdftoppm 就是被这么拉起来的，
+        只杀直接子进程会留下它继续渲染、占着 pages/ 的句柄。"""
+        child = ("import subprocess, sys, time; "
+                 "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+                 "print(p.pid, flush=True); time.sleep(60)")
+        p = subprocess.Popen([sys.executable, "-c", child],
+                             stdout=subprocess.PIPE, text=True)
+        gpid = None
+        try:
+            gpid = int(p.stdout.readline().strip())
+            self.assertIsNone(p.poll(), "父进程没能起来")
+            bookflow.kill_tree(p)
+            time.sleep(0.8)
+            self.assertIsNotNone(p.poll(), "直接子进程没杀掉")
+            self.assertFalse(self.pid_alive(gpid), "孙进程逃逸了（taskkill /T 没生效）")
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+            if gpid and self.pid_alive(gpid):
+                subprocess.run(["taskkill", "/PID", str(gpid), "/T", "/F"],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, check=False)
+
+    @staticmethod
+    def pid_alive(pid):
+        """Windows 上判断进程还在不在。
+
+        不能 os.kill(pid, 0)：Windows 的 os.kill 对任意 pid 都几乎不报错
+        （除非 pid 非法），拿它当探活会假阳性。这里问内核要句柄。
+        """
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED = 0x1000
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED, False, pid)
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return False
+            return code.value == 259          # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+
+    @unittest.skipUnless(os.name == "nt", "只在 Windows 上走 taskkill 分支")
+    def test_taskkill_hang_does_not_hang_kill_tree(self):
+        """taskkill 超时也不能把 kill_tree 挂死：超时要被吞掉并兜底 kill。"""
+        p = self.spawn_idle()
+        try:
+            with mock.patch("bookflow.subprocess.run") as run:
+                run.side_effect = subprocess.TimeoutExpired(["taskkill"], 10)
+                bookflow.kill_tree(p)
+            p.wait(timeout=5)
+            self.assertIsNotNone(p.poll(), "taskkill 超时后子进程逃逸了")
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
 
     def test_kill_tree_on_finished_process_is_noop(self):
         """已经退出的进程再 kill 一次不能抛（清理路径会被重复调用）。"""
