@@ -27,7 +27,17 @@ DROP_REGIONS = {"footnote", "vision_footnote", "footer", "header",
 
 # 图片/插图区。既不在 DROP_REGIONS 里、也没有任何裁图代码——于是插图整块
 # 消失，区域里的 OCR 行（图注、示意图上的标注字）被当普通正文流式输出。
-FIG_REGIONS = {"image", "figure"}
+#
+# display_formula / chart 也归到这里，理由与插图完全相同、且实测更严重：
+# 它们装的是示意图、公式、字母矩阵——**视觉本身就是全部内容**，OCR 只能
+# 吐出一串残渣。《拉康式主体》实测 27 个 display_formula、3 个 chart，
+# 它们行内的 OCR 结果是「二：L z 情 A」「tt+1 情况B」「~ î ~ ~」「飞丁a」
+# 这种东西，混在正文里读者完全看不懂；而把这块像素裁出来，读者看到的就是
+# 印在书上的那张图。**裁图不丢信息，留在正文里才丢。**
+#
+# 为什么不是加进 DROP_REGIONS 直接删：那样图还在页面上，成书里却凭空
+# 空了一块，读者不知道该处原本有什么。
+FIG_REGIONS = {"image", "figure", "display_formula", "chart"}
 # 表格区。同样不在 DROP_REGIONS 里，于是每一行都独立成段：实测《中国僧官
 # 制度史》4 个表格页产出 40 个 ≤6 字的碎片段（「共公僧」「池方僧官」「卜座」）。
 TBL_REGIONS = {"table"}
@@ -559,8 +569,19 @@ def clean_page(p, bw, bh, heads, keep_nums=False, band_top=0.085, band_bot=0.93)
         # 跨页重复的版式文本（书眉、水印、出版社名）：命中即删，**不看页内行数**。
         # 旧代码把它放在位置判断之后，且整段受 len(p["lines"]) > 3 保护，于是
         # "整页只剩水印"的空白页（实测 p054）会把水印留下并输出成正文。
+        #
+        # 但**章首页的标题本身也常常就是那一章的书眉文字**（「附录2 追踪原因」
+        # 「索引」），跨页重复学下来就成了书眉文本，于是这一章唯一的标题被删掉，
+        # 成书里该章凭空消失。实测《拉康式主体》p266（附录2）、p288（索引）
+        # 两章的标题都这样丢了，而它在《规训与惩罚》《中国僧官制度史》上
+        # 一次都没出现（那两本的书眉是书名，不是章名）。
+        # 判据与上面的 header 例外同源：**位置证据优先于文本证据**——书眉在
+        # 页眉带里，章标题不在。区域标签再确认一次是标题区，三条同时成立才留。
         if norm(t) in heads:
-            continue
+            titled = L.get("region") in ("paragraph_title", "doc_title")
+            low_enough = L["y0"] > max(band_top, 0.14) * H
+            if not (titled and low_enough):
+                continue
         # 但"位置带"判断不能在页行数很少时生效：只有标题/副标题的章节扉页
         # （如「黑格尔哲学与中国传统思维」独占页首）位于顶部带内，是正文的一部分。
         small_page = len(p["lines"]) <= 3
@@ -860,6 +881,38 @@ def _table_flags(p, rows, bw, bh):
 
 
 
+def table_quality(rows, bw, bh):
+    """表格块的"可读性"：视觉行列数的一致性，返回 (一致率, 众数列数, 行数)。
+
+    为什么要判这个：表格**不是**随便什么都能当整段文字读的。一层文字层的表
+    （列被拆成散框）读出来是「A B A和B　A和B / T T T　第1行 / F F　第2行」——
+    列已经错位；而两层文字的 XOR 表读出来是「·F　F 第3行　T」，连行列关系都
+    没有了。这类表留在正文里是**假信息**：读者会以为书上就是这么排的。
+
+    判据是"每行的列数基本一致"：真表格每行都是同样几列（表头除外），
+    列数乱跳说明这一块被拆碎或认残了。实测：
+      · 僧官 3 块可读（责任编辑/僧人沿革表，列数 2/3 稳定）、
+        4 块不可读（p135/p320/p321 的框图，列数在 1~9 之间乱跳）
+      · 拉康 3 块可读、13 块不可读（表格页码多、字母矩阵多）
+
+    可读的走原来的整段文字路径；不可读的**改成裁图**（见 plan_regions）。
+    裁图不丢信息——读者看到的是书上那张表的原样。
+    """
+    vis = _visual_rows(rows, bw, bh)
+    if len(vis) < 2:
+        return 0.0, 0, len(vis)
+    ncol = [r["ncol"] for r in vis]
+    best = max(set(ncol), key=ncol.count)
+    return ncol.count(best) / len(ncol), best, len(vis)
+
+
+# 表格块可读性的门槛。ratio 是"列数与众数列相同的行占比"，modal 是众数列数。
+# 0.7 是实测值：真表格（僧官 p120 沿革表、p306 封赐表）一致率 0.67~1.00，
+# 被打散的框图（p135/p320/p321）0.25~0.43，中间几乎没有样本。
+TABLE_MIN_RATIO = 0.7
+TABLE_MIN_COLS = 2
+
+
 def table_blocks(p, rows, bw, bh):
     """一页里被并成「表格块」的行组（每组是一串行对象，按阅读顺序）。
 
@@ -983,13 +1036,30 @@ def plan_regions(pages, cleaned, bw, bh, toc_ids=None):
             idxs = [pos[id(L)] for L in blk if id(L) in pos]
             if not idxs:
                 continue
-            text = group_table_text(blk, bw, bh).strip()
-            if not text:
-                continue
+            ratio, modal, nvis = table_quality(blk, bw, bh)
             rows_gone = [(pi, i) for i in idxs]
-            ins.setdefault((pi, min(idxs)), []).append(("tbl", text, pi, rows_gone))
-            report["tables"] += 1
-            report["table_lines"] += len(idxs)
+            if ratio >= TABLE_MIN_RATIO and modal >= TABLE_MIN_COLS:
+                text = group_table_text(blk, bw, bh).strip()
+                if not text:
+                    continue
+                ins.setdefault((pi, min(idxs)), []).append(("tbl", text, pi, rows_gone))
+                report["tables"] += 1
+                report["table_lines"] += len(idxs)
+            else:
+                # 列数乱跳的表 = 被拆碎或认残了，当文字读出来是**假信息**
+                # （「·F　F 第3行　T」这种行列错位的样子书上并不存在）。
+                # 改成按这块行的包围盒裁图：读者看到的是书上那张表的原样。
+                # 与插图同一条思路——视觉本身就是内容，裁图不丢信息。
+                ys0 = min(L["y0"] for L in blk)
+                ys1 = max(L["y1"] for L in blk)
+                xs0 = min(L["x0"] for L in blk)
+                xs1 = max(L["x1"] for L in blk)
+                report["garbled_tables"] = report.get("garbled_tables", 0) + 1
+                ins.setdefault((pi, min(idxs)), []).append(
+                    ("fig", "fig-p%03d-%d.png" % (pi + 1, report["figures"] + 1),
+                     pi, rows_gone, (xs0, ys0, xs1, ys1)))
+                report["figures"] += 1
+                report["figure_lines"] += len(idxs)
 
         # ---- 插图：把区域里的 OCR 行换成裁出来的图
         boxes = find_figures(p)
@@ -1436,6 +1506,29 @@ def match_entries(pages, cleaned, entries, toc_ids, bw, bh, offset=None):
 
 
 # ---------------------------------------------------------------- 组装
+def _body_title(toc, body):
+    """目录页条目的标题：拿正文命中行补齐（书签条目不走这里，见 assemble）。
+
+    两个来源各有残缺，这里做三件事：unify_title 取更完整的那份；剥掉标题里
+    残留的 markdown 标记；把「第X部/章」和紧跟的内容用全角空格隔开——目录页
+    OCR 常把编号和标题黏成「第一章犯人的肉体」。
+
+    最后那条**不能用在书签标题上**：书签里作者写的就是「第1部分结构：异化与他者」
+    （"部分"是一个词），硬插空格会变成「第1部　分结构：异化与他者」。
+    这正是用户报的那个多出来的空格，所以书签条目绕过整个函数。
+    """
+    title = unify_title(toc, body)
+    # 「部」后面可能紧跟「分」构成一个词（第1部分），不能把它拆成「第1部　分」。
+    # 这条是测试逼出来的：`第1部分结构：异化与他者` 原本会被插成
+    # 「第1部　分结构：异化与他者」——正是用户报的那个多余空格。
+    # 所以「部」这一类把可选的「分」一起吃进标记里。
+    mm = re.match(r"^(第\s*[零一二三四五六七八九十百千两0-9]+\s*(?:部分?|[讲章节篇卷编])"
+                 r"|绪论|前言|导论|引言|后记|结语|结论|参考书目|参考文献|致谢|序言)"
+                 r"(?=[^\s、，,.．·:：\-—　])", title)
+    if mm:
+        title = mm.group(1) + "　" + title[mm.end():]
+    return title
+
 def assemble(pages, cleaned, stream, matched, toc_ids, bw, bh, start=0,
              notes=None, subs=None, orphan=None, ins=None, gone=None):
     """把正文行拼成块：标题块 + 段落块 + 章末脚注块 + 图/表块。
@@ -1449,9 +1542,16 @@ def assemble(pages, cleaned, stream, matched, toc_ids, bw, bh, start=0,
     """
     ins = ins or {}
     gone = gone or set()
+    # 同一个 (页, 行) 上**可能有多条标题**，用 list 而不是 dict。
+    #
+    # 这不是理论情况：书签里的「第一部分 酷刑」和「第一章 犯人的肉体」指同一页
+    # （分部扉页是空白页、没有文字层，出版方就把分部书签落到了章首页），
+    # 用 dict 时后者会覆盖前者，整本书的四个「第X部分」全部静默消失
+    # ——实测《规训与惩罚》成书从 16 个标题掉到 12 个。
+    # 同位置的标题按条目顺序输出（分部在章之前，正是书签的顺序）。
     head_at = {}
     for m in matched:
-        head_at[(m["page"], m["line"])] = m
+        head_at.setdefault((m["page"], m["line"]), []).append(m)
 
     # 标题被拆成多行时，其余片段标记为已消费。
     # 印刷标题常折成 2~3 行（如「第五讲 / 黑格尔辩证法的逻辑学… / 论的统一」），
@@ -1616,25 +1716,29 @@ def assemble(pages, cleaned, stream, matched, toc_ids, bw, bh, start=0,
 
     for (pi, li) in stream[start:]:
         L = cleaned[pi][li]
-        m = head_at.get((pi, li))
+        ms = head_at.get((pi, li)) or []
         if ins:
             put_regions(pi, li)
-        if m is not None:
-            flush()
-            # 章边界：把本章已引用的注和锚不上的注一次性落盘
-            if m["level"] == 1:
-                emit_notes(upto=m["pos"])
-            title = unify_title(m["title"], m["body_text"])
-            last_head = (pi, title)
-            title = title.strip(" #*")
-            mm = re.match(r"^(第\s*[零一二三四五六七八九十百千两0-9]+\s*[讲章节篇卷部编]|绪论|前言|导论|引言|后记|结语|结论|参考书目|参考文献|致谢|序言)(?=[^\s、，,.．·:：\-—　])", title)
-            if mm:
-                title = mm.group(1) + "　" + title[mm.end():]
-            if title.strip():
-                blocks.append(("h", m["level"], title, pi + 1))
+        if ms:
+            # 同一行上可能挂着多条标题（分部与首章常常同页，见 head_at 的注释），
+            # 全部按顺序输出：少输出一条，那一层结构就从成书里消失。
+            for m in ms:
+                flush()
+                # 章边界：把本章已引用的注和锚不上的注一次性落盘
+                if m["level"] == 1:
+                    emit_notes(upto=m["pos"])
+                title = m["title"] if m.get("authoritative") \
+                    else _body_title(m["title"], m["body_text"])
+                title = title.strip(" #*")
+                last_head = (pi, title)
+                if title.strip():
+                    blocks.append(("h", m["level"], title, pi + 1))
             prev = None
             continue
         if pi in toc_ids or (pi, li) in consumed:
+            # 目录页整页不进正文；被标题残片/图表块吃掉的行也不进。
+            # 这一条**必须在标题分支之后**：标题行常常也落在 toc_ids 里
+            # （目录页上的条目），先判它会把标题块全跳过。
             continue
         # 章节标题被拆成"第一讲 + 副标题"时，前半截残留行丢弃
         if (elen(L["t"]) <= 8 and L1_PAT.match(L["t"].strip())
@@ -1903,16 +2007,20 @@ def _images_dir(src, meta):
     return os.path.join(base, "out", "images")
 
 
-def emit_images(pages, src, meta, report, cleaned=None):
+def emit_images(pages, src, meta, report, cleaned=None, extra=None):
     """把每个插图区裁成 PNG，返回要插入 md 的 [(页idx, 裁图文件名)]。
 
     页面 PNG 用的是**未清洗的原始页**（p["name"]）：clean_page 会把页眉页脚删掉，
     但裁图要的是原始扫描像素，两者无关。
+
+    extra 是"版面模型没标成图、但也要裁出来"的额外区域，形如
+    [{"page": idx, "name": "fig-p135-1.png", "bbox": (x0,y0,x1,y1)}]。
+    目前只有一处来源：列数乱跳的表格块（见 plan_regions 的 table_quality 分支）。
     """
     outdir = _images_dir(src, meta)
     pagesdir = _find_pages_dir(src, meta)
     made, failed = [], []
-    for f in extract_figures(pages, cleaned):
+    for f in list(extract_figures(pages, cleaned)) + list(extra or []):
         p = pages[f["page"]]
         png = os.path.join(pagesdir, p.get("name") or ("p-%03d.png" % (f["page"] + 1)))
         dst = os.path.join(outdir, f["name"])
@@ -1970,6 +2078,122 @@ def dedupe_pages(pages, min_dup=3):
     return out
 
 
+def _page_file_no(p):
+    """页 JSON 文件名里的页号（p-007.png → 7）；取不到返回 None。
+
+    书签给的是 **PDF 页序**，而 pages 列表的下标是"剔了封底、去了重复页之后"
+    的下标——两者可能对不上。名字里的页号是唯一能对上 PDF 的锚点，
+    所以书签条目一律按它还原，不按下标。
+    """
+    m = re.search(r"p-0*(\d+)\.png", p.get("name") or "")
+    return int(m.group(1)) if m else None
+
+
+def outline_entries(pages, pdf):
+    """PDF 书签 → 目录条目（页下标已经换算到 pages 里）。返回 (条目, 说明)。
+
+    书签是**数字文本**，比 OCR 目录页可靠得多：标题一个字都不错，页码精确，
+    层级就是嵌套深度。本地 111 个 PDF 实测 59 个带可用书签。
+
+    换算不过来的条目（书签指向的页被去重/剥封底删掉了）直接丢掉，并计入
+    说明——**不按比例类推**：猜出来的页码会把章节起点挪错几页，而那几页
+    的正文会被静默并进上一章。
+    """
+    try:
+        import outline
+    except ImportError:
+        return [], "outline 模块不可用"
+    raw, why = outline.read_outline(pdf)
+    if not raw:
+        return [], why
+    by_no = {}
+    for p in pages:
+        n = _page_file_no(p)
+        if n is not None:
+            by_no.setdefault(n, p["idx"])
+    out, lost = [], 0
+    for e in raw:
+        idx = by_no.get(e["pdf_page"] + 1)
+        if idx is None:
+            lost += 1
+            continue
+        out.append({"title": e["title"], "page_idx": idx,
+                    "pdf_page": e["pdf_page"], "level": e["level"],
+                    "x0": 0.0, "toc_page": None})
+    if lost:
+        why += "；%d 条书签指向的页已不在正文里（去重/剥封底），跳过" % lost
+    return out, why
+
+
+def anchor_outline(pages, cleaned, entries, toc_ids, bw, bh):
+    """把书签条目落到正文的**具体行**上，返回 matched 列表。
+
+    书签只给"这一章从第几页开始"，不给行。要落到行上——因为 assemble 是按
+    (页, 行) 切章的，落在页首会把该页页首那行正文吞掉。
+
+    **一页之内按顺序匹配**，不是全页找最像的：同一页上「第1部分」是页首、
+    「结构：异化与他者」是次行，两行都像标题；全页取最相似会把两条书签都
+    吸到同一行，后一章的起点就丢了。
+
+    匹配不上的（索引页把「索引」当成两次出现的词、封底简介占了整页）
+    退回"页首第一行"：书签的页码本身是权威的，行只影响这一页丢不丢第一行。
+    """
+    stream = []
+    for p in pages:
+        if p["idx"] in toc_ids:
+            continue
+        for j, L in enumerate(cleaned[p["idx"]]):
+            stream.append((p["idx"], j))
+    pos_of = {pl: k for k, pl in enumerate(stream)}
+
+    matched = []
+    for ei, e in enumerate(entries):
+        pi = e["page_idx"]
+        rows = cleaned.get(pi) or []
+        tgt = norm(e["title"])
+        best_pos, best = None, 0.0
+        if tgt:
+            for li, L in enumerate(rows):
+                k = pos_of.get((pi, li))
+                if k is None:
+                    continue
+                cand = norm(L["t"])
+                cands = [cand]
+                if li + 1 < len(rows):
+                    cands.append(cand + norm(rows[li + 1]["t"]))
+                for c in cands:
+                    if not c:
+                        continue
+                    r = SequenceMatcher(None, c, tgt).ratio()
+                    if r > best:
+                        best, best_pos = r, k
+                        best_text = L["t"]
+                if best_pos is not None and best >= 0.60:
+                    break           # 一页之内命中即止（见 docstring）
+        if best_pos is None:
+            k = pos_of.get((pi, 0))
+            if k is None:
+                # 这页清洗后一行不剩（整页插图）。挂到紧随其后的第一行上，
+                # 否则这一章在成书里根本没有起点。
+                k = next((pos_of[pl] for pl in stream if pl[0] >= pi), None)
+            if k is None:
+                continue
+            best_pos, best = k, 0.0
+            best_text = ""
+        matched.append({
+            "ei": ei, "title": e["title"], "level": e["level"],
+            "printed_page": None, "page": pi,
+            "line": stream[best_pos][1],
+            "score": round(best, 3),
+            "body_text": best_text,
+            "pos": best_pos,
+            # 书签标题是出版方原文，assemble 要原样用它（见那里的注释）。
+            "authoritative": True,
+        })
+    matched.sort(key=lambda m: m["pos"])
+    return stream, matched
+
+
 def build(src=None, meta=None):
     meta = meta or {}
     if src is None:
@@ -1985,21 +2209,70 @@ def build(src=None, meta=None):
                                    keep_nums=(p["idx"] in toc_ids),
                                    band_top=band_top, band_bot=band_bot)
                for p in pages}
-    entries = parse_toc(pages, cleaned, bw, bh, toc_ids)
-    if not entries:
-        # 目录页缺失时整条流水线会"成功"地产出一本无章节结构的书：
-        # 全书拍成一个平面段落流，EPUB 只有一章、没有导航。rc=0、无告警，
-        # 用户拿到成书只会以为"这书本来就这样"——必须显式警告。
-        print("\n" + "!" * 68)
-        print("! 未检测到目录条目：成书将没有章节结构（全书作为一章、无目录导航）。")
-        print("! 如果原书确实有目录页，请检查：")
-        print("!   1) 扫描件前 30 页是否有「目 录 / 目次 / Contents」页；")
-        print("!   2) 目录页是否被 OCR 成了图片或整页乱码；")
-        print("!   3) 目录条目的行尾页码是否被识别出来（parse_toc 靠它判条目）。")
-        print("! 检测到的目录页索引：%s" % (sorted(toc_ids) or "无"))
-        print("!" * 68 + "\n")
-    offset = page_offset(pages)
-    stream, matched = match_entries(pages, cleaned, entries, toc_ids, bw, bh, offset)
+    # 目录来源：**PDF 书签与印刷目录页取更详细的那一份**（判据见下面的注释）。
+    # 书签是数字文本（标题不会错、页码精确、层级就是嵌套深度），而目录页要过
+    # OCR——它恰好是 OCR 最难的版面（字号大、行距紧、引导点和页码挤一行）。
+    # 实测《拉康式主体》目录页 23 条只解析出 15 条，还把「附录1」和「附录2」
+    # 粘成一条；而同一本书的 PDF 书签 23 条一条不差。但《中国僧官制度史》反过来：
+    # 书签只有 3 条、目录页有 103 条。所以不能无条件优先。
+    toc_source = "tocpage"
+    entries, toc_why = [], ""
+    pdf = meta.get("pdf") or ""
+    if not pdf:
+        # 页级 JSON 自带 source_pdf，重跑 md 不必再敲一遍 --pdf
+        for p in pages:
+            if p.get("source_pdf"):
+                pdf = p["source_pdf"]
+                break
+    if pdf:
+        entries, toc_why = outline_entries(pages, pdf)
+    if entries:
+        # **书签要比目录页更详细才用它。**
+        #
+        # 大多数书的书签只是"封面/正文/附录"这种导航跳板，根本不含章节结构；
+        # 而印刷目录页才是出版方排出来的真目录。实测三本书把这个区别摆得很清楚：
+        #
+        #   《拉康式主体》书签 23 条，目录页也只解析出 23 条（还有 8 条没落到
+        #                正文），书签一条不差 → 用书签
+        #   《规训与惩罚》书签 17 条，目录页 16 条，书签还多一条「前言」→ 用书签
+        #   《中国僧官制度史》书签只有 3 条（封面頁/序/正文），目录页有 103 条
+        #                真条目 → **用书签就等于把 103 条目录全扔掉**
+        #
+        # 所以判据是"书签至少和目录页一样细"，而不是"有书签就用书签"。
+        # 目录页一条都解析不出来时（toc_count = 0），书签有几条用几条。
+        toc_count = len(parse_toc(pages, cleaned, bw, bh, toc_ids))
+        if toc_count > len(entries):
+            print("  目录来源：印刷目录页（%d 条 vs 书签 %d 条；书签太粗，不够当目录）"
+                  % (toc_count, len(entries)))
+            entries, toc_why = [], toc_why + "（书签 %d 条 < 目录页 %d 条）" % (
+                len(entries), toc_count)
+    if entries:
+        toc_source = "outline"
+        print("  目录来源：PDF 书签（%s），不再解析目录页" % toc_why)
+        stream, matched = anchor_outline(pages, cleaned, entries, toc_ids, bw, bh)
+        if len(matched) < len(entries):
+            print("  书签 %d 条，落到正文 %d 条" % (len(entries), len(matched)))
+    else:
+        # 走这条路意味着"PDF 没书签 / 书签太少 / 没装 pypdf"之一，
+        # toc_why 里写的是哪一条，原样打出来——用户得知道为什么没走书签。
+        if toc_why:
+            print("  目录来源：印刷目录页（%s）" % toc_why)
+        entries = parse_toc(pages, cleaned, bw, bh, toc_ids)
+        if not entries:
+            # 目录页缺失时整条流水线会"成功"地产出一本无章节结构的书：
+            # 全书拍成一个平面段落流，EPUB 只有一章、没有导航。rc=0、无告警，
+            # 用户拿到成书只会以为"这书本来就这样"——必须显式警告。
+            print("\n" + "!" * 68)
+            print("! 未检测到目录条目：成书将没有章节结构（全书作为一章、无目录导航）。")
+            print("! 如果原书确实有目录页，请检查：")
+            print("!   1) 扫描件前 30 页是否有「目 录 / 目次 / Contents」页；")
+            print("!   2) 目录页是否被 OCR 成了图片或整页乱码；")
+            print("!   3) 目录条目的行尾页码是否被识别出来（parse_toc 靠它判条目）。")
+            print("!   4) PDF 里有没有书签：pip install pypdf 后重跑，书签比目录页可靠。")
+            print("! 检测到的目录页索引：%s" % (sorted(toc_ids) or "无"))
+            print("!" * 68 + "\n")
+        offset = page_offset(pages)
+        stream, matched = match_entries(pages, cleaned, entries, toc_ids, bw, bh, offset)
     start = 0
     if meta.get("drop_front", True) and matched and matched[0]["level"] == 1:
         start = matched[0]["pos"]
@@ -2024,7 +2297,15 @@ def build(src=None, meta=None):
     # emit_images 负责真正把插图裁出来落盘。两者都只在页 JSON 带 regions 字段
     # 时有产出——没跑过版面分析的老工作目录，这一步是空操作（硬回归靠这个）。
     ins, reg_report = plan_regions(pages, cleaned, bw, bh, toc_ids)
-    figs = emit_images(pages, src, meta, reg_report, cleaned)
+    # 「列数乱跳的表格」按包围盒裁图：plan_regions 把它们记成带 bbox 的 fig 块，
+    # 但它们的 bbox 不在页 JSON 的 regions 里，extract_figures 拿不到，
+    # 所以单独摘出来交给 emit_images 的 extra 参数。
+    extra = []
+    for key, blks in ins.items():
+        for b in blks:
+            if b[0] == "fig" and len(b) > 4 and b[4]:
+                extra.append({"page": b[2], "name": b[1], "bbox": b[4]})
+    figs = emit_images(pages, src, meta, reg_report, cleaned, extra=extra)
     made = {f["name"] for f in figs}
     gone = set()
     for key in list(ins):
@@ -2060,6 +2341,8 @@ def build(src=None, meta=None):
         "pages": len(pages), "bw": round(bw, 2), "bh": round(bh, 2),
         "head_band": [round(band_top, 4), round(band_bot, 4)],
         "toc_pages": sorted(toc_ids),
+        "toc_source": toc_source,
+        "toc_note": toc_why,
         "toc_entries": len(entries),
         "matched": len(matched),
         "levels": {1: sum(1 for m in matched if m["level"] == 1),
@@ -2078,6 +2361,7 @@ def build(src=None, meta=None):
         # 图 / 表降级的明细：裁了几张、并了几块表、各自吃掉多少行。
         # 这几项是「这次成书为什么和图版对得上」的唯一证据，必须进 report。
         "regions": {
+            "garbled_tables": reg_report.get("garbled_tables", 0),
             "figures": reg_report.get("figures", 0),
             "plates": reg_report.get("plates", 0),
             "figure_lines": reg_report.get("figure_lines", 0),

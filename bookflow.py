@@ -55,7 +55,8 @@ STAGE_PKGS = {
     "ocr": ("rapidocr",),
     "repair": ("rapidocr",),
     "layout": ("rapid_layout",),
-    "md": (),                          # layout/qa/fix 纯标准库 + difflib
+    "md": (),                          # layout/qa/fix 纯标准库 + difflib；
+                                       # pypdf 是**可选增强**（有书签就用），单独 check_md_extra 查
     "audit": (),                       # 需要词典，单独检查
     "disagree": (),                    # 同上
     "decisions": (),

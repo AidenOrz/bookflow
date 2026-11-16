@@ -11,6 +11,10 @@ numpy>=1.24
 jieba>=0.42
 # 版面分析（layout 阶段，可选但强烈建议）：
 #   pip install rapid_layout   # PP-DocLayoutV3，约 0.30 s/页
+# PDF 书签当目录（md 阶段，可选但建议）：纯 Python，无编译依赖。
+#   装了才有「书签优先于 OCR 目录页」这条路；没装会打印告警并退回解析目录页，
+#   不会静默没有目录。本地 111 个 PDF 实测 59 个带可用书签。
+pypdf>=5.0
 # 外部依赖（非 pip）：
 #   poppler 的 pdftoppm（render 阶段）
 # EPUB 打包不需要外部依赖：本项目自带 epub3.py（纯标准库）
