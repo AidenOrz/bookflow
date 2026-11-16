@@ -157,6 +157,8 @@ def inject(epub, title, cover_jpg):
 
 if __name__ == "__main__":
     import argparse
+    import stdio
+    stdio.utf8_stdio()      # --title 里可能是任意书名（见 stdio 模块头）
     ap = argparse.ArgumentParser()
     ap.add_argument("--page", help="封面扫描页，如 pages/p-001.png")
     ap.add_argument("--jpg", default="cover.jpg")

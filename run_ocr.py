@@ -3,6 +3,7 @@ import os, sys, json, glob, time
 from multiprocessing import Pool
 
 import pagedoc
+import stdio
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "pages")
@@ -105,6 +106,7 @@ def work(job):
 
 
 if __name__ == "__main__":
+    stdio.utf8_stdio()
     _a = parse_args()
     SRC, DST, PROCS, DEVICE, MODEL = _a.src, _a.dst, _a.procs, _a.device, _a.model
     if DEVICE in ("dml", "cuda"):

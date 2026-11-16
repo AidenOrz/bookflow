@@ -19,6 +19,7 @@ from PIL import Image
 from rapidocr import RapidOCR
 import jsonio
 import pagedoc
+import stdio
 
 SUSPECT = 0.62        # 认出比例低于此值视为失败行
 ACCEPT = 0.70         # 重识别结果需达到应有字数的此比例才采纳
@@ -139,4 +140,5 @@ def main():
 
 
 if __name__ == "__main__":
+    stdio.utf8_stdio()
     main()

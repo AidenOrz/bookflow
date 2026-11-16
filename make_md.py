@@ -14,6 +14,7 @@ import layout
 import qa
 import fix
 import pagedoc
+import stdio
 
 
 def main():
@@ -103,4 +104,5 @@ def main():
 
 
 if __name__ == "__main__":
+    stdio.utf8_stdio()
     main()
