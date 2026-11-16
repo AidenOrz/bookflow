@@ -10,6 +10,7 @@ import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import epub3
+import stdio
 
 
 def main():
@@ -50,4 +51,5 @@ def main():
 
 
 if __name__ == "__main__":
+    stdio.utf8_stdio()
     main()

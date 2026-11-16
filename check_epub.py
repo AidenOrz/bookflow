@@ -1,5 +1,8 @@
 import zipfile, re, sys
 import xml.etree.ElementTree as ET
+import stdio
+
+stdio.utf8_stdio()      # 会打印 EPUB 里的原文片段（见 stdio 模块头）
 
 p = sys.argv[1]
 z = zipfile.ZipFile(p)

@@ -3,6 +3,9 @@ import json, glob, os, sys, argparse
 import numpy as np
 from PIL import Image, ImageDraw
 import jsonio
+import stdio
+
+stdio.utf8_stdio()      # 后面会把 OCR 原文打给人看，GBK 下会炸（见 stdio 模块头）
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--audit", default="out/audit.json")

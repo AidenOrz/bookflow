@@ -2,6 +2,9 @@
 import glob, os, sys, re
 from difflib import SequenceMatcher
 import jsonio
+import stdio
+
+stdio.utf8_stdio()      # 差异清单里是 OCR 原文，GBK 下会炸（见 stdio 模块头）
 
 A = sys.argv[1] if len(sys.argv) > 1 else "ocr"
 B = sys.argv[2] if len(sys.argv) > 2 else "ocr_medium"

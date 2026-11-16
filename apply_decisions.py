@@ -42,6 +42,7 @@ sys.path.insert(0, HERE)
 import jsonio                     # noqa: E402
 import decisions as dec           # noqa: E402
 import pagedoc                    # noqa: E402
+import stdio                      # noqa: E402
 
 # 回填目标目录：相对 --work
 DEFAULT_SRC = "ocr_merged"
@@ -518,4 +519,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    stdio.utf8_stdio()
     sys.exit(main())

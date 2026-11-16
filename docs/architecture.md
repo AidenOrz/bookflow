@@ -41,7 +41,7 @@ PDF ──render──► pages/*.png              300dpi 灰度（pdftoppm）
 | `run_ocr.py` | 全量 OCR | 多进程；每进程一份引擎实例；GPU 自动用 DirectML |
 | `repair.py` | 补识别 | 按「认出字数 ÷ 应有字数 < 0.62」找可疑行，单行重识别 |
 | `run_layout.py` | 版面分析 | PP-DocLayoutV3，给每行加 `region` 字段，并写 `regions[]`（图/表/脚注区），可选增强 |
-| `textlayer.py` | 文字层抽取 | `pdftotext -bbox` → 页级 JSON；按 **yMax** 聚行、行内空格判据、重复框去重；stdout 末尾的 `SUMMARY` 行是 CLI 契约 |
+| `textlayer.py` | 文字层抽取 | `pdftotext -bbox` → 页级 JSON；按 **yMax** 聚行、行内空格判据、重复框去重；**叠字图层按字高拆行再合并**（`split_mixed_height_row` + `collapse_duplicate_rows`）；stdout 末尾的 `SUMMARY` 行是 CLI 契约 |
 | `layout.py` | 版面与结构 | 去页眉/页码/书脊、同行合并、目录解析、顺序匹配、合段 |
 | `fix.py` | 形近字修正 | `AUTO_RULES`（整词级，错写法本身不是词）+ `CAND_RULES`（单字级，带排除表）；统计净改动；`--conservative-fix` 可让单字级只出候选 |
 | `qa.py` | 质检闸门 | 空缺页、短行、低置信、段落异常、跨页断裂 |
@@ -55,6 +55,7 @@ PDF ──render──► pages/*.png              300dpi 灰度（pdftoppm）
 | `epub3.py` | EPUB3 构建 | 章节切分、nav/ncx、封面、**弹窗脚注渲染**、自校验 |
 | `make_epub.py` | epub 阶段入口 | `epub3.py` 的 CLI |
 | `qa.py` / `check_epub.py` | 校验 | 成书前闸门（含脚注完整性）/ EPUB 包结构自校验 |
+| `stdio.py` | 输出编码 | `utf8_stdio()`：把 stdout/stderr 强制成 UTF-8 且 `errors="replace"`。**所有会打印用户文本的脚本入口都要调**（有测试扫源码）。Windows 子进程默认 GBK，一个非 GBK 字符就能让脚本崩在半路 |
 | `jsonio.py` | IO 工具 | with 包住句柄；写临时文件再 rename。**所有**产物写入都该走它（含 `audit` / `disagree` / `cmp_ocr`），页级 JSON 走 `pagedoc.write` |
 | `pagedoc.py` | **数据契约** | 页级 JSON 与 report.json 的 `schema`/`schema_version`/`producer`；老文件兼容、新版本拒绝；`stamp`/`read`/`check`/`describe` |
 
@@ -126,6 +127,10 @@ PDF ──render──► pages/*.png              300dpi 灰度（pdftoppm）
 | 裁决表用 **page@y0 稳定主键** | 旧版按列表下标取条目，队列顺序一变裁决整体错位；且多差异段会被静默跳过（20 条硬编码里 2 条从未生效） |
 | 裁决回填**默认 dry-run** | 它会原地覆写 OCR，而重跑一本 383 页的书要 4.3 分钟；一次误跑不可逆的成本远高于多打一个 --apply |
 | 重复页**按内容去重** | 扫描件常见整段页重复；不去重会成段重复正文（实测 19 页） |
+| 叠字图层**按字高拆行 + 按几何合并** | 逐对比较（`dedupe_words`）在这类 PDF 上永远判不出来：两套小框同基线并列、文本各不相同，整行大框与紧邻小框又不等长。改成「一行有两簇字高」+「两条候选 x 跨度几乎完全重合」两个纯几何判据。实测成书从 26.1 万汉字（+80.6%）回到 14.8 万（+0.9%） |
+| 打印用户文本的脚本**自己修 stdio 编码**，不靠调用方 | 实测 `repair.py` 崩在 `print()` 上时已写完 129/310 页，退出码 1 让 `bookflow.py all` 判整个阶段失败、剩余 181 页一个字没写。业务全对、话说不出口，结果等于全错。用测试扫源码保证 14 个入口都调了 |
+| `mark_value` 之类的字符分类函数**认不出就返回 None，不抛** | `NOTE_HEAD` 的 `[\u2070-\u209c]` 里有下标 ₀-₉、上标 i、上标运算符，全不是数字。旧实现 `表.index(s)` 遇到 S₁ 直接 ValueError，整本 `make_md` 失败。一个正区间当成「字符集」用，就埋下这颗雷 |
+| 目录页码判据既要**位置**也要**文本形态** | 这本书整页是「标题 /页码」：整行一个框、x0 在版心左边、没有引导点，旧的「右半侧 + 引导点」两条全不成立，13 条目录被压成 12 条怪物、命中 0、成书无章节。补充「斜杠+数字 / 斜杠+罗马数字」，并加负向断言「斜杠前不能紧贴数字」挡住「比例 3/4」 |
 | 产物**原子写** | 中途崩溃不能留下「book.md 有、report.json 没有」的半成品 |
 | 清理路径**必须带超时且有兜底** | `taskkill` 卡在 WMI/RPC 上会让「Ctrl+C 收尸」永远回不来（比子进程变孤儿更糟）；而 `check=False` 又会让权限不足/进程已消失时静默什么都不做。两个失败方向相反，所以既要 `timeout`，也要在非 0 时补一次 `proc.kill()` |
 | 属性位转义**只有一个入口** | `epub3.esc_attr()`。`cover.py` 曾自己 `format(title=...)` 拼进 `alt=""`，书名带引号就产出坏 XML；`esc()` 刻意 `quote=False`，专供文本节点，两者不能混用 |

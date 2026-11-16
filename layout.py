@@ -84,8 +84,27 @@ NOTE_HEAD = re.compile(
 NOTE_HEAD2 = re.compile(r"^\s*[（(]?\s*(\d{1,2}|[ilI])\s*[.、．，,:：)）]?\s*(?=[《〈（(])")
 
 
+# 上标数字：U+2070 是 ⁰，其余 1~9 散在拉丁补充区（不是连续码位，不要按偏移算）。
+# 用 dict 而不是 "".index(s)：后者的 s 不在表里就抛 ValueError，而 NOTE_HEAD 的
+# 正则范围 [\u2070-\u209c] 远远宽于这十个数字——U+2081-2089 是**下标**、
+# U+2071 是上标 i、U+207A-207E 是上标运算符，全都落在范围内却都不是数字。
+# 实测出处：《拉康式主体》（上海文艺，2024）正文里有 S₁ S₂、∅、∀，OCR 成 ocr_layout
+# 之后跑 md 直接崩在 mark_value('₁') → ValueError: substring not found，
+# 整条 make_md 阶段失败、一本书一个字都出不来。
+# 注号认不出只该"不是注号"，不该让整本书跑不出来。
+_SUPERSCRIPT_DIGITS = {
+    "\u2070": 0, "\u00b9": 1, "\u00b2": 2, "\u00b3": 3, "\u2074": 4,
+    "\u2075": 5, "\u2076": 6, "\u2077": 7, "\u2078": 8, "\u2079": 9,
+}
+
+
 def mark_value(s):
-    """注号字符串 → 整数；认不出返回 None。"""
+    """注号字符串 → 整数；认不出返回 None。
+
+    **不允许抛异常**：这个函数在 plan_notes 里对每一行注文的开头调用一次，
+    而"开头像注号、其实不是"是常态（S₁ 这种数学下标、⁺⁻ 运算符、ⁱ 上标 i）。
+    认不出就是"这条不是注号"，返回 None 即可，让调用方走普通正文分支。
+    """
     s = s.strip()
     if not s:
         return None
@@ -95,8 +114,11 @@ def mark_value(s):
             return o - 0x2460 + 1
         if 0x3251 <= o <= 0x325F:
             return o - 0x3251 + 21
-        if 0x2070 <= o <= 0x209C:
-            return "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079".index(s)
+        if o in (0xB9, 0xB2, 0xB3) or 0x2070 <= o <= 0x209C:
+            # 上标 1/2/3 不在 U+2070 区，而是复用拉丁补充区的 ¹²³（U+00B9/B2/B3）。
+            # 原先的区间判断把它们挡在外面，于是「…movement）。²」这种真上标注号
+            # 反而不被认出来——表里写了、判断走不到，是同一处 bug 的另一半。
+            return _SUPERSCRIPT_DIGITS.get(s)
     # 数字注号可能带各种包裹/分隔符：「(1」「1)」「1.」「1、」「（12）」。
     # 前面已经处理过单字符（圈号/上标），到这里剩下的都是数字或 i/l 的形态。
     m = re.match(r"^[（(]?\s*(\d{1,2}|[iIl])\s*[.、．，,:：)）]?\s*$", s)
@@ -1013,6 +1035,43 @@ def heading_score(L, bw, bh):
 
 
 # ---------------------------------------------------------------- 目录页解析
+
+# 目录条目行尾的页码分隔符：斜杠后面直接跟数字或罗马数字。
+# 实测出处：《拉康式主体》（上海文艺，2024）的目录页整页都是「标题 /页码」——
+# 「第3部分拉康式对象：爱、欲望、享乐 /113」「总序 /III」「参考书目/255」。
+# 这类排版两条旧判据都接不住：
+#   ① 页码不在右侧独立列：整行是**一个** OCR 行框，x0 在最左边（19% 页宽），
+#      而判据要求 x0 > 0.5W；
+#   ② 也没有省略号/引导点，判据要求页码前有 [.…．·]。
+# 于是每个条目都被当成"没有页码的折行"，一层层拼到下一条上，13 条目录被压成
+# 12 条互不相同的怪物（「总序 /III总序翻译之为精神分析家的任务/III」），
+# 层级全错、命中 0 条，成书没有任何章节结构。
+#
+# 误伤评估：三本书 28,471 行正文里，行尾匹配「斜杠+数字」的只有 18 行，
+# **而且全部 18 行都在目录页**（p-006/p-007）。正文里的分数线、日期、链接写法
+# 都没撞上。所以这条判据在当前语料上零误伤。
+# 斜杠前**不能紧贴数字**：目录页码是「标题 /113」，斜杠前面一定有空格或汉字；
+# 而正文里的分数「3/4」「1/2」、日期「2012/9」斜杠前必然是数字。
+# 这条负向断言是测试逼出来的：不加它，目录页上一行「比例 3/4」会把 4 当成页码。
+_TOC_PAGE_SLASH = re.compile(r"(?<![0-9])/\s*(\d{1,4})\s*$")
+# 罗马数字页码（前言/序常编成 I, II, III…）。单独一条规则，因为 "III" 不是数字，
+# 上一条匹配不到；而"行尾是拉丁字母"在正文里太常见，必须限定"斜杠 + 纯罗马数字"。
+_TOC_PAGE_ROMAN = re.compile(r"(?<![0-9A-Za-z])/\s*([IVXLCDM]{1,7})\s*$")
+
+
+def _roman_to_int(s):
+    """罗马数字 → 整数；不合法返回 None（目录页码只到几十，不需要通用解析）。"""
+    vals = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+    total, prev = 0, 0
+    for ch in reversed(s.upper()):
+        v = vals.get(ch)
+        if v is None:
+            return None
+        total += -v if v < prev else v
+        prev = max(prev, v)
+    return total or None
+
+
 def parse_toc(pages, cleaned, bw, bh, toc_ids):
     """解析已判定的印刷目录页，得到条目与层级。"""
     entries = []
@@ -1048,6 +1107,11 @@ def parse_toc(pages, cleaned, bw, bh, toc_ids):
                 # 页码列判据：① 位于页面右半侧；② 或页码前有引导点（………… / ……　·）
                 # 注意不能要求"连续 ≥2 个引导点"：有些排版是「……　· ( 54 )」，
                 # 全角空格会把点串打断，那样整行会被误当标题并粘到下一条上。
+                # ③ 或页码前是斜杠（「第3部分 拉康式对象 /113」，见 _TOC_PAGE_SLASH 的说明）。
+                #    这一条不要求位置：斜杠是排版里明确的"标题│页码"分隔符，
+                #    而这类排版的整行只有一个行框、x0 就在版心左边界。
+                slash = _TOC_PAGE_SLASH.search(L["t"])
+                roman = None if slash else _TOC_PAGE_ROMAN.search(L["t"])
                 if m and (L["x0"] > 0.5 * W
                           or re.search(r"[.…．·]", L["t"][:m.start()])):
                     page_no = int(m.group(1))
@@ -1056,6 +1120,18 @@ def parse_toc(pages, cleaned, bw, bh, toc_ids):
                         title_parts.append((L["x0"], head))
                 elif m and L["t"].strip().startswith(("(", "（")) and len(L["t"]) <= 8:
                     page_no = int(m.group(1))
+                elif slash:
+                    page_no = int(slash.group(1))
+                    head = L["t"][:slash.start()].strip(" .…．·")
+                    if head:
+                        title_parts.append((L["x0"], head))
+                elif roman and _roman_to_int(roman.group(1)):
+                    # 罗马数字页码（总序 /III）。只收"斜杠 + 纯罗马数字"这一种写法，
+                    # 不接受"行尾任意拉丁字母"——那在正文里满地都是。
+                    page_no = _roman_to_int(roman.group(1))
+                    head = L["t"][:roman.start()].strip(" .…．·")
+                    if head:
+                        title_parts.append((L["x0"], head))
                 else:
                     title_parts.append((L["x0"], L["t"]))
             title_parts.sort()

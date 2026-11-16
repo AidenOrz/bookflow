@@ -75,6 +75,7 @@ PDF 加密、纯扫描页（`pdftotext` 返回空 body）都不许静默产出 0
 另带 `chars_total` / `usable` / `dpi` / `producer` / `elapsed`。
 """
 import argparse
+import difflib
 import html
 import json
 import os
@@ -86,6 +87,7 @@ import time
 
 import jsonio
 import pagedoc
+import stdio
 
 PDF_DPI = 72.0              # PDF 用户单位（点）的定义：1/72 英寸
 DEFAULT_DPI = 300.0         # 与 bookflow.py render 阶段的默认 dpi 一致
@@ -124,6 +126,36 @@ LATIN_SPACE_EM = 0.0
 # 0.30 正好落在两簇之间：0.21~0.26 那批不会被插空格，0.31 以上会补上。
 MIXED_SPACE_EM = 0.30
 HUGE_GAP_EM = 3.0       # 超过 3 em 的缝（双栏/表格/目录页码列）一律补空格
+
+# ---- 叠字图层（同一页两套字高不同的文字）的识别阈值 ----
+# 有些 PDF 的文字层里同时存在**两套完整文字**：一套是排版真实的整行文本，
+# 一套是把同一行按单个/几个字切碎的小框，两者的字号还不一样。
+# 实测出处：《拉康式主体》（上海文艺，2024，PDFPatcher 1.0.3 生成）——
+# 每页都是「Droid Sans Fallback 16.5pt 整行」+「SimSun 11pt 逐字」两套，
+# pdftotext -bbox 把两套都吐出来。不去重的话正文会整段重复一遍
+# （实测 310 页里 288 页中招，成书 26.1 万汉字 vs 真实 14.7 万，膨胀 80%）。
+#
+# 为什么不能沿用 dedupe_words 那条判据（相邻同文本 + 水平重叠 ≥50%）：
+# 那条只比**相邻**两个 word。这里两套的小框是同基线并列的（「回」「到」「精」
+# 都在 y1=105.8），而整行大框夹在这一串之后；相邻的两个小框文本不同，
+# 紧邻大框的那个小框又与整行不等长，所以逐对比较永远判不出来。
+#
+# 所以要两级处理，缺一不可（两级各自的效果都实测过）：
+#   1. **按字高拆行**：一行里同时出现两簇字高、且两簇的 x 跨度都够宽 → 拆成两条候选。
+#      不拆的话两套文字在 group_lines 里被并成同一行（y1 差 4~5pt，落在 3pt 容差外
+#      的时候才侥幸分开），拼出来是「…在很大程」+「…在很大程度」黏成一句。
+#      只拆不合并没有用：实测拆完汉字总数一模一样（265,249），因为两套都还在。
+#   2. **合并几乎完全重合的候选行**：两条候选的 x 跨度几乎重合、文本又高度相似
+#      → 同一行的两份，留信息多的那条。只合并不拆同样不行（+13.7%）。
+#
+# 两级都只认「几何 + 文本」双重证据，所以单层 PDF 上一条都不会触发：
+# 实测三本参照书的 ocr_layout（僧官 350 页、规训 383 页）拆 0 行、合 0 行。
+HEIGHT_SPLIT_FRAC = 0.25      # 两簇字高的间隙 > 小簇字高的这个比例才拆
+HEIGHT_SPLIT_MIN_SPAN = 0.5   # 两簇各自的 x 跨度都要 ≥ 行宽的此比例（否则是上标/注号）
+LAYER_COVER = 0.98            # 两条候选的 x 跨度重叠率（相对较窄者）≥ 此值才算同一行
+LAYER_SIM = 0.50              # 两条候选文本的相似度下限（再低就是两行不同的字）
+LAYER_DY_PT = 10.0            # 两条候选的基线差上限（PDF 点）
+LAYER_MIN_CHARS = 6           # 短于此长度的候选不参与合并（页码、注号会互相误伤）
 
 # 收尾标点：**右词以它开头时一律左贴**，不看间距。
 # 实测依据：四本书里"右词首字是收尾标点"的情形共 111 处，pdftotext 自己的纯文本
@@ -457,6 +489,105 @@ def _resolve_wide(word, forward):
     return False
 
 
+def split_mixed_height_row(row):
+    """一行里若同时有两簇字高，按字高拆成两段候选（见模块头的叠字图层说明）。
+
+    返回 [words, ...]，一般只返回一个元素（不拆）。拆的条件三条，缺一不可：
+
+    * 字高至少两簇，且**最大间隙 > 小簇字高的 HEIGHT_SPLIT_FRAC 倍**。
+      用"最大间隙"而不是固定阈值，是因为字号因书而异（本书小簇 11pt、
+      大簇 16.5pt，间隙 5.5pt = 小簇的 50%）；而同一本书里上标、注号、
+      页码这些正常小字的间隙只有 1~2pt（≤ 小簇的 20%），不会被误拆。
+    * 两簇**各自的 x 跨度都 ≥ 行宽的 HEIGHT_SPLIT_MIN_SPAN 倍**。
+      这一条挡的是"正文行 + 行尾一个上标注号"——注号只在最右边占几个字宽，
+      跨度远小于行宽。没有它，几乎每条带注号的正文行都会被拆开。
+    * 两簇都非空。
+
+    为什么不在 group_lines 里直接按字高分行：那样调用方拿到的行数会随字高
+    抖动变化，而"这一页有几行"是下游 qa/版面规则的依据。拆只在 page_lines
+    这个明确的两套文字场景里做，且拆完立刻在 collapse_duplicate_rows 里合并，
+    对外的行数语义不变。
+    """
+    hs = sorted({round(w["y1"] - w["y0"], 2) for w in row})
+    if len(hs) < 2:
+        return [row]
+    gap, idx = max((hs[i + 1] - hs[i], i) for i in range(len(hs) - 1))
+    lo = hs[idx]
+    if lo <= 0 or gap <= HEIGHT_SPLIT_FRAC * lo:
+        return [row]
+    # 不要用 "w not in small" 取补集：那是 dict 的 == 比较，两个坐标文本
+    # 完全相同的 word 会被判成同一个（去重后的重复框偶尔真会这样），
+    # 于是 large 少算、span_l 偏小，整行拆不开。按同一个判据各取一遍。
+    small = [w for w in row if (w["y1"] - w["y0"]) <= lo + 1e-6]
+    large = [w for w in row if (w["y1"] - w["y0"]) > lo + 1e-6]
+    if not small or not large:
+        return [row]
+    full = max(w["x1"] for w in row) - min(w["x0"] for w in row)
+    span_s = max(w["x1"] for w in small) - min(w["x0"] for w in small)
+    span_l = max(w["x1"] for w in large) - min(w["x0"] for w in large)
+    if full <= 0:
+        return [row]
+    if span_s < HEIGHT_SPLIT_MIN_SPAN * full or span_l < HEIGHT_SPLIT_MIN_SPAN * full:
+        return [row]
+    return [small, large]
+
+
+def _span_overlap(a, b):
+    """两条候选在 x 方向的重叠率（相对较窄的那条）。"""
+    ov = min(a["x1"], b["x1"]) - max(a["x0"], b["x0"])
+    narrow = min(a["x1"] - a["x0"], b["x1"] - b["x0"])
+    return 0.0 if narrow <= 0 else max(0.0, ov) / narrow
+
+
+def collapse_duplicate_rows(rows):
+    """把几乎完全重合的候选行合并成一条，留信息多的那份。
+
+    rows 是 [{x0,y0,x1,y1,t}]（PDF 点），按 (y1, x0) 排好序。
+
+    判据四条同时满足才算同一行：
+
+    * 基线差 ≤ LAYER_DY_PT（10pt）——两套文字实测差 4~7pt，真正相邻的两行
+      差 27pt 以上（中文正文行距 ≈13pt 字高 + 14pt 行距），中间有 3 倍余量。
+    * x 跨度重叠率 ≥ LAYER_COVER（0.98）——用"几乎完全"而不是"有重叠"，
+      是因为正文里**上标注号就压在行尾**、行内引文会与其他行部分重叠，
+      放宽到 0.90 只多合 36 对，且实测全是「1/0组合。」vs「1/0组合。」
+      这类把正确文本和漏字文本混在一起的假配对。
+    * 文本相似度 ≥ LAYER_SIM（0.50）——两套文字常有单字差异（·/•、，/,、
+      漏字），实测同等文本占 21%，其余多为 1~3 字差；完全不设下限会把
+      「图2.2」和「重叠的意思是说…」这种同位置不同内容的两行合掉。
+    * 两条长度都 ≥ LAYER_MIN_CHARS——页码、注号、孤字会在这条上互相误伤
+      （实测残留的 428 对几乎全是「VI」vs「VII」这类页码）。
+
+    "留信息多的那条"按 (字数, 字高) 比较：字数多说明没漏字；字数相同取字高
+    更大的，因为叠字图层里整行那套的字号比逐字那套大，实测大框文本漏字更少。
+    """
+    if len(rows) < 2:
+        return rows
+    dropped = set()
+    for i, a in enumerate(rows):
+        if i in dropped:
+            continue
+        for j in range(i + 1, len(rows)):
+            if j in dropped:
+                continue
+            b = rows[j]
+            if b["y1"] - a["y1"] > LAYER_DY_PT:
+                break               # 已排好序，后面只会更远
+            if len(a["t"]) < LAYER_MIN_CHARS or len(b["t"]) < LAYER_MIN_CHARS:
+                continue
+            if _span_overlap(a, b) < LAYER_COVER:
+                continue
+            if difflib.SequenceMatcher(None, a["t"], b["t"]).ratio() < LAYER_SIM:
+                continue
+            ka = (len(a["t"]), a["y1"] - a["y0"])
+            kb = (len(b["t"]), b["y1"] - b["y0"])
+            if kb > ka:
+                dropped.add(i)
+                break
+            dropped.add(j)
+    return [r for i, r in enumerate(rows) if i not in dropped]
+
+
 def page_lines(page, dpi, tol_pt=LINE_TOL_PT):
     """一页的 words（PDF 点）→ 行列表（像素坐标，与 pages/*.png 同坐标系）。
 
@@ -466,22 +597,38 @@ def page_lines(page, dpi, tol_pt=LINE_TOL_PT):
     旧版在这里乘了 dpi/72（300dpi 就是 12.5pt），结果把相距 10pt 的两行
     （页眉「Appl. Sci. 2024」与正文首行）并成一行——实测那一段被拼成
     「…9304 MDR in 2017…」。缩放只在最后输出时做一次。
+
+    流程：去重框 → 聚行 → **按字高拆叠字图层** → **合并重合的候选行** → 缩放。
+    中间两步只对"同一页存在两套文字"的 PDF 起作用，单层 PDF 上实测零触发
+    （见模块头的叠字图层说明）。
     """
     scale = float(dpi) / PDF_DPI
     words = dedupe_words(page["words"])
     rows = group_lines(words, tol_pt)
-    out = []
+
+    cand = []
     for ws in rows:
-        t = join_words(ws)
-        if not t.strip():
-            continue
-        out.append({
-            "x0": round(min(w["x0"] for w in ws) * scale, 1),
-            "y0": round(min(w["y0"] for w in ws) * scale, 1),
-            "x1": round(max(w["x1"] for w in ws) * scale, 1),
-            "y1": round(max(w["y1"] for w in ws) * scale, 1),
-            "t": t, "s": 1.0,
-        })
+        for part in split_mixed_height_row(ws):
+            t = join_words(part)
+            if not t.strip():
+                continue
+            cand.append({
+                "x0": min(w["x0"] for w in part),
+                "y0": min(w["y0"] for w in part),
+                "x1": max(w["x1"] for w in part),
+                "y1": max(w["y1"] for w in part),
+                "t": t,
+            })
+    cand.sort(key=lambda r: (r["y1"], r["x0"]))
+    cand = collapse_duplicate_rows(cand)
+
+    out = [{
+        "x0": round(r["x0"] * scale, 1),
+        "y0": round(r["y0"] * scale, 1),
+        "x1": round(r["x1"] * scale, 1),
+        "y1": round(r["y1"] * scale, 1),
+        "t": r["t"], "s": 1.0,
+    } for r in cand]
     out.sort(key=lambda L: (L["y0"], L["x0"]))
     return out
 
@@ -716,13 +863,11 @@ def _utf8_stdio():
     按 UTF-8 解码成乱码（实测「文字层：40 页…」整行变成「���ֲ㣺40 ҳ…」）。
     SUMMARY 行虽然本身是纯 ASCII，但失败分支里的 `error` 字段是中文，同样会坏。
     这里自己修，不指望调用方记得加 -X utf8。
+
+    实现放在 stdio 模块里（全项目的脚本共用一份，见那里的模块头）；这里保留
+    这个名字是因为测试和 bookflow.py 都按 `textlayer._utf8_stdio` 引用过它。
     """
-    for name in ("stdout", "stderr"):
-        s = getattr(sys, name, None)
-        try:
-            s.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError):
-            pass          # 被重定向成不可重配的对象时忽略（测试里就是这样）
+    stdio.utf8_stdio()
 
 
 if __name__ == "__main__":

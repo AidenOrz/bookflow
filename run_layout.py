@@ -22,6 +22,7 @@ from PIL import Image
 
 import jsonio
 import pagedoc
+import stdio
 
 # 页级 JSON 的来由标记。run_layout 只**追加** region 字段、不改任何文本，
 # 但它是产生这一版文件的最后一道工序，所以 producer 记它自己；
@@ -141,4 +142,5 @@ def main():
 
 
 if __name__ == "__main__":
+    stdio.utf8_stdio()
     main()

@@ -19,6 +19,7 @@
 import re, os, argparse
 from collections import defaultdict
 import jsonio
+import stdio
 
 def _find_dict():
     """找 jieba 词典：先用项目自带 dict.txt，再从 jieba 的安装位置推。
@@ -222,4 +223,5 @@ def main():
 
 
 if __name__ == "__main__":
+    stdio.utf8_stdio()
     main()

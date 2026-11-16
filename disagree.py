@@ -13,6 +13,7 @@
 """
 import os, glob, sys, argparse, re
 from difflib import SequenceMatcher
+import stdio
 
 # 标点/符号差异不是错字，直接剔除（第二版模型偏好半角标点，这类分歧有 150+ 处）
 PUNCT = re.compile(r"[，。、；：！？“”‘’（）《》〈〉—…·,.!?;:()\"']")
@@ -172,4 +173,5 @@ def main():
 
 
 if __name__ == "__main__":
+    stdio.utf8_stdio()
     main()
