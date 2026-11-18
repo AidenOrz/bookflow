@@ -45,7 +45,7 @@ PDF→EPUB 其实是**两个异质任务**：像素→文字（OCR，占 80% 工
 # $py 换成装好依赖的 Python 解释器路径
 $py = "python"
 
-# 图形界面（本地面板：预设、流水线看板、裁决台、成书检视）
+# 图形界面（本地工作台：方案、处理进度、校对、成品）
 & $py bookflow.py ui
 
 # 全流程：PDF → pages → ocr → repair → layout → md → audit → epub（含弹窗脚注）

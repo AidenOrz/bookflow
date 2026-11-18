@@ -1,5 +1,6 @@
-// 通用 UI 小工具：元素构造、提示条、弹窗、格式化。
-// 全部使用原生 DOM API，不依赖任何第三方库。
+// 通用 UI 小工具：元素构造、提示、弹窗、格式化、阶段展示。
+// 全部原生 DOM，不依赖第三方库。样式类名与 css/base.css 对应。
+// 术语约定见 docs/UI-DESIGN.md：任务 / 处理进度 / 校对 / 成品 / 方案 / 确认。
 
 // ---- 元素构造 ----
 // el("div", {class: "x", onclick: fn}, "文本", 子节点...)
@@ -15,8 +16,6 @@ export function el(tag, attrs) {
         node.className = String(val);
       } else if (key === "text") {
         node.textContent = String(val);
-      } else if (key === "html") {
-        node.innerHTML = String(val);
       } else if (key === "style") {
         if (typeof val === "string") node.setAttribute("style", val);
         else {
@@ -30,8 +29,7 @@ export function el(tag, attrs) {
         node.value = val;
       } else if (key === "checked" || key === "disabled" || key === "selected" ||
                  key === "hidden" || key === "readOnly" || key === "multiple") {
-        const prop = key === "readOnly" ? "readOnly" : key;
-        node[prop] = !!val;
+        node[key] = !!val;
       } else if (key.slice(0, 2) === "on" && typeof val === "function") {
         node.addEventListener(key.slice(2).toLowerCase(), val);
       } else {
@@ -61,7 +59,7 @@ export function clear(node) {
   return node;
 }
 
-// ---- 提示条 ----
+// ---- 提示 ----
 function toastRoot() {
   let root = document.getElementById("toasts");
   if (!root) {
@@ -71,19 +69,16 @@ function toastRoot() {
   return root;
 }
 
+// kind: info | success | warn | error
 export function toast(message, kind, ms) {
   const root = toastRoot();
   const k = kind || "info";
   const node = el("div", { class: "toast toast-" + k, role: "status" },
     el("span", { class: "toast-dot" }),
     el("span", { class: "toast-text", text: String(message) }),
-    el("button", {
-      class: "toast-close", title: "关闭", type: "button",
-      onclick: () => remove()
-    }, "×")
+    el("button", { class: "toast-close", title: "关闭", type: "button", onclick: () => remove() }, "×")
   );
   root.appendChild(node);
-  // 最多同时保留 4 条，避免糊住右下角
   while (root.childNodes.length > 4) root.removeChild(root.firstChild);
   let timer = null;
   function remove() {
@@ -110,7 +105,7 @@ export function openModal(opts) {
     } else if (o.body instanceof Node) {
       bodyNode.appendChild(o.body);
     } else {
-      bodyNode.appendChild(el("p", { text: String(o.body) }));
+      bodyNode.appendChild(el("p", { class: "modal-text", text: String(o.body) }));
     }
   }
 
@@ -120,7 +115,9 @@ export function openModal(opts) {
     const a = actions[i];
     foot.appendChild(el("button", {
       type: "button",
-      class: "btn " + (a.kind === "primary" ? "btn-primary" : a.kind === "danger" ? "btn-danger" : "btn-ghost"),
+      class: "btn " + (a.kind === "primary" ? "btn-primary"
+                     : a.kind === "danger" ? "btn-danger-solid" : "btn-ghost"),
+      disabled: a.disabled,
       onclick: () => {
         if (typeof a.onClick === "function") {
           const keep = a.onClick(handle);
@@ -157,12 +154,7 @@ export function openModal(opts) {
   }
   document.addEventListener("keydown", onKey, true);
 
-  const handle = {
-    root: backdrop,
-    panel: panel,
-    body: bodyNode,
-    close: () => closeReason("close")
-  };
+  const handle = { root: backdrop, panel: panel, body: bodyNode, close: () => closeReason("close") };
 
   function closeReason(reason) {
     if (closed) return;
@@ -186,23 +178,18 @@ export function openModal(opts) {
   return handle;
 }
 
-// 通用确认框，返回 Promise<boolean>
 export function confirmDialog(opts) {
   const o = opts || {};
   return new Promise((resolve) => {
     let settled = false;
-    const finish = (val) => {
-      if (settled) return;
-      settled = true;
-      resolve(val);
-    };
+    const finish = (val) => { if (!settled) { settled = true; resolve(val); } };
     const body = [];
     if (o.message) body.push(el("p", { class: "modal-text", text: o.message }));
     if (o.extra) body.push(o.extra);
     openModal({
       title: o.title || "请确认",
       body: body,
-      width: o.width || 560,
+      width: o.width || 520,
       actions: [
         { label: o.cancelText || "取消", kind: "ghost", onClick: () => finish(false) },
         { label: o.confirmText || "确认", kind: o.danger ? "danger" : "primary",
@@ -214,9 +201,7 @@ export function confirmDialog(opts) {
 }
 
 // ---- 格式化 ----
-function pad2(n) {
-  return n < 10 ? "0" + n : String(n);
-}
+function pad2(n) { return n < 10 ? "0" + n : String(n); }
 
 export const fmt = {
   num(n) {
@@ -250,8 +235,7 @@ export const fmt = {
     const m = Math.floor(s / 60);
     s = s % 60;
     if (m < 60) return m + " 分 " + pad2(s) + " 秒";
-    const h = Math.floor(m / 60);
-    return h + " 时 " + pad2(m % 60) + " 分";
+    return Math.floor(m / 60) + " 时 " + pad2(m % 60) + " 分";
   },
   percent(v, digits) {
     if (v === null || v === undefined || isNaN(Number(v))) return "-";
@@ -261,18 +245,20 @@ export const fmt = {
     const t = String(s === null || s === undefined ? "" : s);
     const max = n || 60;
     return t.length > max ? t.slice(0, max) + "…" : t;
+  },
+  pageNo(page) {
+    const m = /(\d+)/.exec(String(page || ""));
+    return m ? Number(m[1]) : 0;
   }
 };
 
-// 简单骨架屏
+// ---- 通用块 ----
 export function skeleton(rows) {
-  const box = el("div", { class: "skeleton-box" });
-  const count = rows || 3;
-  for (let i = 0; i < count; i++) box.appendChild(el("div", { class: "skeleton-line" }));
+  const box = el("div", { class: "sk" });
+  for (let i = 0; i < (rows || 3); i++) box.appendChild(el("div", { class: "sk-line" }));
   return box;
 }
 
-// 空状态
 export function emptyState(title, desc, actionNode) {
   return el("div", { class: "empty" },
     el("div", { class: "empty-title", text: title }),
@@ -281,7 +267,6 @@ export function emptyState(title, desc, actionNode) {
   );
 }
 
-// 错误条
 export function errorBar(message) {
   return el("div", { class: "errorbar", role: "alert" },
     el("span", { class: "errorbar-icon", text: "⚠" }),
@@ -289,7 +274,16 @@ export function errorBar(message) {
   );
 }
 
-// ---- 流水线阶段（契约固定顺序，见 API.md 第 2 节）----
+export function progressBar(percent, cls) {
+  const p = Math.max(0, Math.min(100, Number(percent) || 0));
+  return el("div", { class: "progress" },
+    el("div", { class: "progress-fill" + (cls ? " " + cls : ""), style: { width: p + "%" } })
+  );
+}
+
+export function kbd(key) { return el("kbd", { text: key }); }
+
+// ---- 阶段定义（顺序固定，见 webui/API.md 第 2 节）----
 export const STAGES = ["render", "textlayer", "ocr", "repair", "layout", "md", "verify", "audit", "epub"];
 
 export const STAGE_LABELS = {
@@ -298,10 +292,22 @@ export const STAGE_LABELS = {
   ocr: "OCR",
   repair: "修复",
   layout: "版面",
-  md: "成文",
-  verify: "校验",
-  audit: "审计",
-  epub: "EPUB"
+  md: "Markdown",
+  verify: "核对",
+  audit: "审核",
+  epub: "成品"
+};
+
+export const STAGE_HINTS = {
+  render: "把 PDF 逐页渲染成图片，后续 OCR 都基于它",
+  textlayer: "抽取 PDF 自带文字层，用于与 OCR 结果对账",
+  ocr: "识别每页文字，产出候选",
+  repair: "按规则修正常见误识，产出修复稿",
+  layout: "还原标题、段落、插图与脚注的版面结构",
+  md: "生成 Markdown 正文与目录",
+  verify: "与文字层逐行对账，列出分歧供人工校对",
+  audit: "生成人工审核清单与质检报告",
+  epub: "打包成 EPUB 交付物"
 };
 
 export const STATUS_LABELS = {
@@ -314,7 +320,6 @@ export const STATUS_LABELS = {
   pending: "排队中"
 };
 
-// 把后端 status 翻成统一的 class 后缀
 export function statusClass(status) {
   const s = String(status || "missing");
   if (s === "ok") return "st-ok";
@@ -325,32 +330,29 @@ export function statusClass(status) {
   return "st-missing";
 }
 
-// 从 run.stages 里取某阶段记录（没有就返回 missing 占位）
-export function stageOf(run, stage) {
-  const list = (run && run.stages) || [];
+export function stageOf(task, stage) {
+  const list = (task && task.stages) || [];
   for (let i = 0; i < list.length; i++) {
     if (list[i] && list[i].stage === stage) return list[i];
   }
   return { stage: stage, status: "missing", at: "", count: null, detail: "" };
 }
 
-// 9 格阶段状态条
-export function stageStrip(run, size) {
-  const wrap = el("div", { class: "stage-strip" + (size === "lg" ? " stage-strip-lg" : "") });
+// 9 个阶段的小圆点
+export function stageStrip(task) {
+  const wrap = el("div", { class: "stage-strip" });
   for (let i = 0; i < STAGES.length; i++) {
     const name = STAGES[i];
-    const rec = stageOf(run, name);
+    const rec = stageOf(task, name);
     let tip = STAGE_LABELS[name] + " · " + (STATUS_LABELS[rec.status] || rec.status);
     if (rec.count !== null && rec.count !== undefined && rec.count !== "") tip += " · " + rec.count;
-    if (rec.at) tip += " · " + fmt.datetime(rec.at);
+    if (rec.elapsed) tip += " · " + fmt.dur(rec.elapsed);
     if (rec.detail) tip += "\n" + rec.detail;
-    wrap.appendChild(el("div", {
-      class: "stage-cell " + statusClass(rec.status),
-      title: tip
-    }, el("span", { class: "stage-cell-name", text: STAGE_LABELS[name] })));
+    wrap.appendChild(el("span", {
+      class: "stage-dot " + statusClass(rec.status),
+      title: tip,
+      text: String(i + 1)
+    }));
   }
   return wrap;
 }
-
-
-

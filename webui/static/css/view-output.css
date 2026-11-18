@@ -1,0 +1,121 @@
+/* 成品（#/task/:id/output）——下载条、四块统计卡、目录树、质检、执行记录、Markdown 预览。
+   规范见 docs/UI-DESIGN.md §4.5。只引用 base.css 的令牌，不写字面色值。 */
+
+.view-output { display: block; }
+
+/* ---------- 顶部 ---------- */
+.op-head { margin-bottom: var(--sp-4); }
+.op-head-main { min-width: 0; flex: 1 1 auto; }
+.op-head-title { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
+.op-head-actions { flex-wrap: wrap; }
+
+.op-body { display: flex; flex-direction: column; gap: var(--sp-4); }
+
+/* ---------- EPUB 下载条 ---------- */
+.op-epub {
+  display: flex; align-items: center; gap: var(--sp-4);
+  padding: var(--sp-4) var(--sp-5);
+}
+.op-epub-main { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; flex: 1 1 auto; }
+.op-epub-icon {
+  flex: 0 0 auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 26px; padding: 0 8px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft); color: var(--accent);
+  font-family: var(--mono); font-size: var(--fs-xs); font-weight: 700;
+  letter-spacing: .5px;
+}
+.op-epub-text { min-width: 0; }
+.op-epub-name {
+  font-size: var(--fs-lg); font-weight: 600; color: var(--fg);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.op-epub-sub { font-size: var(--fs-xs); margin-top: 2px; }
+.op-epub-actions { margin-left: auto; flex: 0 0 auto; }
+
+/* ---------- 四块统计卡 ---------- */
+.op-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--sp-4);
+}
+@media (max-width: 1100px) {
+  .op-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+.op-stat { padding: var(--sp-4) var(--sp-5); }
+.op-stat-value {
+  font-size: var(--fs-2xl); font-weight: 600; line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+}
+.op-stat-label { margin-top: var(--sp-1); font-size: var(--fs-sm); color: var(--fg-muted); font-weight: 500; }
+.op-stat-sub { margin-top: 2px; font-size: var(--fs-xs); color: var(--fg-faint); }
+
+.op-loading { grid-column: 1 / -1; }
+
+/* ---------- 通用卡片 ---------- */
+.op-card { min-width: 0; }
+.op-card .card-head { padding: var(--sp-3) var(--sp-5); }
+
+/* ---------- 目录树 ---------- */
+.op-toc { padding: var(--sp-2) var(--sp-3) var(--sp-3); max-height: 52vh; overflow: auto; }
+.op-toc-row {
+  display: flex; align-items: baseline; gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+}
+.op-toc-row:hover { background: var(--surface-2); }
+.op-toc-row[data-level="1"] { font-weight: 600; }
+.op-toc-row[data-level="3"], .op-toc-row[data-level="4"],
+.op-toc-row[data-level="5"], .op-toc-row[data-level="6"] { color: var(--fg-muted); }
+.op-toc-row.is-hidden { display: none; }
+
+.op-toc-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.op-toc-dots {
+  flex: 1 1 auto; min-width: 12px;
+  border-bottom: 1px dotted var(--border-strong);
+  transform: translateY(-3px);
+}
+.op-toc-page { flex: 0 0 auto; color: var(--fg-faint); font-size: var(--fs-xs); white-space: nowrap; }
+.op-toc-score {
+  flex: 0 0 auto; min-width: 38px; text-align: right;
+  font-family: var(--mono); font-size: var(--fs-xs);
+  color: var(--fg-faint);
+}
+.op-toc-score.is-low { color: var(--warn); font-weight: 600; }
+
+/* ---------- 表格容器 ---------- */
+.op-table-wrap { max-height: 52vh; overflow: auto; }
+.op-qa-table td, .op-manifest-table td { vertical-align: middle; }
+.op-qa-table tbody tr:last-child td { border-bottom: none; }
+
+/* ---------- 执行记录 ---------- */
+.op-manifest-meta {
+  display: flex; flex-wrap: wrap; gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-5) 0;
+}
+.op-manifest-meta .chip { max-width: 460px; }
+.op-manifest-table .stage-dot { width: 18px; height: 18px; font-size: 9px; }
+
+/* ---------- Markdown 预览 ---------- */
+.op-md-scroll {
+  max-height: 60vh;
+  overflow: auto;
+  background: var(--surface-2);
+  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+}
+.op-md {
+  margin: 0;
+  padding: var(--sp-4) var(--sp-5);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  line-height: 1.7;
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ---------- 空态 ---------- */
+.op-empty { padding: var(--sp-3); }
+.op-empty-actions { margin-top: var(--sp-3); display: flex; gap: var(--sp-2); justify-content: center; }

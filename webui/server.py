@@ -503,10 +503,17 @@ def _bf_args(run_root):
 # ---------------------------------------------------------------------------
 # 裁剪：从页图里切出某一行
 # ---------------------------------------------------------------------------
-def crop_png(run_root, page, y0, height=None, pad=8):
-    """按行 y0 从页图裁一条。找不到页图/页 JSON/行，返回 None + 原因。"""
+def crop_png(run_root, page, y0, height=None, pad=8, context=5):
+    """按行 y0 从页图裁一条。找不到页图/页 JSON/行，返回 None + 原因。
+
+    **不只裁那一行**：默认向上、向下各带 context 行（默认 5）。
+    只裁一行会得到一条 40px 高的窄条，放进证据区里剩一大片空白，
+    而人判「已 / 己」这类形近字时恰恰需要看到**同段其他字的字形**作参照——
+    孤零零一个字很难判断它是印刷体还是误识。带上下文之后既能对比同段字形，
+    也不必把图放大到失真。目标行用一圈细框标出，保证「看的是哪一行」不含糊。
+    """
     try:
-        from PIL import Image
+        from PIL import Image, ImageDraw
     except ImportError:
         return None, "缺少 Pillow，无法裁图"
     work = paths.work_dir(run_root)
@@ -531,6 +538,7 @@ def crop_png(run_root, page, y0, height=None, pad=8):
         img_p = cand
 
     line = None
+    lines = []
     for src_dir in ("ocr_layout", "ocr_merged", "ocr_fix", "ocr_text", "ocr"):
         d = os.path.join(work, src_dir)
         if not os.path.isdir(d):
@@ -555,6 +563,7 @@ def crop_png(run_root, page, y0, height=None, pad=8):
                 best, bestd = L, d0
         if best is not None and bestd is not None and bestd <= 2.0:
             line = best
+            lines = doc.get("lines") or []
             break
     if line is None:
         return None, "页内 y0=%s 附近没有行" % y0
@@ -570,8 +579,28 @@ def crop_png(run_root, page, y0, height=None, pad=8):
         ly1 = float(line.get("y1") or (ly0 + 40))
     except (TypeError, ValueError):
         return None, "行坐标不是数字"
-    top = max(0, int(ly0) - pad)
-    bot = min(im.height, int(ly1) + pad)
+    # 上下各扩 context 行：按 y0 排序后取目标行前后的邻居
+    ordered = []
+    for L in lines:
+        try:
+            ordered.append((float(L.get("y0") or 0), float(L.get("y1") or 0), L))
+        except (TypeError, ValueError):
+            continue
+    ordered.sort(key=lambda t: t[0])
+    try:
+        idx = next(i for i, t in enumerate(ordered) if t[2] is line)
+    except StopIteration:
+        idx = None
+    top, bot = ly0, ly1
+    if idx is not None and context:
+        lo = max(0, idx - context)
+        hi = min(len(ordered) - 1, idx + context)
+        top = min(top, ordered[lo][0])
+        bot = max(bot, ordered[hi][1])
+
+    im_w, im_h = im.size
+    top = max(0, int(top) - pad)
+    bot = min(im_h, int(bot) + pad)
     if height:
         try:
             h = max(20, int(float(height)))
@@ -579,12 +608,35 @@ def crop_png(run_root, page, y0, height=None, pad=8):
                 bot = top + h
         except (TypeError, ValueError):
             pass
-    left = max(0, int(x0) - 40)
-    right = min(im.width, int(x1) + 40)
+    # 横向：带上下文的图按整页正文宽度取，否则上下几行会在左右被切掉，
+    # 参照价值就没了；不带上下文时仍以目标行的左右界为准
+    if idx is not None and context:
+        left, right = 0, im_w
+        for _a, _b, L in ordered[max(0, idx - context):idx + context + 1]:
+            try:
+                left = min(left, float(L.get("x0") or 0))
+                right = max(right, float(L.get("x1") or im_w))
+            except (TypeError, ValueError):
+                continue
+        left = max(0, int(left) - 40)
+        right = min(im_w, int(right) + 40)
+    else:
+        left = max(0, int(x0) - 40)
+        right = min(im_w, int(x1) + 40)
     if right <= left or bot <= top:
         return None, "裁剪区域为空"
-    box = (left, top, right, bot)
-    crop = im.crop(box)
+
+    crop = im.crop((left, top, right, bot))
+    # 标出目标行：一圈细框，中性蓝，不抢文字
+    try:
+        draw = ImageDraw.Draw(crop)
+        ry0 = int(ly0) - top - pad
+        ry1 = int(ly1) - top + pad
+        draw.rectangle([0, max(0, ry0), crop.width - 1, min(crop.height - 1, ry1)],
+                       outline=(47, 107, 240), width=2)
+    except Exception:
+        # 画框失败不影响出图：缺一圈框总比看不到证据好
+        pass
     # 竖屏裁出来的横条太窄，放大到 2 倍宽更好读（不改变内容，只放尺寸）
     scale = 2 if crop.width < 900 else 1
     if scale > 1:
@@ -974,7 +1026,16 @@ class Handler(BaseHTTPRequestHandler):
             return _json(self, {"changed": changed, "skipped": skipped, "errors": []})
 
         if rest == ["crop"] and method == "GET":
-            data, why = crop_png(root, q.get("page"), q.get("y0"), q.get("height"))
+            # context 缺省时**不能**传 None 进去：那会覆盖掉函数默认值，
+            # 于是带上下文的裁图静默退回「只裁一行」，图又变回一条窄条。
+            ctx_n = q.get("context")
+            kw = {}
+            if ctx_n not in (None, ""):
+                try:
+                    kw["context"] = max(0, int(ctx_n))
+                except (TypeError, ValueError):
+                    kw["context"] = 5
+            data, why = crop_png(root, q.get("page"), q.get("y0"), q.get("height"), **kw)
             if data is None:
                 return _err(self, why, 404)
             return self._send_bytes(data, "image/png")

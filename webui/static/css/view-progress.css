@@ -1,0 +1,195 @@
+/* 处理进度（#/task/:id）——左 = 9 阶段纵向时间线，右 = 日志面板。
+   规范见 docs/UI-DESIGN.md §4.3。只引用 base.css 的令牌，不写字面色值。 */
+
+.view-progress { display: block; }
+
+/* ---------- 顶部 ---------- */
+.pg-head { margin-bottom: var(--sp-4); }
+.pg-head-main { min-width: 0; flex: 1 1 auto; }
+.pg-head-title { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; flex-wrap: wrap; }
+.pg-head-title .page-title { min-width: 0; }
+.pg-head-meta {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 0;
+  margin-top: var(--sp-2); font-size: var(--fs-sm); color: var(--fg-muted);
+}
+.pg-head-current { color: var(--accent); font-weight: 500; }
+.pg-head-bar { margin-top: var(--sp-3); max-width: 560px; }
+.pg-head-actions { flex-wrap: wrap; }
+
+/* ---------- 待校对提示卡 ---------- */
+.pg-notice {
+  display: flex; align-items: center; gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  margin-bottom: var(--sp-4);
+  background: var(--warn-soft);
+  border: 1px solid var(--warn);
+  border-radius: var(--radius-lg);
+  color: var(--warn);
+}
+.pg-notice-icon {
+  flex: 0 0 auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 50%;
+  background: var(--warn); color: var(--accent-fg);
+  font-size: var(--fs-xs); font-weight: 700;
+}
+.pg-notice-text { flex: 1 1 auto; min-width: 0; }
+.pg-notice-title { font-size: var(--fs); font-weight: 600; color: var(--fg); }
+.pg-notice-sub { font-size: var(--fs-xs); color: var(--fg-muted); margin-top: 2px; }
+
+/* ---------- 两栏 ---------- */
+.pg-layout {
+  display: grid;
+  grid-template-columns: 380px minmax(0, 1fr);
+  gap: var(--sp-4);
+  align-items: start;
+}
+@media (max-width: 1100px) {
+  .pg-layout { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ---------- 左栏：阶段时间线 ---------- */
+.pg-timeline-card { min-width: 0; }
+.pg-timeline-card .card-head { padding: var(--sp-3) var(--sp-4); }
+.pg-timeline { padding: var(--sp-2) var(--sp-3) var(--sp-3); }
+
+.pg-stage {
+  position: relative;
+  display: flex; align-items: flex-start; gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-2) var(--sp-2) 0;
+  border-radius: var(--radius);
+  transition: background .12s;
+}
+.pg-stage + .pg-stage { border-top: 1px dashed var(--border); }
+.pg-stage:hover { background: var(--surface-2); }
+.pg-stage.is-running { background: var(--accent-soft); }
+
+/* 竖线与圆点 */
+.pg-rail {
+  position: relative; flex: 0 0 auto;
+  width: 24px; display: flex; justify-content: center;
+  padding-top: 2px;
+}
+.pg-stage:not(:last-child) .pg-rail::after {
+  content: "";
+  position: absolute; top: 28px; bottom: -14px; left: 50%;
+  width: 1px; margin-left: -.5px;
+  background: var(--border);
+}
+.pg-rail .stage-dot { cursor: help; }
+
+.pg-stage-body { flex: 1 1 auto; min-width: 0; }
+.pg-stage-top { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
+.pg-stage-name {
+  font-size: var(--fs); font-weight: 600; color: var(--fg);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.pg-stage-status {
+  font-size: var(--fs-xs); white-space: nowrap;
+  padding: 1px 8px; border-radius: 999px;
+  background: var(--neutral-soft); color: var(--neutral);
+}
+.pg-stage-status.is-ok       { background: var(--ok-soft);      color: var(--ok); }
+.pg-stage-status.is-degraded { background: var(--warn-soft);    color: var(--warn); }
+.pg-stage-status.is-failed   { background: var(--danger-soft);  color: var(--danger); }
+.pg-stage-status.is-running  { background: var(--accent-soft);  color: var(--accent); }
+.pg-stage-status.is-skipped  { background: var(--neutral-soft); color: var(--neutral); }
+.pg-stage-status.is-missing  { background: transparent; color: var(--fg-faint); border: 1px solid var(--border); }
+
+.pg-stage-meta {
+  display: flex; flex-wrap: wrap; align-items: center;
+  margin-top: 2px;
+  font-family: var(--mono); font-size: var(--fs-xs); color: var(--fg-faint);
+}
+.pg-stage-detail {
+  margin-top: var(--sp-1);
+  font-size: var(--fs-xs); color: var(--fg-muted);
+  line-height: 1.45;
+}
+
+/* 执行中的旋转指示 */
+.pg-spin {
+  flex: 0 0 auto;
+  width: 12px; height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--accent-soft);
+  border-top-color: var(--accent);
+  animation: spin .8s linear infinite;
+}
+
+.pg-rerun { flex: 0 0 auto; margin-left: var(--sp-2); opacity: .55; transition: opacity .12s; }
+.pg-stage:hover .pg-rerun, .pg-rerun:focus-visible { opacity: 1; }
+
+/* ---------- 右栏：日志 ---------- */
+.pg-log-card {
+  display: flex; flex-direction: column;
+  min-width: 0;
+}
+.pg-log-card .card-head { padding: var(--sp-3) var(--sp-4); }
+.pg-stream-state { font-size: var(--fs-xs); color: var(--fg-faint); margin-left: var(--sp-2); }
+.pg-stream-state.is-live { color: var(--accent); }
+.pg-stream-state.is-live::before {
+  content: "";
+  display: inline-block;
+  width: 6px; height: 6px; margin-right: 5px;
+  border-radius: 50%; background: var(--accent);
+  animation: pulse 1.6s ease-in-out infinite;
+  vertical-align: middle;
+}
+.pg-stream-state.is-ok { color: var(--ok); }
+.pg-stream-state.is-warn { color: var(--warn); }
+.pg-log-count { font-family: var(--mono); }
+
+.pg-log-scroll {
+  max-height: 60vh;
+  overflow: auto;
+  background: var(--surface-2);
+  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+}
+.pg-log-body {
+  padding: var(--sp-2) var(--sp-3);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+}
+
+.pg-log-line {
+  display: flex; align-items: baseline; gap: var(--sp-2);
+  padding: 1px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.pg-log-t {
+  flex: 0 0 auto; width: 62px;
+  color: var(--fg-faint);
+}
+.pg-log-tag {
+  flex: 0 0 auto;
+  min-width: 52px;
+  padding: 0 6px;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+  text-align: center;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pg-log-tag.is-empty { background: transparent; border-color: transparent; color: var(--fg-faint); }
+.pg-log-text { flex: 1 1 auto; color: var(--fg); min-width: 0; }
+
+.pg-log-line.is-sys .pg-log-text { color: var(--accent); }
+.pg-log-line.is-sys.is-ok .pg-log-text { color: var(--ok); }
+.pg-log-line.is-sys.is-warn .pg-log-text { color: var(--warn); }
+
+/* 无执行时的说明块 */
+.pg-log-note {
+  display: flex; flex-direction: column; align-items: center; gap: var(--sp-2);
+  padding: var(--sp-7) var(--sp-5);
+  text-align: center;
+  font-family: var(--sans);
+}
+.pg-log-note-title { font-size: var(--fs-lg); font-weight: 600; color: var(--fg); }
+.pg-log-note-sub { font-size: var(--fs-sm); color: var(--fg-muted); max-width: 460px; line-height: 1.6; }
+
+/* 空任务兜底 */
+.pg-back { display: flex; justify-content: center; margin-top: var(--sp-3); }

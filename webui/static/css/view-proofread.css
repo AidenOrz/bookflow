@@ -1,0 +1,267 @@
+/* 校对页（#/task/:id/proofread）—— 本工具最核心的界面。
+   规范见 docs/UI-DESIGN.md §5。三栏：分组 | 证据 | 判定。
+   本文件只引用 base.css 的令牌，不写字面色值。 */
+
+.view-proofread {
+  display: flex; flex-direction: column;
+  height: calc(100vh - var(--topbar-h));
+  margin: calc(var(--sp-4) * -1) calc(var(--sp-6) * -1) 0;
+}
+
+/* ---------- 顶栏 ---------- */
+.pr-bar {
+  display: flex; align-items: center; gap: var(--sp-4);
+  padding: var(--sp-3) var(--sp-5);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.pr-bar-title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.pr-bar-name {
+  font-size: var(--fs-lg); font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pr-bar-sub { font-size: var(--fs-xs); color: var(--fg-faint); }
+
+.pr-progress { flex: 1 1 auto; min-width: 200px; max-width: 460px; }
+.pr-progress-meta {
+  display: flex; align-items: baseline; justify-content: space-between;
+  font-size: var(--fs-xs); color: var(--fg-muted); margin-bottom: 5px;
+}
+.pr-progress-meta b { color: var(--fg); font-size: var(--fs-sm); }
+
+.pr-bar-actions { margin-left: auto; display: flex; align-items: center; gap: var(--sp-2); }
+
+/* ---------- 三栏 ---------- */
+.pr-body {
+  flex: 1 1 auto; min-height: 0;
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr) 320px;
+  gap: 1px;
+  background: var(--border);
+}
+@media (min-width: 1440px) {
+  .pr-body { grid-template-columns: 240px minmax(0, 1fr) 340px; }
+}
+
+.pr-pane { background: var(--bg); min-height: 0; display: flex; flex-direction: column; }
+.pr-pane-evidence { background: var(--surface-2); }
+.pr-pane-decide { background: var(--surface); }
+
+/* ---------- 1. 分组侧栏 ---------- */
+.pr-groups { flex: 1 1 auto; overflow: auto; padding: var(--sp-2); }
+.pr-group-head {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-2) var(--sp-1);
+  font-size: var(--fs-xs); font-weight: 600; color: var(--fg-faint);
+  letter-spacing: .3px;
+}
+.pr-group {
+  display: flex; align-items: center; gap: var(--sp-2);
+  width: 100%; padding: 7px 10px;
+  font-family: inherit; font-size: var(--fs-sm); text-align: left;
+  color: var(--fg-muted); background: transparent;
+  border: none; border-left: 2px solid transparent; border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  cursor: pointer;
+}
+.pr-group:hover { background: var(--surface-hover); color: var(--fg); }
+.pr-group.active {
+  background: var(--accent-soft); color: var(--accent);
+  border-left-color: var(--accent); font-weight: 600;
+}
+.pr-group-label {
+  flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--mono); font-size: var(--fs-sm);
+}
+.pr-group-count {
+  flex: 0 0 auto; font-size: var(--fs-xs); font-variant-numeric: tabular-nums;
+  color: var(--fg-faint);
+}
+.pr-group.active .pr-group-count { color: var(--accent); }
+.pr-group.is-unlocated .pr-group-label { font-family: var(--sans); }
+.pr-group.is-unlocated { color: var(--warn); }
+.pr-group.is-unlocated.active { background: var(--warn-soft); color: var(--warn); border-left-color: var(--warn); }
+.pr-group-done {
+  flex: 0 0 auto; width: 6px; height: 6px; border-radius: 50%; background: var(--ok);
+}
+
+.pr-filter {
+  padding: var(--sp-2);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+/* ---------- 2. 证据区 ---------- */
+.pr-evidence-bar {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-4);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  flex: 0 0 auto;
+}
+.pr-evidence-meta { font-size: var(--fs-xs); color: var(--fg-faint); font-family: var(--mono); }
+
+.pr-stage {
+  flex: 1 1 auto; min-height: 0;
+  display: flex; align-items: center; justify-content: center;
+  overflow: auto; padding: var(--sp-4);
+  /* 证据图必须占足够面积：不小于 420px，默认约视口 58%。
+     这是判字的前提条件 —— 图太小，形近字根本分不出来。 */
+  min-height: clamp(420px, 58vh, 780px);
+  height: 100%;
+}
+.pr-shot {
+  display: block;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  image-rendering: auto;
+  /* 切片图默认铺满证据区宽度：它是一条窄条，按原始像素显示会小得看不清字形。
+     放大靠 JS 设 width，但永远不许超出容器 —— 超出就出横向滚动条，
+     人被逼着左右拖着看一行字，那是判不了字的。 */
+  max-width: 100%;
+}
+.pr-stage.mode-crop .pr-shot {
+  /* 单行切片：宽度吃满，高度自适应，垂直居中 */
+  width: 100%;
+}
+.pr-stage.mode-page .pr-shot {
+  /* 整页：按高度适配，宽度自适应，允许放大后滚动 */
+  max-height: none;
+  height: auto;
+}
+.pr-stage.mode-page { align-items: flex-start; }
+.pr-stage.mode-crop { align-items: center; }
+.pr-shot-wrap { display: flex; flex-direction: column; align-items: center; gap: var(--sp-2); }
+.pr-shot-hint { font-size: var(--fs-xs); color: var(--fg-faint); }
+
+.pr-shot-fail {
+  display: flex; flex-direction: column; align-items: center; gap: var(--sp-3);
+  padding: var(--sp-6); color: var(--fg-muted); text-align: center;
+}
+
+/* ---------- 3. 判定区 ---------- */
+.pr-decide { flex: 1 1 auto; min-height: 0; overflow: auto; padding: var(--sp-4); }
+
+.pr-loc {
+  display: flex; align-items: center; gap: var(--sp-2);
+  font-size: var(--fs-xs); color: var(--fg-faint);
+  font-family: var(--mono); margin-bottom: var(--sp-3);
+}
+
+.pr-cand { margin-bottom: var(--sp-3); }
+.pr-cand-head {
+  display: flex; align-items: center; gap: var(--sp-2);
+  font-size: var(--fs-xs); font-weight: 600; color: var(--fg-muted);
+  margin-bottom: 5px;
+}
+.pr-cand-body {
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: var(--fs); line-height: 1.7; font-weight: 500;
+  word-break: break-all;
+  max-height: 148px; overflow: auto;
+}
+.pr-cand.is-chosen .pr-cand-body { border-color: var(--accent); background: var(--accent-soft); }
+.pr-cand-body mark {
+  padding: 1px 1px; border-radius: 2px; text-decoration: none;
+  /* 先靠**加粗 + 颜色**把那个字顶出来，不靠大面积底色。
+     底色只是辅助定位；字形本身能不能看清，靠的是笔画粗细与足够的明度差。
+     棕色 #8a5a00 配浅琥珀 #fdf0d0 实测 5.24:1，正文小字达标；
+     再叠一层 700 字重，形近字（已/己、己/已）的笔画差别才分得出来。 */
+  font-weight: 700;
+}
+.pr-cand-body mark.d-replace { background: var(--diff-replace-bg); color: var(--diff-replace-fg); text-decoration: underline; text-decoration-thickness: 1.5px; }
+.pr-cand-body mark.d-insert  { background: var(--diff-insert-bg);  color: var(--diff-insert-fg); }
+.pr-cand-body mark.d-delete  { background: var(--diff-delete-bg);  color: var(--diff-delete-fg); text-decoration: line-through; text-decoration-thickness: 1.5px; }
+.pr-cand-note { margin-top: 4px; font-size: var(--fs-xs); color: var(--fg-faint); }
+
+/* 判定按钮：整行宽、44px 高、一眼可辨 */
+.pr-actions { display: flex; flex-direction: column; gap: var(--sp-2); margin-top: var(--sp-4); }
+.pr-btn {
+  display: flex; align-items: center; gap: var(--sp-2);
+  width: 100%; height: 44px; padding: 0 14px;
+  font-family: inherit; font-size: 15px; font-weight: 600;
+  border-radius: var(--radius); cursor: pointer;
+  transition: background .12s, border-color .12s, transform .06s;
+  text-align: left;
+}
+.pr-btn:active { transform: translateY(1px); }
+.pr-btn:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 1px; }
+.pr-btn kbd { margin-left: auto; flex: 0 0 auto; }
+.pr-btn-label { flex: 1 1 auto; }
+
+.pr-btn-a { background: var(--surface); border: 1px solid var(--border-strong); color: var(--fg); }
+.pr-btn-a:hover { background: var(--surface-hover); border-color: var(--fg-faint); }
+.pr-btn-b { background: var(--accent); border: 1px solid var(--accent); color: var(--accent-fg); }
+.pr-btn-b:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.pr-btn-b kbd { background: rgba(255,255,255,.18); border-color: rgba(255,255,255,.35); color: #fff; }
+.pr-btn-c { background: var(--surface); border: 1px solid var(--border-strong); color: var(--fg); }
+.pr-btn-c:hover { background: var(--surface-hover); }
+.pr-btn-s {
+  background: transparent; border: 1px solid transparent;
+  color: var(--fg-muted); font-weight: 500; height: 36px; font-size: var(--fs-sm);
+  justify-content: center;
+}
+.pr-btn-s:hover { background: var(--surface-hover); color: var(--fg); }
+
+/* 判定后的 200ms 反馈 */
+.pr-btn.flash { background: var(--ok) !important; border-color: var(--ok) !important; color: #fff !important; }
+
+.pr-custom { margin-top: var(--sp-2); }
+.pr-custom[hidden] { display: none; }
+
+/* 底部状态行 */
+.pr-foot {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding-top: var(--sp-3); margin-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+  font-size: var(--fs-xs); color: var(--fg-faint);
+}
+.pr-foot b { color: var(--fg-muted); }
+
+/* 无条目的空态 */
+.pr-noitem {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  height: 100%; gap: var(--sp-2); color: var(--fg-muted); text-align: center;
+}
+
+/* ---------- 状态提示 ---------- */
+.pr-banner {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-5);
+  font-size: var(--fs-sm);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.pr-banner-warn { background: var(--warn-soft); color: var(--warn); }
+.pr-banner-info { background: var(--accent-soft); color: var(--accent); }
+
+/* ---------- 未定位条目说明 ---------- */
+.pr-unloc-note {
+  display: flex; gap: var(--sp-2);
+  padding: var(--sp-3); margin: var(--sp-3);
+  background: var(--warn-soft); color: var(--fg);
+  border-radius: var(--radius); font-size: var(--fs-sm);
+  border: 1px solid var(--warn);
+}
+
+/* ---------- 提交预览弹窗 ---------- */
+.pr-preview-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr);
+  gap: var(--sp-2); margin-bottom: var(--sp-4);
+}
+.pr-preview-cell {
+  padding: var(--sp-3); text-align: center;
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.pr-preview-num { font-size: var(--fs-xl); font-weight: 600; line-height: 1.2; }
+.pr-preview-lbl { font-size: var(--fs-xs); color: var(--fg-faint); margin-top: 2px; }
+.pr-preview-cell.is-apply .pr-preview-num { color: var(--accent); }
+.pr-preview-cell.is-already .pr-preview-num { color: var(--ok); }
+.pr-preview-cell.is-missing .pr-preview-num { color: var(--warn); }
+.pr-preview-table { max-height: 320px; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius); }
