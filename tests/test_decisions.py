@@ -94,13 +94,19 @@ class TestFromDisagree(unittest.TestCase):
         self.assertEqual(dec.validate(d), [])
 
     def test_real_repo_disagree(self):
-        """仓库现有 out/disagree.json：196 条，A=37 / B=27 / ?=132。
+        """仓库现有 disagree.json：196 条，A=37 / B=27 / ?=132。
 
-        out/ 被 .gitignore 排掉，换了机器就没有——缺失时跳过，不算失败。
+        分层布局后它在 runs/<book-id>/report/ 下（旧路径是仓库根的 out/）。
+        两者都找一遍：目录被 .gitignore 排掉，换了机器就没有——缺失时跳过，不算失败。
         """
-        p = os.path.join(ROOT, "out", "disagree.json")
-        if not os.path.exists(p):
-            self.skipTest("out/disagree.json 不存在（运行产物，未入库）")
+        p = None
+        for cand in (os.path.join(ROOT, "runs", "hegel", "report", "disagree.json"),
+                     os.path.join(ROOT, "out", "disagree.json")):
+            if os.path.exists(cand):
+                p = cand
+                break
+        if not p:
+            self.skipTest("disagree.json 不存在（运行产物，未入库）")
         raw = jsonio.read(p)
         self.assertEqual(len(raw), 196)
         d = dec.from_disagree(raw)

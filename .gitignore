@@ -1,43 +1,36 @@
 # ---------------------------------------------------------------------------
-# .gitignore — 分层布局 + 旧平铺布局两套规则并存
+# .gitignore — 只有一套布局：runs/<book-id>/（tiered）
 #
-# 旧规则是**裸名**（pages/ ocr/ out/ ...），它们匹配**任意层级**，方向没错
-# （run-x/out/ 也该挡），但有三处过头或缺项（docs/IO-CONVENTIONS.md §1 I4 实测）：
-#   * "*.png" 把 assets/icon.png、docs 配图、tests 夹具一起挡了 —— 任何需要入库的
-#     图片都进不来。收窄成「只挡产物目录里的图」。
-#   * 缺 ocr_text/ 与 ocr_text_raw/，而 --text-layer 的**默认值就是 verify**：
-#     在仓库根跑一次 all 就会凭空多出两个未忽略的目录。
+# 迁移前这里是「旧平铺 + 新分层两套规则并存」：仓库根同时是黑格尔那本的工作目录，
+# 于是要写 /pages/ /ocr*/ /out/ /run*/ 一整串裸名规则，而这些规则**匹配任意层级**，
+# 方向对了但过头或缺项（docs/IO-CONVENTIONS.md §1 I4 实测）：
+#   * "*.png" 把 assets/icon.png、docs 配图、tests 夹具一起挡了；
+#   * 缺 ocr_text/ 与 ocr_text_raw/，而 --text-layer 的默认值就是 verify；
 #   * ".tmp-*" 只挡前缀式，jsonio 的临时文件是后缀式（xxx.json.tmp）。
+#
+# 现在工作树只剩一套布局（四本书都在 runs/<book-id>/ 下，旧目录已删），
+# 所以规则可以收成三条：runs/ 里全是产物、dist/ 是交付物、input/*/source.pdf 是源书。
+# 裸名规则（pages/ ocr/ out/ run*/）**全部删掉**：它们会误伤任何同名目录，
+# 而新布局里不会再出现第一层的数据目录。
 # ---------------------------------------------------------------------------
 
-# ---- 运行产物：中间态（可重生成，体积大）----
-/pages/
-/ocr/
-/ocr_fix/
-/ocr_alt/
-/ocr_medium/
-/ocr_merged/
-/ocr_layout/
-/ocr_text/
-/ocr_text_raw/
-/out/
-/run*/
-/dist/
+# ---- 工作目录：一本书一棵树（work/ report/ review/ + manifest.json）----
+# 中间态体积大（pages/ 一本 450 MB），全部可重生成；人工件（review/decisions.json）
+# 是唯一不可重建的，但它也在 runs/ 里，同样不入库——本项目的做法是把书放在
+# 工作区之外由人保管，而不是塞进 git。
 /runs/
-/input/*/source.pdf
 
-# 产物目录里的图片一律不入库（收窄后不再误伤 assets/ 与 tests/）
-/pages/*.png
-/out/*.png
-/out/images/
-ocr/*.png
-ocr_fix/*.png
-ocr_alt/*.png
-ocr_medium/*.png
-ocr_merged/*.png
-ocr_layout/*.png
-ocr_text/*.png
-ocr_text_raw/*.png
+# ---- 交付物 ----
+/dist/
+*.epub
+
+# ---- 输入：源 PDF 与上传元信息都不入库（几十 MB，且是别人的版权物）----
+# meta.json 是 WebUI 上传时生成的（书名/作者/页数），属本机状态，不是项目文件。
+# 只挡 source.pdf 会漏掉它，git status 里就一直挂着一条无意义的未跟踪文件。
+/input/
+
+# ---- 迁移记录：tools/migrate_layout.py 的回滚凭据，属本机状态 ----
+.migration-*.json
 
 # ---- 临时文件 ----
 .tmp-*
@@ -46,6 +39,3 @@ ocr_text_raw/*.png
 __pycache__/
 *.pyc
 *.bak
-
-# ---- 交付物 ----
-*.epub

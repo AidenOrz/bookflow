@@ -89,9 +89,16 @@ class TestCliRecordsManifest(unittest.TestCase):
         shutil.rmtree(self.d, ignore_errors=True)
 
     def run_bf(self, *args):
+        # 必须显式 encoding="utf-8"：子进程带 -X utf8 写的是 UTF-8，
+        # 而 text=True 按**本机 locale**（中文 Windows 是 cp936）解码。
+        # 一旦输出里有 gb2312 解不了的中文字节，解码线程抛 UnicodeDecodeError，
+        # stderr 直接变成 None —— 断言就变成 None + "" 的 TypeError，
+        # 看着像产品坏了，其实是测试自己的解码方式不对。
+        # errors="replace" 再兜一层，避免同样原因再挂一次。
         return subprocess.run([sys.executable, "-X", "utf8",
                                os.path.join(ROOT, "bookflow.py")] + list(args),
-                              capture_output=True, text=True, cwd=ROOT, timeout=120)
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", cwd=ROOT, timeout=120)
 
     def test_missing_work_is_rejected_but_ui_is_not(self):
         cp = self.run_bf("md", "--work", "")
