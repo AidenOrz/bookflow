@@ -10,6 +10,7 @@
   4. md     : JSON → 结构化 Markdown + 目录树 + [^id] 脚注 (layout.py)
   5. epub   : Markdown → EPUB3（弹窗脚注）     (epub3.py，项目自带)
   +. verify : 文字层 × OCR 交叉验证，分歧进 decisions 候选 (disagree.py)
+  +. table  : 裁决表 → 人填的 Markdown 表格（并可回读）  (make_table.py)
 
 **文字层**（PDF 自带的 text layer）是 OCR 的一条捷径，但**质量参差不齐**，
 所以有三种模式（--text-layer）：
@@ -60,6 +61,7 @@ STAGE_PKGS = {
     "audit": (),                       # 需要词典，单独检查
     "disagree": (),                    # 同上
     "decisions": (),
+    "table": (),                       # make_table.py：纯标准库 + difflib
     "epub": (),                        # epub3.py 纯标准库
     "prune": (),
     "all": ("rapidocr", "rapid_layout"),
@@ -1251,6 +1253,39 @@ def stage_decisions(a):
     print("  下一步：python apply_decisions.py --work %s --decisions %s [--apply]" % (a.work, dst))
 
 
+def stage_table(a):
+    """裁决表 <-> 人填的 Markdown 表格。
+
+    为什么要这一步：decisions.json 是给机器读的协议——run-lacan 那份有 2825 条，
+    1325 条含多个差异段，手写 verdict=B 时 B 必须是整行（写少一个字就整行覆盖错），
+    而 key 重复 / C 缺 replacement 会让 validate() 拒绝整张表。人被逼着改 JSON，
+    出错是必然的。这里把人要碰的面积压到两列。
+
+    两个方向共用一个入口：
+      python bookflow.py table --work run1                    # 渲染 out/decisions.md
+      python bookflow.py table --work run1 --import           # 把表里填的判定合回 JSON
+    """
+    out = os.path.join(a.work, "out")
+    dec_path = a.out or os.path.join(out, "decisions.json")
+    cmd = [PY, os.path.join(HERE, "make_table.py"),
+           "--decisions", dec_path,
+           "--out", os.path.join(out, "decisions.md"),
+           "--title", a.title,
+           "--only", a.only]
+    if a.do_import:
+        md = a.do_import
+        if md is True or md == "":
+            md = os.path.join(out, "decisions.md")   # --import 不带值时用默认位置
+        cmd += ["--import", md]
+    sh(cmd)          # 失败时 sh() 直接 sys.exit 并打印人话，不用在这里判返回码
+    if a.do_import:
+        # 回填以后**必须**重建 ocr_layout：它排在 OCR_DIRS 第一位，
+        # 只要它存在，md 就永远读不到 ocr_merged 里的回填成果（实测静默丢 8 处）。
+        print("  下一步：python apply_decisions.py --work %s --src ocr_merged --apply" % a.work)
+        print("  然后必须重跑 layout（ocr_layout 存在时 md 不会读 ocr_merged）：")
+        print("    python bookflow.py layout --work %s --force" % a.work)
+
+
 def stage_prune(a):
     """删掉体积大、可重生成的中间产物（pages/ 占绝大部分）。
 
@@ -1282,7 +1317,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("stage", choices=["render", "textlayer", "ocr", "repair", "layout",
                                       "md", "audit", "epub", "all", "prune", "disagree",
-                                      "decisions", "verify"])
+                                      "decisions", "table", "verify"])
     ap.add_argument("--pdf", help="源 PDF")
     ap.add_argument("--work", required=True, help="工作目录")
     ap.add_argument("--title", default="")
@@ -1324,6 +1359,13 @@ def main():
     ap.add_argument("--out", default="", help="decisions 阶段的输出路径")
     ap.add_argument("--merge", action="store_true",
                     help="decisions 阶段合并进已有 decisions.json（按 page@y0 去重）")
+    ap.add_argument("--import", dest="do_import", nargs="?", const=True, default="",
+                    help="table 阶段：把表里填好的判定合回 decisions.json。"
+                         "不带路径时读 <work>/out/decisions.md")
+    ap.add_argument("--only", default="eyes", choices=["eyes", "noise", "all"],
+                    help="table 阶段渲染哪些条目：eyes=差异含汉字（默认，"
+                         "实测 run-lacan 2825 条里只有 999 条属此类）/ noise=纯标点空白"
+                         "/ all=全部")
     a = ap.parse_args()
 
     # 参数校验放在建目录之前：参数错了就一个字节都别写，
@@ -1381,7 +1423,7 @@ def main():
      "layout": stage_layout, "md": stage_md, "audit": stage_audit,
      "epub": stage_epub, "prune": stage_prune, "textlayer": stage_textlayer,
      "disagree": stage_disagree, "decisions": stage_decisions,
-     "verify": stage_verify}[a.stage](a)
+     "table": stage_table, "verify": stage_verify}[a.stage](a)
 
 
 if __name__ == "__main__":

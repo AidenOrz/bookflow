@@ -4,7 +4,10 @@
 
 > 详细设计与决策见 [architecture.md](architecture.md)；
 > 当前进度与下一步见 [HANDOFF.md](HANDOFF.md)；
-> 踩过的坑与事实速查见 [MEMORY.md](MEMORY.md)。
+> 踩过的坑与事实速查见 [MEMORY.md](MEMORY.md)；
+> 输入/输出的目录分层与命名规范（建议稿）见 [IO-CONVENTIONS.md](IO-CONVENTIONS.md)。
+
+最新代码审阅见 [REVIEW-2026-11-18.md](REVIEW-2026-11-18.md)：6 个已复现问题、影响、修复建议及测试结果。
 
 ## 为什么不是"一键转换"
 
@@ -49,16 +52,27 @@ $py = "python"
 | verify | `bookflow.py verify` | 文字层与 OCR 交叉验证（`disagree.py` 的 A=文字层 / B=OCR），分歧进 `decisions.json` |
 | disagree | `bookflow.py disagree --ocr-alt ocr_alt` | 双模型交叉比对，产出候选清单。**不在 `all` 里**：需要第二版 OCR |
 | decisions | `bookflow.py decisions --from disagree` | 把各路候选（disagree/audit/旧队列）归一成 `out/decisions.json` |
+| table | `bookflow.py table` / `--import` | 裁决表 ↔ **人填的 Markdown 表格**：只填「判定」「替换整行」两列，按词对分组、组头一次定一组 |
 
 裁决闭环（人工/VLM 裁决后回填）：
 
 ~~~powershell
 & $py bookflow.py disagree --work ./run1 --ocr-alt ocr_alt   # 产出 out/disagree.json
 & $py bookflow.py decisions --work ./run1 --from disagree      # 归一成 out/decisions.json
-# ... 编辑 decisions.json 的 verdict（A 保留 / B 采用 B / C 用 replacement / ? 待定）...
+& $py bookflow.py table --work ./run1                          # 渲染 out/decisions.md（给人填）
+# ... 在 decisions.md 里填「判定」列（A 保留 / B 采用建议 / C 用整行覆盖 / ? 待定 / 留空=未裁决）...
+& $py bookflow.py table --work ./run1 --import                 # 合回 decisions.json（校验失败整份不写）
 & $py apply_decisions.py --work ./run1 --decisions out/decisions.json            # 默认 dry-run
-& $py apply_decisions.py --work ./run1 --decisions out/decisions.json --apply    # 真正落盘
+& $py apply_decisions.py --work ./run1 --decisions out/decisions.json --src ocr_merged --apply    # 真正落盘
+& $py bookflow.py layout --work ./run1 --force                # 必须：ocr_layout 存在时不重建，回填永远不生效
+& $py bookflow.py md --work ./run1                            # 重新出书
+& $py bookflow.py epub --work ./run1                          # 重打包
 ~~~
+
+回填目标必须是 `ocr_merged`（不是 `ocr_fix`）：`md` 按
+`ocr_layout > ocr_merged > ocr_text > ocr_fix > ocr` 选源，回填到别的目录等于白改。
+完整语义（`A/B/C/?` 四种取值、跨行词与误报怎么补、备份活不过一次 `prune`、`book.md` 手改必丢）
+见 [IO-CONVENTIONS.md §9](IO-CONVENTIONS.md#9-人工检查并修改之后怎么合并回文件)。
 
 常用参数：`--dpi 300`、`--procs 5`、`--device auto|cpu|dml|cuda`、`--model small|medium|server`、
 `--ocr-src`（指定 OCR 结果目录）、`--force`（重跑已有阶段）、`--no-layout`（跳过版面分析）、
@@ -275,8 +289,9 @@ EPUB3 有专门的脚注语义，主流阅读器（Apple Books / Thorium / Kobo�
 python -m unittest discover -s tests -v
 ~~~
 
-270 个用例（test_layout 55 + test_textlayer 56 + test_textlayer_cli 38 + test_decisions 34 +
-test_outline_robust 23 + test_pagedoc 17 + test_epub3 16 + test_pdf_robust 20 + test_smallfixes 11），
+298 个用例（test_layout 55 + test_textlayer 56 + test_decisions 39 + test_textlayer_cli 38 +
+test_make_table 23 + test_outline_robust 23 + test_pdf_robust 20 + test_pagedoc 17 + test_epub3 16 +
+test_smallfixes 11），
 全部来自真实踩过的坑（正文首行被当书眉删、标题残片漏消费、重复页、
 空输入静默成功、fix 规则误伤、脚注误连、EPUB 断链、单页目录判不出、
 「第X部分」被压平到与「第X章」同级、章节撞到分部扉页、星号注错配、

@@ -30,6 +30,7 @@ PDF→EPUB 其实是**两个异质任务**：像素→文字（OCR，占 80% 工
 | [docs/architecture.md](docs/architecture.md) | 系统目标与边界、架构图、模块清单、数据契约、关键设计决策 |
 | [docs/HANDOFF.md](docs/HANDOFF.md) | 当前进度、已修问题清单、下一步 |
 | [docs/MEMORY.md](docs/MEMORY.md) | 事实速查、约定、踩过的坑（21 条，每条都有真实案例） |
+| [docs/IO-CONVENTIONS.md](docs/IO-CONVENTIONS.md) | **输入 / 输出规范化建议**（目录分层、命名规范、manifest 溯源、迁移路线；建议稿，未改代码） |
 | [PROMPTS.md](PROMPTS.md) | 分级裁决策略与提示词（L0~L3） |
 | [REVIEW.md](REVIEW.md) | 2026-11-12 的审阅报告（问题清单与证据） |
 
@@ -61,12 +62,13 @@ $py = "python"
 | `run_layout.py` | 版面分析（脚注/页眉/页码分流，可选） |
 | `layout.py` | 版面清理、合段、目录驱动分章、脚注锚定（核心，最复杂） |
 | `fix.py` / `qa.py` / `audit.py` | 形近字修正 / 质检 / 替换型错字候选 |
-| `disagree.py` / `apply_decisions.py` | 双模型分歧召回与裁决回填 |
+| `disagree.py` / `decisions.py` / `apply_decisions.py` | 双模型分歧召回 / 裁决表适配 / 裁决回填 |
+| `make_table.py` | 裁决表 ⇄ 人填的 Markdown 表格（只填两列，按词对分组） |
 | `epub3.py` / `make_epub.py` | EPUB3 构建（弹窗脚注 `noteref`/`aside`）与 CLI |
 | `assets/style.css` | 成书样式表 |
 | `cover.py` / `check_epub.py` | 封面裁切 / EPUB 结构校验 |
 | `jsonio.py` | JSON 读写工具（原子写、句柄安全） |
-| `tests/` | 回归测试（84 个用例，全部来自真实踩坑） |
+| `tests/` | 回归测试（298 个用例，全部来自真实踩坑） |
 | `pages/` `ocr*/` `out/` | 运行产物（已 `.gitignore`，不入库） |
 
 ## 关于扫描书与版权

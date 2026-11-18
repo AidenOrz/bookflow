@@ -223,6 +223,53 @@ def _lines_with(ocr_dir, page, wrong):
     return path, [L for L in (doc.get("lines") or []) if wrong in (L.get("t") or "")]
 
 
+def find_cross_line(ocr_dir, page, wrong, right):
+    """词被行长切断时的定位：wrong 的后半截在下一行行首。
+
+    实测（run-guixun）audit 的 20 条命中里有 2 条是这种：
+    p-272「…人们的言语介」+「人可怕的沉默…」、p-287「…刚刚人」+「狱还是即将出狱…」。
+    它们在页里**找不到行内子串**，于是整条落成 verdict=? + y0=None，
+    人工补的时候连改哪一行都不知道——这是"定位不到"里最贵的一类。
+
+    返回 (行, 下一行, 该行改好后的整行文本) 或 None。
+    只在**唯一命中**时返回：跨行是推断，多个候选时交给人，
+    宁可不给建议，也不能给出一个看起来像建议的错误位置。
+    """
+    path = page_path(ocr_dir, page)
+    if not path or not wrong:
+        return None
+    lines = pagedoc.read(path).get("lines") or []
+    hits = []
+    for i in range(len(lines) - 1):
+        t = lines[i].get("t") or ""
+        nxt = lines[i + 1].get("t") or ""
+        # wrong 的每一种切分都试：只有切成 (head, tail) 且行尾/行首同时命中才算
+        for k in range(1, len(wrong)):
+            head, tail = wrong[:k], wrong[k:]
+            if t.endswith(head) and nxt.startswith(tail):
+                hits.append((lines[i], lines[i + 1]))
+                break
+    if len(hits) != 1:
+        return None
+    L, nxt_line = hits[0]                # hits 存的是 (行对象, 下一行对象)
+    t = L.get("t") or ""
+    nxt = nxt_line.get("t") or ""
+    # 错字到底落在哪一行，要看切分后的两半各自对不对：
+    #   p-287「…刚刚人」+「狱还是…」：前半截「人」错（应「入」）→ 改**第一行**
+    #   p-272「…言语介」+「人可怕…」：前半截「介」本来就对，「人」在下一行开头 → 改**第二行**
+    # 只改真的那一行：行级裁决是整行覆盖，改错了行等于把两行内容互换。
+    for k in range(1, len(wrong)):
+        head, tail = wrong[:k], wrong[k:]
+        if not (t.endswith(head) and nxt.startswith(tail)):
+            continue
+        if head != right[:k]:                       # 错在前半截 -> 本行
+            return L, t[: -len(head)] + right[:k]
+        if tail != right[k:]:                       # 错在后半截 -> 下一行
+            return nxt_line, right[k:] + nxt[len(tail):]
+        return None                                 # 两半都对：词没坏，只是被切开了
+    return None
+
+
 def from_audit(audit_list, report_json_path=None, ocr_dir=""):
     """audit.json（词表可疑字）-> decisions。audit 只出清单、不自动改，这里补上回路。
 
@@ -260,6 +307,26 @@ def from_audit(audit_list, report_json_path=None, ocr_dir=""):
         path, hits = _lines_with(ocr_dir, page, wrong) if page is not None else (None, [])
 
         if not hits:
+            # 先试"词被行长切断"：这是 audit 定位不到的最常见原因（实测 20 条里 2 条）。
+            # 能定位就把裁决挂到**前半截所在的那一行**，并直接给出改好后的整行——
+            # 否则人要自己翻页、自己找到行、自己手写整行，而这正是最容易出错的地方。
+            cross = find_cross_line(ocr_dir, page, wrong, right) if page is not None else None
+            if cross:
+                L, new = cross
+                out.append(make_decision(
+                    page, L.get("y0"), A=L.get("t") or "", B=new,
+                    verdict="B", replacement=None, level="L1",
+                    # note 里必须带「X」→「Y」这个词对：make_table 用它分组，
+                    # 否则跨行条目会按"差异段"分到别的组里去（实测把
+                    # 「人狱→入狱」混进了「介人→介入」的组，组头一填就一起改了）。
+                    # 也要说清到底改哪一行：错字可能在前半截（本行）也可能在后半截（下一行）。
+                    note="跨行定位：「%s」→「%s」（词被行长切断，%s）；"
+                         "整行覆盖只作用在错误那一行，另一半留在原来的行"
+                         % (wrong, right,
+                            "错字是前半截，就在本行"
+                            if L is not None and (L.get("t") or "").endswith(wrong[:1])
+                            else "错字是后半截，落在下一行")))
+                continue
             if page is None:
                 why = "缺页码映射（report.json 的 layout.page_map），无法定位到页"
             elif not path:

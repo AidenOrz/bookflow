@@ -187,6 +187,61 @@ class TestFromAudit(unittest.TestCase):
                                 doc["decisions"][1]["key"])
 
 
+class TestCrossLine(unittest.TestCase):
+    """audit 定位不到的条目里，最常见的其实是"词被行长切断"。
+
+    实测 run-guixun 的 20 条命中里有 2 条是这种；它们原先整条落成
+    verdict=? + y0=None，人补的时候连改哪一行都不知道。
+    """
+
+    def _mk(self, lines):
+        d = tempfile.mkdtemp(prefix="xl-")
+        ocr = os.path.join(d, "ocr")
+        os.makedirs(ocr)
+        jsonio.write(os.path.join(ocr, "p-001.png.json"),
+                     {"name": "p-001.png", "w": 2000, "h": 3000,
+                      "lines": [{"x0": 100, "y0": float(y), "x1": 1800,
+                                 "y1": float(y) + 60, "t": t, "s": 0.99}
+                                for y, t in lines]})
+        return d, ocr
+
+    def test_error_in_first_half_targets_that_line(self):
+        """p-287 形态：「…刚刚人」+「狱还是…」，错的是本行末字。"""
+        d, ocr = self._mk([(640.9, "无论他是刚刚人"), (735.6, "狱还是即将出狱")])
+        L, new = dec.find_cross_line(ocr, 1, "人狱", "入狱")
+        self.assertEqual(L["y0"], 640.9)
+        self.assertEqual(new, "无论他是刚刚入")
+
+    def test_error_in_second_half_targets_next_line(self):
+        """p-272 形态：「…言语介」+「人可怕…」，错的是下一行首字。"""
+        d, ocr = self._mk([(1866.9, "人们的言语介"), (1959.9, "人可怕的沉默")])
+        L, new = dec.find_cross_line(ocr, 1, "介人", "介入")
+        self.assertEqual(L["y0"], 1959.9, "应改下一行，不能改上一行（整行覆盖会互换两行内容）")
+        self.assertEqual(new, "入可怕的沉默")
+
+    def test_no_cross_hit_returns_none(self):
+        d, ocr = self._mk([(100.0, "完全无关的一行")])
+        self.assertIsNone(dec.find_cross_line(ocr, 1, "介人", "介入"))
+
+    def test_ambiguous_hit_returns_none(self):
+        """两个候选行时不给建议：跨行是推断，猜错比不给更糟。"""
+        d, ocr = self._mk([(100.0, "甲介"), (200.0, "人乙"),
+                           (300.0, "丙介"), (400.0, "人丁")])
+        self.assertIsNone(dec.find_cross_line(ocr, 1, "介人", "介入"))
+
+    def test_from_audit_uses_cross_line_instead_of_giving_up(self):
+        """接进 from_audit：跨行命中的 hit 必须变成可回填的 B，而不是 verdict=?。"""
+        d, ocr = self._mk([(640.9, "无论他是刚刚人"), (735.6, "狱还是即将出狱")])
+        doc = dec.from_audit([{"wrong": "人狱", "right": "入狱", "pos": 100,
+                               "freq": 246, "page": 1}], None, ocr)
+        e = doc["decisions"][0]
+        self.assertEqual(e["verdict"], "B")
+        self.assertEqual(e["y0"], 640.9)
+        self.assertEqual(e["B"], "无论他是刚刚入")
+        # note 里的词对必须是「人狱」→「入狱」（make_table 靠它分组）
+        self.assertIn("「人狱」→「入狱」", e["note"])
+
+
 class TestMergeAndIO(unittest.TestCase):
     def test_merge_later_wins(self):
         """按 key 合并，后者覆盖前者（重新裁决时以新为准），且保序。"""

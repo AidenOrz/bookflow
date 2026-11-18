@@ -55,7 +55,8 @@ PDF ──render──► pages/*.png              300dpi 灰度（pdftoppm）
 | `make_review.py` | 候选图 | 把可疑行从原图裁出拼成对照图，供人工/VLM 裁决 |
 | `disagree.py` | 双模型分歧 | 两版 OCR 交叉比对，词频强弱比判胜负 |
 | `apply_decisions.py` | 裁决回填 | 读 `decisions.json`，`key=page@y0` 稳定主键；**默认 dry-run**；整行覆盖支持多差异段；时间戳备份目录；三态判定（apply/already/missing）保证幂等 |
-| `decisions.py` | 裁决表适配层 | `from_disagree`/`from_audit`/`from_queue`/`merge`，把两套互不兼容的候选格式统一成 `decisions.json` |
+| `decisions.py` | 裁决表适配层 | `from_disagree`/`from_audit`/`from_queue`/`merge`，把两套互不兼容的候选格式统一成 `decisions.json`；`find_cross_line()` 定位被行长切断的词 |
+| `make_table.py` | 裁决表 ⇄ 人填表格 | `decisions.json` → Markdown 表格（按词对分组、组头一次定一组），回读只认「行 y0／判定／替换整行」三列；`--import` 校验失败整份不写 |
 | `cover.py` | 封面 | 从首页裁封面，按墨迹密度去水印带；不合适的页返回 None；`alt` 属性走 `epub3.esc_attr` |
 | `make_md.py` | md 阶段入口 | 调 layout → fix → qa，三个产物原子写 |
 | `epub3.py` | EPUB3 构建 | 章节切分、nav/ncx、封面、**弹窗脚注渲染**、自校验 |

@@ -227,6 +227,15 @@ def plan(doc, src, y_tol=None, require_single_segment=None):
         elif cur == (e.get("A") or ""):
             items.append(dict(kind="apply", entry=e, page=page, path=path,
                               old=cur, new=want, line=L, reason=""))
+        elif e.get("verdict") == "C" and not (e.get("A") or ""):
+            # verdict=C 且 A 为空：这条裁决是**人看着原书**给出的整行覆盖，
+            # 而 A 为空说明它出自「定位不到」的条目（audit 在页里找不到那个词）。
+            # 此时没有 A 可比对，但 replacement 本身就是权威的整行——
+            # 若照旧判 missing，人工补完 y0+整行之后**仍然回填不上**（实测踩过）。
+            # 只对 C 放宽：A/B 都依赖 A 做「防改错行」的校验，不能放。
+            items.append(dict(kind="apply", entry=e, page=page, path=path,
+                              old=cur, new=want, line=L,
+                              reason="verdict=C 且无 A（人工整行覆盖）"))
         else:
             # 既不是裁决记录的 A、也不是目标：不敢改。旧版把这种情况和"已应用"混成同一句
             # "未定位到（原文已变？）"，于是一次重跑刷出 6 条假告警；这里两态分开。
