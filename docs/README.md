@@ -5,7 +5,8 @@
 > 详细设计与决策见 [architecture.md](architecture.md)；
 > 当前进度与下一步见 [HANDOFF.md](HANDOFF.md)；
 > 踩过的坑与事实速查见 [MEMORY.md](MEMORY.md)；
-> 输入/输出的目录分层与命名规范（建议稿）见 [IO-CONVENTIONS.md](IO-CONVENTIONS.md)。
+> 目录分层与输出规范（**已实现**）见 [LAYOUT.md](LAYOUT.md)，其论证与实测依据见 [IO-CONVENTIONS.md](IO-CONVENTIONS.md)；
+> 本地 Web 工作台的接口契约见 [../webui/API.md](../webui/API.md)。
 
 最新代码审阅见 [REVIEW-2026-11-18.md](REVIEW-2026-11-18.md)：6 个已复现问题、影响、修复建议及测试结果。
 
@@ -53,6 +54,8 @@ $py = "python"
 | disagree | `bookflow.py disagree --ocr-alt ocr_alt` | 双模型交叉比对，产出候选清单。**不在 `all` 里**：需要第二版 OCR |
 | decisions | `bookflow.py decisions --from disagree` | 把各路候选（disagree/audit/旧队列）归一成 `out/decisions.json` |
 | table | `bookflow.py table` / `--import` | 裁决表 ↔ **人填的 Markdown 表格**：只填「判定」「替换整行」两列，按词对分组、组头一次定一组 |
+| **ui** | `bookflow.py ui` | **本地 Web 工作台**：预设、流水线看板（SSE）、键盘驱动裁决台、成书检视。不需要 `--work`，工作目录从界面里选 |
+| manifest | 每个阶段自动记 | 把「这次是怎么跑出来的」写进 `<work>/manifest.json`：输入 sha256、全部参数、每阶段 status/耗时。**旁路记录，写不进去不影响出书** |
 
 裁决闭环（人工/VLM 裁决后回填）：
 
@@ -95,6 +98,33 @@ OCR 同规模约 17.6 秒/页 × 927 ≈ 4.5 小时。抽样 13 页逐字对比�
 选源优先级 `OCR_DIRS = ocr_layout > ocr_merged > ocr_text > ocr_fix > ocr`：
 `ocr_layout` 多了 region 标签（脚注抽取要它）；`ocr_merged` 是**人工裁决过**的，
 必须压住原始文字层；`ocr_text` 比 OCR 准但不可改（PDF 自带，没法回填）。
+
+## Web 工作台（`bookflow.py ui`）
+
+~~~powershell
+& $py bookflow.py ui                  # 起服务并打开浏览器（默认 127.0.0.1:8765，占用则递增）
+& $py bookflow.py ui --port 8800 --no-open
+~~~
+
+五个页面，都是**纯静态文件**（原生 ES module + fetch + EventSource，零 npm、零 CDN、可离线）：
+
+| 页面 | 做什么 |
+|---|---|
+| `#/runs` | 运行列表：9 格阶段条（ok/degraded/failed/skipped/missing 用颜色分开）、进度、待裁决数、EPUB 徽章 |
+| `#/setup` | 新建任务三步：**选输入**（拖拽/上传/手输路径）→ **选预设**（三大场景）→ **审批并启动**（列出即将执行的路径/阶段/**最终生效参数**，勾选核对后按钮才可用） |
+| `#/run/:id` | 流水线看板：实时日志（SSE）+ 阶段进度 + 安全中断（走 `kill_tree` 清整棵进程树）+ 单阶段重跑 |
+| `#/run/:id/triage` | **裁决台**：左行级切片图、中 A/B 字符级高亮、右词频证据；键盘 `a/b/c/空格/j/k/Enter/u`；组头一次判一组；提交后强制走 **预览（干跑）→ 确认 → 执行** |
+| `#/run/:id/inspect` | 成书检视：目录树、脚注健康仪表盘、QA 问题、EPUB 下载、`book.md` 阅读预览、**manifest 原文**（这次是怎么跑出来的） |
+
+后端是 `webui/server.py`，**纯标准库**（`http.server` + 手写路由 + SSE），不引 FastAPI——
+OCR 要跑在已经装好 GPU 依赖的那个解释器上，让用户为一个本地界面再动那套环境不划算。
+契约定死在 [../webui/API.md](../webui/API.md)：改动先改契约，再改两端。
+
+### 审批闸门（这两处是刻意的，别顺手放开）
+
+1. `POST /api/runs` 之前必须在界面上核对**最终生效参数**（预设 + 覆盖合并后的那一份）。
+2. `POST /api/runs/{id}/apply` 必须带 `confirm: true`，否则 400。回填会**原地覆写页级 JSON**，
+   一次误点不可逆；正确路径是 `apply/preview`（干跑）→ 人看 counts → 再 `apply`。
 
 ## 实测规模
 

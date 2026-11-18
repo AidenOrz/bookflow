@@ -29,10 +29,13 @@ PDF→EPUB 其实是**两个异质任务**：像素→文字（OCR，占 80% 工
 | [docs/README.md](docs/README.md) | 快速开始、阶段命令、实测数据、引擎选型、已知限制 |
 | [docs/architecture.md](docs/architecture.md) | 系统目标与边界、架构图、模块清单、数据契约、关键设计决策 |
 | [docs/HANDOFF.md](docs/HANDOFF.md) | 当前进度、已修问题清单、下一步 |
-| [docs/MEMORY.md](docs/MEMORY.md) | 事实速查、约定、踩过的坑（21 条，每条都有真实案例） |
-| [docs/IO-CONVENTIONS.md](docs/IO-CONVENTIONS.md) | **输入 / 输出规范化建议**（目录分层、命名规范、manifest 溯源、迁移路线；建议稿，未改代码） |
+| [docs/MEMORY.md](docs/MEMORY.md) | 事实速查、约定、踩过的坑（每条都有真实案例） |
+| [docs/LAYOUT.md](docs/LAYOUT.md) | **目录分层与输出规范（已实现）**：三种布局、四类产物边界、manifest、迁移工具 |
+| [docs/IO-CONVENTIONS.md](docs/IO-CONVENTIONS.md) | 上面那份规范的**论证与实测依据**（问题清单、命名规则、迁移路线） |
+| [webui/API.md](webui/API.md) | WebUI 前后端 API 契约（已冻结） |
 | [PROMPTS.md](PROMPTS.md) | 分级裁决策略与提示词（L0~L3） |
 | [REVIEW.md](REVIEW.md) | 2026-11-12 的审阅报告（问题清单与证据） |
+| [docs/REVIEW-2026-11-18.md](docs/REVIEW-2026-11-18.md) | 2026-11-18 的审阅报告（6 项，已全部修复） |
 
 ## 30 秒上手
 
@@ -41,6 +44,9 @@ PDF→EPUB 其实是**两个异质任务**：像素→文字（OCR，占 80% 工
 ~~~powershell
 # $py 换成装好依赖的 Python 解释器路径
 $py = "python"
+
+# 图形界面（本地面板：预设、流水线看板、裁决台、成书检视）
+& $py bookflow.py ui
 
 # 全流程：PDF → pages → ocr → repair → layout → md → audit → epub（含弹窗脚注）
 & $py bookflow.py all --work ./run1 --pdf "D:/books/某书.pdf" `
@@ -64,12 +70,16 @@ $py = "python"
 | `fix.py` / `qa.py` / `audit.py` | 形近字修正 / 质检 / 替换型错字候选 |
 | `disagree.py` / `decisions.py` / `apply_decisions.py` | 双模型分歧召回 / 裁决表适配 / 裁决回填 |
 | `make_table.py` | 裁决表 ⇄ 人填的 Markdown 表格（只填两列，按词对分组） |
+| `paths.py` / `manifest.py` / `runs.py` | 目录分层解析 / 本次运行的事实源 / run 发现与进度 |
+| `webui/` | 本地面板：`server.py`（纯标准库后端）+ `static/`（零构建前端） |
+| `tools/migrate_layout.py` | 平铺工作目录 → 分层布局的可回滚迁移 |
 | `epub3.py` / `make_epub.py` | EPUB3 构建（弹窗脚注 `noteref`/`aside`）与 CLI |
 | `assets/style.css` | 成书样式表 |
 | `cover.py` / `check_epub.py` | 封面裁切 / EPUB 结构校验 |
 | `jsonio.py` | JSON 读写工具（原子写、句柄安全） |
-| `tests/` | 回归测试（298 个用例，全部来自真实踩坑） |
-| `pages/` `ocr*/` `out/` | 运行产物（已 `.gitignore`，不入库） |
+| `tests/` | 回归测试（**401 个用例**，全部来自真实踩坑） |
+| `input/` `runs/` `dist/` | 输入落档 / 新书工作目录 / 交付物（均不入库） |
+| `pages/` `ocr*/` `out/` | 旧平铺布局的运行产物（已 `.gitignore`，不入库） |
 
 ## 关于扫描书与版权
 

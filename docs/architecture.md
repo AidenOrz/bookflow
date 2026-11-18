@@ -38,6 +38,28 @@ PDF ──render──► pages/*.png              300dpi 灰度（pdftoppm）
      ──epub──► out/<书名>.epub               EPUB3 + 三级目录 + 弹窗脚注 + 封面（epub3.py）
 ~~~
 
+## 2.1 工作目录布局（三种并存）
+
+~~~text
+tiered（新书，runs/<book-id>/）        flat（四个既有工作目录，永远可读）
+  manifest.json  本次运行的事实源        manifest.json  同样放这里（不参与布局判定）
+  work/pages  ocr*  .backup/            pages/  ocr*/
+  report/book.md  report.json  ...      out/book.md  report.json  ...
+  review/decisions.json  notes.md       out/decisions.json（人工件与机器件同层）
+交付物 -> dist/<book-id>/<slug>__<YYYYMMDD>.epub
+~~~
+
+路径一律走 `paths.py` 的**角色**函数（`work_dir` / `report_dir` / `review_dir` / 
+`ocr_dir` / `decisions_path` / `backup_dir`），调用方不再手拼目录名。
+
+判定只看 `work/` `report/` `review/` **三个目录在不在**，**不看 manifest.json**：
+把 manifest 算进判定会导致「在 flat 目录上跑一次阶段 → 写下 manifest → 整棵树被判成 tiered
+→ 下个阶段去 work/ 找 pages/，找不到」，而每一步退出码都是 0。
+
+四类产物的边界（这是分层唯一的理由）：交付物只有 epub 阶段能写；机器报告谁都能删；
+人工件（`decisions.json`）**只有人能写**且是全项目唯一不可重建的产物；中间产物由 `prune` 清。
+详见 [LAYOUT.md](LAYOUT.md)。
+
 ## 3. 模块清单
 
 | 文件 | 职责 | 关键点 |
@@ -57,6 +79,13 @@ PDF ──render──► pages/*.png              300dpi 灰度（pdftoppm）
 | `apply_decisions.py` | 裁决回填 | 读 `decisions.json`，`key=page@y0` 稳定主键；**默认 dry-run**；整行覆盖支持多差异段；时间戳备份目录；三态判定（apply/already/missing）保证幂等 |
 | `decisions.py` | 裁决表适配层 | `from_disagree`/`from_audit`/`from_queue`/`merge`，把两套互不兼容的候选格式统一成 `decisions.json`；`find_cross_line()` 定位被行长切断的词 |
 | `make_table.py` | 裁决表 ⇄ 人填表格 | `decisions.json` → Markdown 表格（按词对分组、组头一次定一组），回读只认「行 y0／判定／替换整行」三列；`--import` 校验失败整份不写 |
+| `paths.py` | **布局解析** | 三种布局判定 + 角色到路径的映射。`is_tiered()` **不看 manifest**（见 §2.1）；`backup_dir()` 把备份从被备份目录内部搬到 `work/.backup/` |
+| `manifest.py` | **本次运行的事实源** | `manifest.json` 读写：`input.sha256` 是唯一输入身份、`stages[*].status` 取 ok/degraded/failed/skipped。缺失/损坏一律返回空骨架，**绝不抛** |
+| `stage_manifest.py` | 阶段记录层 | 把阶段包一层：跑前记 running、跑完按结果记 ok/failed。记录失败只告警，不挡路 |
+| `runs.py` | run 发现与进度 | run id 白名单校验（拒绝绝对路径与路径穿越）、9 阶段状态（manifest 权威 / 旧书推断且标 `inferred`）、进度计算（**failed 不算做完**） |
+| `webui/server.py` | **本地 Web 后端** | 纯标准库 `http.server` + 手写路由 + SSE。作业调度、`kill_tree` 中断、行级切片图、裁决读写闸门（校验失败整份不写）。契约见 `webui/API.md` |
+| `webui/static/` | **本地 Web 前端** | 原生 ES module，零构建零依赖。五页：运行列表 / 新建任务 / 流水线看板 / 裁决台 / 成书检视 |
+| `tools/migrate_layout.py` | 布局迁移 | 平铺 → 分层，默认预演；`--apply` 写 `.migration-<ts>.json`，`--rollback` 按记录搬回 |
 | `cover.py` | 封面 | 从首页裁封面，按墨迹密度去水印带；不合适的页返回 None；`alt` 属性走 `epub3.esc_attr` |
 | `make_md.py` | md 阶段入口 | 调 layout → fix → qa，三个产物原子写 |
 | `epub3.py` | EPUB3 构建 | 章节切分、nav/ncx、封面、**弹窗脚注渲染**、自校验 |
@@ -156,6 +185,24 @@ PDF ──render──► pages/*.png              300dpi 灰度（pdftoppm）
 | 图/表**裁不出来就退回文字块**，不丢行 | 静默丢图只是「少了张图」，静默丢字是「少了段正文」。实测 p053 整页图版原样保留 45 行乱码当 table 块，虽难看但不丢 |
 | 「书眉」的判断放在**学习阶段**，丢弃阶段只认「学到与否」 | 曾在丢弃阶段用「窄+短+在边缘」补判书眉，实测吃掉僧官 61 行/453 汉字、《黑格尔辩证法讲演录》20 行。用「与书眉/章名/书名的 Dice 相似度」去救也救不回来——这 61 行最高相似度只有 0.60（阈值 0.75 一行都过不了），全是正文。真书眉在上游已被 `region=header` 标签 + 跨页重复学习 + 自适应带状区三重删净，三重都没拦下的边缘窄短行实测 87/8/805 行（僧官/规训/黑格尔），逐行看过全是正文 |
 | 书眉学习窗口取 **0.18H + 窄行守门**，而非 0.11H | 书眉坐多低因书而异：《规训与惩罚》章节书眉 y1 到 13.4% 页高，0.11H 只学到 2 条、漏 9 条，而 `head_band` 有 0.09 硬上限兜不住，残片（「第二章 断头台的场面第一章」）会拼进正文。但 0.18H 里绝大多数行是正文，所以顶部必须配「`w > 0.55W` 的行不参与学习」——学到的文本在 `clean_page` 里不看位置一律删，误学一个正文长句就是全书丢句 |
+
+### 5.1 分层与可观测（2026-11-18 新增）
+
+| 决策 | 理由 |
+|---|---|
+| **三种布局并存**，不做一次性改造 | 四个既有工作目录里有 `run-lacan` 的 2825 条裁决表（唯一不可重建）和四本黄金 `book.md`。改布局一次失误没有第二次机会，所以新书走 tiered、旧书永远 flat |
+| 布局判定**不看 manifest.json** | 实测：在 flat 目录跑一次阶段写下 manifest，整棵树立刻被判成 tiered，下个阶段去 `work/` 找 `pages/` 找不到。跑一次 `md` 之后 `run-lacan/out/` 会“整个消失”，而每一步退出码都是 0 |
+| `input.sha256` 是**唯一**输入身份 | 旧代码只比 `realpath`：同名不同版的 PDF 换进来，所有下游产物看起来仍然“正常”。这是本项目头号风险（静默出错）的又一形态 |
+| 阶段状态 `ok/degraded/failed/skipped`，**failed 不算做完** | 没有这条，「目录存在」就等于「阶段跑完」。实测 `run-sengguan/ocr_text` 只剩一个 `_textlayer.meta`，与「还没跑」在文件系统上一模一样；而进度条把 failed 算进 done 会在一个阶段失败时仍显示 100% |
+| 备份从 `<src>/.bak/` 搬到 `<work>/.backup/<src>/` | 旧路径是**被备份的目录内部**：`prune` 删掉整个 `ocr_merged` 时会连备份一起删（实测过），而只看顶层的统计完全看不见它 |
+| 交付物出到 `dist/<book-id>/`，名字带日期段 | 原名字只有 `<title>.epub`：两次运行直接覆盖，回滚只能靠回忆时间点 |
+| 页图名**容忍补零差异**（三个模块同一口径） | `pdftoppm` 按页数决定位宽（9 页的书出 `p-1.png`），页级 JSON 一律 `p-001.png`。实测 9 页的书：`make_review` 直接 `FileNotFoundError` 让整轮 `all` 在最后一步失败；`run_layout` 全部「跳过（缺页面图）」而**退出码 0**，脚注静默降级 |
+| 表格列数必须**恰好等于**表头 | 多列时旧版照读前 7 列，C 的「替换整行」里有一个未转义的 `|` 就会静默截断，而回填是整行覆盖——等于删正文 |
+| 重跑 `verify` **保留人工裁决** | 旧版只恢复 `status`，`verdict`/`replacement`/`note` 被机器新候选整条覆盖。更糟的是会产出「人工整行替换消失、机器新建议却标成已应用」这种自相矛盾的状态 |
+| 渲染/选源按**页号集合**判完整，不按“非空” | 渲染中断后 `pages/` 可能只有前若干页，续跑不会补齐；`ocr_layout` 只成功一页也会按优先级压住拥有全书的 `ocr_fix`。下游按现存文件枚举，**发现不了从未生成的页** |
+| WebUI 后端用**纯标准库**，不引 FastAPI | OCR 要跑在已装好 GPU 依赖的解释器上（`E:/ocr-venv`）。为了一个本地界面让用户再动那套环境，代价远大于收益；单用户工具只需要一个线程化 HTTP server + SSE |
+| 前端**零构建**（原生 ES module） | 无 npm/无 CDN/可离线，`bookflow.py ui` 一条命令就能起完整界面。代价是没有组件生态——对这个规模的界面不值得 |
+| 回填**必须** `confirm: true` + 先干跑 | 回填会原地覆写页级 JSON，一次误点不可逆。界面强制走「预览 → 确认 → 执行」，且预览复用 `apply_decisions.plan()`，不重写判定逻辑 |
 
 ## 6. 为什么不用 pandoc
 

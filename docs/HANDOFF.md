@@ -1,7 +1,79 @@
 # HANDOFF — 交接现状
 
-更新时间：2026-11-16
+更新时间：2026-11-18
 
+## 本轮（2026-11-18）：修 6 个审阅缺陷 + 目录分层 + WebUI
+
+用户这一轮要了三件事：**先修 bug**、**完善多级分层**、**实现 WebUI**（预设 / 可观测性 /
+核心功能交互 / 输入输出审批都在界面上运作）。三件都做完了，全部有实测与回归测试。
+
+### 1. 修复 docs/REVIEW-2026-11-18.md 的 6 项
+
+| # | 问题 | 修法 |
+|---|---|---|
+| P1 | 重跑 `verify` 覆盖人工裁决 | `_merge_keep_status` 保留 `verdict`/`replacement`/`note`；A/B 变了才把 `applied` 重置成 `pending` 并列出需要核对的 key |
+| P1 | 非空目录被当成完整产物 | 新增 `pdf_page_count()`（pdfinfo → pypdf，失败返回 None）；`stage_render` 按页号集合判缺页并补齐；`ocr_dir` 增覆盖检查，选中目录不完整而顺位更低的更完整就换源并打印两边数字 |
+| P2 | `layout` 换源绕过 `--text-layer off` | 改用 `active_dirs(a)` 再排除 `ocr_layout`，不再写第二套未过滤顺序 |
+| P2 | 跨行候选绕过同一行归并 | 跨行与行内建议共用按行归并，叠加替换；叠加不上降级成 `verdict=?` 交人 |
+| P2 | 表格多列时静默截断 | 列数必须**恰好等于**表头，多列同样报错并提示字面竖线写 `\|` |
+| P2 | 未定位条目的填表提示自相矛盾 | 说明改成「必须补真实 y0」；`merge_into` 对「判定已填但 y0 仍为 None」给出具体错误，CLI 整份不写、退出码 2 |
+
+### 2. 目录分层（`paths.py` + `manifest.py` + `tools/migrate_layout.py`）
+
+三种布局并存，旧目录一个字节都不动：
+
+- **tiered**（新书 `runs/<book-id>/`）：`work/` `report/` `review/` + `manifest.json`，交付物出 `dist/<book-id>/`；
+- **flat**（`run-guixun` `run-lacan` `run-sengguan` 与仓库根那本）：`pages/ ocr*/ out/`，永远可读；
+- 迁移工具默认**只预演**，`--apply` 写 `.migration-<ts>.json`，`--rollback` 按记录搬回。
+
+实测（`run-guixun` 的临时副本）：13 项搬迁、`book.md` 逐字节不变；搬完直接 `bookflow.py md` 能跑。
+四本黄金哈希全程未变：`320A586E` / `E5053BDD` / `0BA1E017` / `457413BA`。
+
+### 3. WebUI（`bookflow.py ui`）
+
+后端 `webui/server.py`（纯标准库），前端 `webui/static/`（原生 ES module，零构建）。
+五个页面：运行列表 / 新建任务（选输入 → 选预设 → **审批最终参数**）/ 流水线看板（SSE）/
+**裁决台**（键盘驱动、组头批量、切片图）/ 成书检视（目录树、脚注健康、EPUB 下载、manifest）。
+
+两处审批闸门是刻意的：起任务前必须核对最终生效参数；回填必须 `confirm:true` 且强制走
+「干跑预览 → 确认 → 执行」。
+
+### 4. 真跑一本 9 页 PDF 时额外修掉的三处
+
+这三处**都不是**为了新功能引入的，是原有代码在「页数 < 100 的书」上必然踩的：
+
+| 位置 | 症状 | 退出码 |
+|---|---|---|
+| `make_review.py` | `FileNotFoundError`，整轮 `all` 死在最后一步 | 1 |
+| `run_layout.py` | 全部「跳过（缺页面图）」，region 一个没打上 | **0** |
+| `bookflow.stage_layout_guarded` | 文件名交集在 <100 页的书上恒为空集，连 `run_layout` 都没被调用 | **0** |
+
+根因同一个：`pdftoppm` 按页数决定补零位数（`p-1.png` vs `p-001.png`）。三处已统一成按页号匹配。
+另外 `bookflow.py` 的两个 CLI 开关（`--conservative-fix`、`--limit-pages`）此前只存在于下游脚本或
+根本不存在，这次补齐并往下传。
+
+### 验收（全部实跑）
+
+~~~powershell
+python -X utf8 -m unittest discover -s tests -q     # Ran 401 tests ... OK (skipped=3)
+Get-FileHash out\book.md,run-guixun\out\book.md,run-sengguan\out\book.md,run-lacan\out\book.md -Algorithm SHA256
+# 320A586E / E5053BDD / 0BA1E017 / 457413BA（四条逐字节未变）
+~~~
+
+端到端实测：`bookflow.py ui` → 上传 9 页 PDF → 选预设 → 审批 → 全流程 48 秒完成、
+`manifest.json` 8 个阶段全 ok、EPUB 出在 `dist/<book-id>/`；裁决台读 `run-lacan` 的 2825 条 →
+625 组、切片图正常、提交判定后干跑计数从 0 变 1、回填后页文本真的改了、备份落在 `work/.backup/`。
+
+### 下一步（按价值排序）
+
+1. **在真机上裁过图的裁决台还没被真人用过**。键盘流、组头批量都已实测，但「一屏 20 条」的
+   节奏、切片图够不够看清字形，要人真裁一轮才知道。
+2. **迁移工具还没在四本真书上跑过**（只在临时副本上验过）。建议先挑 `run-guixun` 跑一次
+   `--apply`，确认 `bookflow.py md` 出同样的书，再改其余三本。
+3. **`layout.py` 仍是 2374 行的单体模块**（docs/architecture.md §8 的拆分计划未动）。
+4. 注号识别率（僧官 288 条注只能降级成页尾注）是**真实质量问题**，优先级高于拆分。
+
+---
 ## 最近一轮：把 PDF 书签当目录 + 三处成书质量修正（2026-11-16，第二轮）
 
 用户试完《拉康式主体》的成书后提了四条意见，逐条对应到了根因。
