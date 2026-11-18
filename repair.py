@@ -13,7 +13,8 @@
   python repair.py --src ./ocr --pages ./pages --dst ./ocr_fix
 非可疑行原样复制，可反复运行。
 """
-import os, json, glob, argparse, statistics
+import json, glob, argparse, statistics, re
+import os
 import numpy as np
 from PIL import Image
 from rapidocr import RapidOCR
@@ -44,6 +45,25 @@ def rapidocr_version():
 # 旧版本地实现把全角标点也算 1.0 字宽（layout 算 0.55），
 # 一条「《高僧传》卷五」在两处能差 20%，同一行会在不同阶段被判成不同长度。
 from layout import elen  # noqa: E402
+
+
+def _page_image(pages_dir, name):
+    """页名 -> pages/ 里真实存在的页图（容忍补零位数不同）。没有就抛 OSError。
+
+    与 run_layout / make_review 同一口径：pdftoppm 不补零（9 页的书出 p-1.png），
+    而页级 JSON 一律叫 p-001.png。三个模块各自拼名字就会各自在小书上崩。
+    """
+    p = os.path.join(pages_dir, name)
+    if os.path.exists(p):
+        return p
+    m = re.search(r"(\d+)", os.path.basename(name or ""))
+    if m and os.path.isdir(pages_dir):
+        want = int(m.group(1))
+        for f in sorted(os.listdir(pages_dir)):
+            mm = re.search(r"(\d+)", f)
+            if f.lower().endswith(".png") and mm and int(mm.group(1)) == want:
+                return os.path.join(pages_dir, f)
+    return p          # 交给 Image.open 抛原生的 FileNotFoundError，别吞
 
 
 def median_char_width(files):
@@ -112,7 +132,7 @@ def main():
             if n >= SUSPECT * expect:
                 continue
             if img is None:
-                img = Image.open(os.path.join(a.pages, page)).convert("RGB")
+                img = Image.open(_page_image(a.pages, page)).convert("RGB")
             crop = img.crop((max(0, int(L["x0"])), max(0, int(L["y0"])),
                              min(W, int(L["x1"])), min(H, int(L["y1"]))))
             r = ocr(np.array(crop))

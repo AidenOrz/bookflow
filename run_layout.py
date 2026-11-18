@@ -13,6 +13,7 @@ RapidOCR 只给出"行框"，不知道这一行是正文、脚注、页眉还是
 之后用 --ocr-src ocr_layout 跑 md 阶段。
 """
 import argparse
+import re
 import glob
 import os
 import sys
@@ -39,6 +40,22 @@ def load_engine(use_dml=True, model_type="pp_doc_layoutv3"):
     from rapid_layout import RapidLayout
     cfg = {"use_dml": True} if use_dml else {}
     return RapidLayout(model_type=model_type, engine_cfg=cfg)
+
+
+def _page_image(pages_dir, name):
+    """页名 -> pages/ 里真实存在的页图（容忍补零位数不同）。没有就返回 None。"""
+    p = os.path.join(pages_dir, name)
+    if os.path.exists(p):
+        return p
+    m = re.search(r"(\d+)", os.path.basename(name or ""))
+    if not m or not os.path.isdir(pages_dir):
+        return None
+    want = int(m.group(1))
+    for f in sorted(os.listdir(pages_dir)):
+        mm = re.search(r"(\d+)", f)
+        if f.lower().endswith(".png") and mm and int(mm.group(1)) == want:
+            return os.path.join(pages_dir, f)
+    return None
 
 
 def page_regions(engine, img_path):
@@ -110,8 +127,11 @@ def main():
         if not a.force and os.path.exists(out_path):
             skipped += 1
             continue
-        img = os.path.join(a.pages, name)
-        if not os.path.exists(img):
+        # 页图名容忍补零差异：pdftoppm 不补零（9 页的书出 p-1.png，300 页的书出
+        # p-001.png），而页级 JSON 一律按 p-001.png 命名。直接拼名字会让小书
+        # **整本跳过**且退出码为 0（bookflow.py 里那段告警就是为它写的）。
+        img = _page_image(a.pages, name)
+        if not img:
             print("  跳过（缺页面图）：%s" % name)
             skipped += 1
             continue
