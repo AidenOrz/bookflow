@@ -84,7 +84,7 @@ tiered（新书，runs/<book-id>/）        flat（四个既有工作目录，�
 | `stage_manifest.py` | 阶段记录层 | 把阶段包一层：跑前记 running、跑完按结果记 ok/failed。记录失败只告警，不挡路 |
 | `runs.py` | run 发现与进度 | run id 白名单校验（拒绝绝对路径与路径穿越）、9 阶段状态（manifest 权威 / 旧书推断且标 `inferred`）、进度计算（**failed 不算做完**） |
 | `webui/server.py` | **本地 Web 后端** | 纯标准库 `http.server` + 手写路由 + SSE。作业调度、`kill_tree` 中断、行级切片图、裁决读写闸门（校验失败整份不写）。契约见 `webui/API.md` |
-| `webui/static/` | **本地 Web 前端** | 原生 ES module，零构建零依赖。五页：运行列表 / 新建任务 / 流水线看板 / 裁决台 / 成书检视 |
+| `webui/static/` | **本地 Web 前端** | 原生 ES module，零构建零依赖，浅色主题。五页：任务列表 / 新建任务 / 处理进度 / 校对 / 成品。样式分 `css/base.css`（令牌+共用组件）+ `css/view-*.css`；规范见 [UI-DESIGN.md](UI-DESIGN.md) |
 | `tools/migrate_layout.py` | 布局迁移 | 平铺 → 分层，默认预演；`--apply` 写 `.migration-<ts>.json`，`--rollback` 按记录搬回 |
 | `cover.py` | 封面 | 从首页裁封面，按墨迹密度去水印带；不合适的页返回 None；`alt` 属性走 `epub3.esc_attr` |
 | `make_md.py` | md 阶段入口 | 调 layout → fix → qa，三个产物原子写 |
@@ -190,7 +190,7 @@ tiered（新书，runs/<book-id>/）        flat（四个既有工作目录，�
 
 | 决策 | 理由 |
 |---|---|
-| **三种布局并存**，不做一次性改造 | 四个既有工作目录里有 `run-lacan` 的 2825 条裁决表（唯一不可重建）和四本黄金 `book.md`。改布局一次失误没有第二次机会，所以新书走 tiered、旧书永远 flat |
+| **先并存、后统一迁移**，不用一次性改造 | 四个既有工作目录里有 `run-lacan` 的 2825 条裁决表（唯一不可重建）和四本黄金 `book.md`，一次失误没有第二次机会。所以先把 `paths.py` 做成两种布局都认，迁移工具默认只预演、带哈希守卫、可回滚；等工具被验证过，再一次性把四本搬进 `runs/<id>/`。**现在仓库里只剩 tiered 一种**（见 [LAYOUT.md](LAYOUT.md)） |
 | 布局判定**不看 manifest.json** | 实测：在 flat 目录跑一次阶段写下 manifest，整棵树立刻被判成 tiered，下个阶段去 `work/` 找 `pages/` 找不到。跑一次 `md` 之后 `run-lacan/out/` 会“整个消失”，而每一步退出码都是 0 |
 | `input.sha256` 是**唯一**输入身份 | 旧代码只比 `realpath`：同名不同版的 PDF 换进来，所有下游产物看起来仍然“正常”。这是本项目头号风险（静默出错）的又一形态 |
 | 阶段状态 `ok/degraded/failed/skipped`，**failed 不算做完** | 没有这条，「目录存在」就等于「阶段跑完」。实测 `run-sengguan/ocr_text` 只剩一个 `_textlayer.meta`，与「还没跑」在文件系统上一模一样；而进度条把 failed 算进 done 会在一个阶段失败时仍显示 100% |

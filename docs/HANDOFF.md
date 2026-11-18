@@ -1,79 +1,113 @@
 # HANDOFF — 交接现状
 
-更新时间：2026-11-18
+更新时间：2026-11-19
 
-## 本轮（2026-11-18）：修 6 个审阅缺陷 + 目录分层 + WebUI
+## 本轮（2026-11-19）：迁移到分层布局 + 浅色 WebUI 重做
 
-用户这一轮要了三件事：**先修 bug**、**完善多级分层**、**实现 WebUI**（预设 / 可观测性 /
-核心功能交互 / 输入输出审批都在界面上运作）。三件都做完了，全部有实测与回归测试。
+用户这一轮要三件事：**把旧文件迁进分层体系并删掉旧的**、**用 OpenDesign 重新设计 WebUI
+（现代简洁、浅色）**、**术语标准化 + 校对页重点重做**。三件都做完了，全部有无头浏览器截图验证。
 
-### 1. 修复 docs/REVIEW-2026-11-18.md 的 6 项
+### 1. 迁移：四本书全部进 `runs/<id>/`，旧目录已删除
 
-| # | 问题 | 修法 |
+| 书 | 新位置 | 原位置 |
 |---|---|---|
-| P1 | 重跑 `verify` 覆盖人工裁决 | `_merge_keep_status` 保留 `verdict`/`replacement`/`note`；A/B 变了才把 `applied` 重置成 `pending` 并列出需要核对的 key |
-| P1 | 非空目录被当成完整产物 | 新增 `pdf_page_count()`（pdfinfo → pypdf，失败返回 None）；`stage_render` 按页号集合判缺页并补齐；`ocr_dir` 增覆盖检查，选中目录不完整而顺位更低的更完整就换源并打印两边数字 |
-| P2 | `layout` 换源绕过 `--text-layer off` | 改用 `active_dirs(a)` 再排除 `ocr_layout`，不再写第二套未过滤顺序 |
-| P2 | 跨行候选绕过同一行归并 | 跨行与行内建议共用按行归并，叠加替换；叠加不上降级成 `verdict=?` 交人 |
-| P2 | 表格多列时静默截断 | 列数必须**恰好等于**表头，多列同样报错并提示字面竖线写 `\|` |
-| P2 | 未定位条目的填表提示自相矛盾 | 说明改成「必须补真实 y0」；`merge_into` 对「判定已填但 y0 仍为 None」给出具体错误，CLI 整份不写、退出码 2 |
+| 黑格尔辩证法讲演录 | `runs/hegel` | 仓库根（仓库根本身就是工作目录） |
+| 拉康式主体 | `runs/lacan` | `run-lacan/` |
+| 规训与惩罚 | `runs/guixun` | `run-guixun/` |
+| 中国僧官制度史 | `runs/sengguan` | `run-sengguan/` |
 
-### 2. 目录分层（`paths.py` + `manifest.py` + `tools/migrate_layout.py`）
+仓库第一层现在**没有任何数据目录**，只剩代码 / `docs/` / `tests/` / `tools/` / `webui/` /
+`dist/` / `input/` / `runs/`。
 
-三种布局并存，旧目录一个字节都不动：
+**无损性用「迁移前后直接比对字节」证明**（不是用重跑证明）：
+四本 `book.md` 哈希 `320A586E` / `457413BA` / `E5053BDD` / `0BA1E017` 与迁移前逐一相同；
+`runs/lacan/review/decisions.json` = `87547EA9`、1157481 字节逐字节完好；各 `ocr*` 目录页数守恒。
+迁移工具内置哈希守卫（搬前记 sha256、搬后复核，不一致就退出并提示回滚），本次 4 本 7 项全过。
 
-- **tiered**（新书 `runs/<book-id>/`）：`work/` `report/` `review/` + `manifest.json`，交付物出 `dist/<book-id>/`；
-- **flat**（`run-guixun` `run-lacan` `run-sengguan` 与仓库根那本）：`pages/ ocr*/ out/`，永远可读；
-- 迁移工具默认**只预演**，`--apply` 写 `.migration-<ts>.json`，`--rollback` 按记录搬回。
+**重跑 `md` 只有黑格尔能复现旧哈希，这是预期的**：基线由更早版本代码生成，
+之后 `layout`/`fix`/`outline` 都有实质改动；尤其 lacan 的源 PDF 已不在本机，
+书签通道读不到数据只能退回目录页解析，目录树条目数必然不同。**不是迁移造成的，也不该被"修"。**
 
-实测（`run-guixun` 的临时副本）：13 项搬迁、`book.md` 逐字节不变；搬完直接 `bookflow.py md` 能跑。
-四本黄金哈希全程未变：`320A586E` / `E5053BDD` / `0BA1E017` / `457413BA`。
+### 2. WebUI 重做：浅色 + 术语标准化 + 校对页重排
 
-### 3. WebUI（`bookflow.py ui`）
+新规范 [UI-DESIGN.md](UI-DESIGN.md) 是界面层的唯一依据（配色令牌、排版、五视图布局、校对页硬指标）。
 
-后端 `webui/server.py`（纯标准库），前端 `webui/static/`（原生 ES module，零构建）。
-五个页面：运行列表 / 新建任务（选输入 → 选预设 → **审批最终参数**）/ 流水线看板（SSE）/
-**裁决台**（键盘驱动、组头批量、切片图）/ 成书检视（目录树、脚注健康、EPUB 下载、manifest）。
+**术语全站换掉**（只改显示层与前端路由，**后端 JSON 字段名与 HTTP 路径一个没动**，契约仍冻结在 `webui/API.md`）：
 
-两处审批闸门是刻意的：起任务前必须核对最终生效参数；回填必须 `confirm:true` 且强制走
-「干跑预览 → 确认 → 执行」。
+```
+运行列表 → 任务列表    #/runs → #/tasks
+流水线看板 → 处理进度  #/run/:id → #/task/:id
+裁决台/裁决 → 校对     #/run/:id/triage → #/task/:id/proofread
+成书检视 → 成品        #/run/:id/inspect → #/task/:id/output
+预设 → 方案    审批 → 确认    待裁决 → 待校对    裁决表 → 校对清单
+```
 
-### 4. 真跑一本 9 页 PDF 时额外修掉的三处
+旧哈希路由（`#/runs` 等）在 `main.js` 里自动 301 到新路由，外部书签不会失效。
 
-这三处**都不是**为了新功能引入的，是原有代码在「页数 < 100 的书」上必然踩的：
+**结构从「一个 663 行 app.css」拆成** `css/base.css`（令牌 + 共用组件）+ 每个视图一个
+`css/view-*.css`；`js/` 下每个视图一个模块，全部复用 `ui.js` / `api.js`。
 
-| 位置 | 症状 | 退出码 |
-|---|---|---|
-| `make_review.py` | `FileNotFoundError`，整轮 `all` 死在最后一步 | 1 |
-| `run_layout.py` | 全部「跳过（缺页面图）」，region 一个没打上 | **0** |
-| `bookflow.stage_layout_guarded` | 文件名交集在 <100 页的书上恒为空集，连 `run_layout` 都没被调用 | **0** |
+### 3. 校对页重做（重点）
 
-根因同一个：`pdftoppm` 按页数决定补零位数（`p-1.png` vs `p-001.png`）。三处已统一成按页号匹配。
-另外 `bookflow.py` 的两个 CLI 开关（`--conservative-fix`、`--limit-pages`）此前只存在于下游脚本或
-根本不存在，这次补齐并往下传。
+三栏：左分组 / 中证据 / 右判定。
+
+**三条硬指标**（改样式时别破坏，都是踩过才定下来的）：
+
+1. **证据图不小于 420px 高、默认约视口 58%**。图太小就判不出形近字，这是判字的前提。
+2. **裁图带上下文**：`crop_png` 默认上下各带 5 行并用蓝框标出目标行。
+   只裁一行会得到 40px 窄条，而判「已/己」恰恰需要看**同段其他字的字形**做参照。
+3. **差异字用 700 字重 + 浅底深字**，底色只负责定位。实测「橙底 `#ffb347` + 棕字」
+   只有 **3.33:1**，14px 下字会糊在底色里——那正是最需要看清的地方。现用配色全部 ≥ 4.67:1。
+
+判定按钮整行宽、44px、带键帽（`A`/`B`/`C`/`S`）；`↑↓` 上下条、`Z` 切整页、`1-4` 缩放、
+`/` 聚焦过滤；同型错误可整组采纳（二次确认）。提交强制走**预览 → 确认 → 执行**。
+
+**本轮修掉的校对页缺陷**（都是截图后才发现的）：
+- 只渲染 `diff[]` 导致一行只显示被替换的那个字（后端 diff 只带差异片段，不带相同文字）→ 改成把 diff 当区间标注套在全文上
+- `"?"` 是真值 → 2380 条待校对全被算成"已校对" → 改用 `status` 区分"明确跳过"与"没判过"
+- 顶栏进度按当前加载子集算 → 显示「已校对 999/999」而实际 2380 条没做 → 改按后端 `total/pending` 算全书
+- 分类过滤锁死在 `eyes`，1826 条 noise 根本进不来 → 顶栏加「字形差异/标点空白/全部」切换
+- 未定位条目没有 `y0`，点判定会让整次提交被后端拒绝 → 单独展示、禁用判定按钮并说明要补坐标
+- `q.get("context")` 返回 `None` 覆盖了函数默认值 → 带上下文的裁图静默退回单行
+
+### 4. 迁移工具 `tools/migrate_layout.py` 增强
+
+新增 `--all` 批量模式（仓库根 + 所有 `run-*/`，每本独立写 `.migration-<ts>.json`、独立回滚）；
+`dest_root_of()` 是**唯一一处**「文件该搬到哪」的判断；源目录空掉才删。
+新增 `tests/test_migrate_layout.py` 20 项（plan/apply/rollback/仓库根特例/id 规则/批量发现）。
+过程中发现并修了一个真实竞态：`manifest._migrated.at` 与迁移日志 `at` 各自调 `strftime`，
+跨整秒时对不上，回滚删不掉 manifest、`runs/<id>/` 留空壳。
+
+`.gitignore` 收成三条主干规则（`/runs/` / `/dist/` + `*.epub` / `/input/*/source.pdf`），
+旧裸名规则（`/pages/` `/ocr*/` `/out/` `/run*/`）全删。
 
 ### 验收（全部实跑）
 
-~~~powershell
-python -X utf8 -m unittest discover -s tests -q     # Ran 401 tests ... OK (skipped=3)
-Get-FileHash out\book.md,run-guixun\out\book.md,run-sengguan\out\book.md,run-lacan\out\book.md -Algorithm SHA256
-# 320A586E / E5053BDD / 0BA1E017 / 457413BA（四条逐字节未变）
-~~~
+```powershell
+python -X utf8 -m unittest discover -s tests -q     # Ran 421 tests ... OK (skipped=3)
+Get-FileHash runs\hegel\report\book.md,runs\lacan\report\book.md,runs\guixun\report\book.md,runs\sengguan\report\book.md -Algorithm SHA256
+# 320A586E / 457413BA / E5053BDD / 0BA1E017（四条逐字节未变）
+```
 
-端到端实测：`bookflow.py ui` → 上传 9 页 PDF → 选预设 → 审批 → 全流程 48 秒完成、
-`manifest.json` 8 个阶段全 ok、EPUB 出在 `dist/<book-id>/`；裁决台读 `run-lacan` 的 2825 条 →
-625 组、切片图正常、提交判定后干跑计数从 0 变 1、回填后页文本真的改了、备份落在 `work/.backup/`。
+无头浏览器（`msedge --headless=new`）逐页截图五个视图，全部非空、无横向溢出、无旧术语残留。
+回填链路在迁移后的新路径上复验：`runs/lacan` 干跑 `apply 212 / already 0 / missing 19 / skip 2594`、`src=ocr_layout`。
 
 ### 下一步（按价值排序）
 
-1. **在真机上裁过图的裁决台还没被真人用过**。键盘流、组头批量都已实测，但「一屏 20 条」的
-   节奏、切片图够不够看清字形，要人真裁一轮才知道。
-2. **迁移工具还没在四本真书上跑过**（只在临时副本上验过）。建议先挑 `run-guixun` 跑一次
-   `--apply`，确认 `bookflow.py md` 出同样的书，再改其余三本。
-3. **`layout.py` 仍是 2374 行的单体模块**（docs/architecture.md §8 的拆分计划未动）。
-4. 注号识别率（僧官 288 条注只能降级成页尾注）是**真实质量问题**，优先级高于拆分。
+1. **校对页的键盘节奏还没被真人跑过一轮**。一屏能看多少条、5 行上下文够不够、缩放档位是否合手，
+   这些只有真人连续裁几十分钟才知道。这是目前最值得验的一件事。
+2. **`layout.py` 仍是 2374 行的单体模块**（`docs/architecture.md` §8 的拆分计划未动）。
+3. 注号识别率（僧官 288 条注只能降级成页尾注）是**真实质量问题**，优先级高于拆分。
+4. 校对页目前只在 `runs/lacan`（2825 条）上验过，另外三本没有分歧清单，走的是空态。
 
----
+### 已知限制（诚实记录）
+
+- **迁移工具的 `--all` 已在本机四本真书上跑过并通过哈希守卫**，但 **`--rollback` 没有在真书上验证过**
+  （只在测试里用临时目录验过）。
+- **校对页的 44px 按钮 / 字色对比度是按 WCAG AA 定的，没有做过真人可用性测试**。
+- OpenDesign 那次设计运行只产出方案文本与配色令牌，**没有产出可用文件**（智能体把 HTML 写在思考流里、
+  不落盘）。本轮的实现依据是我写的 `docs/UI-DESIGN.md`，不是 OpenDesign 的产物。
+
 ## 最近一轮：把 PDF 书签当目录 + 三处成书质量修正（2026-11-16，第二轮）
 
 用户试完《拉康式主体》的成书后提了四条意见，逐条对应到了根因。
@@ -800,93 +834,3 @@ out/decisions.json 现为根目录那本书的正式裁决表（--export-legacy 
 | 9 | `--force` 只对 render 生效 | `bookflow.py`/`run_ocr.py` | 透传 + 删除旧 JSON |
 | 10 | `qa.py` DUP_PARA 永不触发 | `qa.py` | `TestQA.test_dup_para_detected` |
 | 11 | qa 跨页断句 87.8% 无区分度 | `qa.py` | 267 → 17 条并输出明细 |
-| 12 | `cmp_ocr.py` 置信度分母用错 | `cmp_ocr.py` | 两版分别计数 |
-| 13 | 合并行丢弃低置信片段 | `layout.py` | 合并时 `s = min(...)` |
-| 14 | 页码规则无版心约束 | `layout.py` | 加 `x1 < bl or x0 > br` |
-| 15 | 目录页判定可能误判正文页 | `layout.py` | 加"连续 2 页"约束 |
-| 16 | `left` 取众数会被引文块带偏 | `layout.py` | 改取 10% 分位 |
-| 17 | 合并窗口 `merged[-4:]` 会饥饿 | `layout.py` | 改按 cy 回溯 |
-| 18 | 目录页码列判据被全角空格打断 | `layout.py` | 放宽为"有引导点" |
-| 19 | 目录条目粘连 | `layout.py` | `_looks_entry()` 分离 |
-| 20 | 标题折行匹配失败（比值 0.70 被 0.72 门槛挡） | `layout.py` | 拼接相邻行再比 |
-| 21 | 源 PDF 重复页导致成段重复 | `layout.py` | `dedupe_pages()` |
-| 22 | 空白页水印漏进正文 | `layout.py` | `heads` 判断提前且不受行数保护 |
-| 23 | 封面裁切对深色封面失效（生成全白图） | `cover.py` | 改墨迹外接矩形 + 密度裁水印 |
-| 24 | JSON 句柄不释放 | 全部 | 统一 `jsonio.read/write` |
-
-### 新增能力
-
-- **版面分析阶段**（`run_layout.py` + `bookflow.py layout`）：
-  PP-DocLayoutV3 给每行打 `region` 标签，脚注/页眉/页码不进正文流。
-  纯增量设计：没有 `region` 字段的老 JSON 行为完全不变。
-- **`--ocr-src`** 显式指定 OCR 来源；**`--no-layout`** 跳过版面分析。
-- **`prune` 阶段**：删可重生成的中间产物（新书 `pages/` 约 520 MB）。
-- **测试套件** `tests/test_layout.py`：全部来自真实踩坑（本轮已扩到 84 个用例，见文首）。
-- **`jsonio.py`**、**`requirements.txt`**、**`.gitignore`**。
-- **文档迁移到 `docs/`**：architecture / README / HANDOFF / MEMORY。
-- **弹窗脚注**（本轮）：`extract_notes`/`plan_notes`/`epub3.py`/`assets/style.css`，
-  详见下面「本轮新增：弹窗脚注」。
-
-### OCR 引擎选型（已实测，结论：不换）
-
-详见表见 `docs/README.md`。要点：
-- PP-OCRv6 small 精度最高（CER 2.85%）、最快（0.73 s/页），加大模型不提精度。
-- PaddleOCR 在 Windows 上官方轮子只有 CPU 版（无 DirectML/CUDA），单页 77 s，
-  6GB 显卡用不上，本机是负收益。
-- 真正该补的是**版面分析**，已接入。
-
-## 当轮状态（弹窗脚注那一轮，数字已过时，看文首）
-
-| 项 | 状态 |
-|---|---|
-| 旧书（306 页）全流程 | 可复现，成书 233,812 汉字，44/44 目录命中，EPUB 754.7 KB |
-| 僧官制度史（350 页）全流程（当时无 `pages/`） | 成书 163,090 汉字，103/103 目录命中，453 条脚注（那时报 165 弹窗 / 288 页尾注；EPUB 里实际是 164 / 289），EPUB 557.1 KB |
-| 规训与惩罚（383 页）全流程 | 成书 195,751 汉字，16/16 目录命中，95 条脚注（75 弹窗 / 20 页尾注），EPUB 473.3 KB |
-| 三书 EPUB 校验 | `epub3.validate()` 均 0 错误、封面存在、mimetype 首位 |
-| 测试 | 30/30 通过 |
-| 文档 | `docs/` 下四份齐全，已按本轮改动更新 |
-
-产物位置（本地，**不进仓库**，见 `.gitignore`）：
-- 旧书：`out/`（`book.md` / `report.json` / `qa.txt` / `黑格尔辩证法讲演录.epub`）
-- 新书：`run-sengguan/out/`（`book.md` / `report.json` / `qa.txt` / `中国僧官制度史.epub`）
-- 规训与惩罚：`run-guixun/out/`（同上 + `规训与惩罚.epub`）
-- 审阅报告：`REVIEW.md`（在仓库里）
-
-> 扫书本身有版权，扫描页和成书都只留在本地。仓库里只有代码、文档和测试。
-
-## 本轮新增：弹窗脚注
-
-详见 `docs/architecture.md` 第 6 节。要点：
-
-- `layout.py`：`extract_notes()` 从 `region=footnote` 抽注并按圈号/数字定编号；
-  `plan_notes()` 只在"本页正文恰好一个该号 + 注区恰好一条"时内联；
-  `assemble()` 输出 `("def", id, text)` 与 `("pn", [...])` 两种块，`to_markdown()` 转成
-  `[^id]` 引用与 `> ① …` 页尾注。
-- `epub3.py`（新）+ `make_epub.py`（新）：项目自带的 EPUB3 构建器，渲染
-  `noteref` / `aside[epub:type=footnote]` 弹窗结构，锚不上的注渲染成 `endnote`。
-- `assets/style.css`（新）：正文上标 + 弹窗注文 + `:target` 兜底浮层。
-- `bookflow.py` 的 epub 阶段改调 `make_epub.py`，不再依赖外部的 md-to-ebook 脚本。
-- `qa.check_notes()`：引用/定义必须一一对应，防断链。
-
-新书实测：453 条注 → 165 可弹窗 + 288 页尾注，引用/定义双向一致 0 问题。
-旧书无脚注区，**成书与改动前逐字节相同**。
-
-## 下一步（建议优先级）
-
-1. **提高注号识别率（收益最大）**：僧官制度史降级为页尾注的 288 条，主因是正文
-   上标 ①②③ 根本没被 OCR 认出来（110 页整页无圈号）。可行方向：OCR 前对页面
-   底部/小字号区域单独放大重识别，或用版面分析的 `text` 区做二次 pass。
-   这是识别问题，**不是匹配算法问题**，改 `plan_notes` 没用。
-   
-   规训与惩罚的瓶颈不同：星号注的注区在 OCR 后大量丢星号（168 行里只剩 6 行），
-   只能靠"注区缩进切块数 == 正文星号数"配对，83 页中 63 页成功、20 页降级。
-   要提高得让版面分析把每条注单独成框（现在整片注区是一批 `footnote` 行）。
-2. **把实测数字接到 CI**：现在数字是手工填的，容易再次漂移。
-   建议写 `tools/bench.py` 跑固定样本并输出机器可读结果。
-3. **`disagree.py` 接入 CLI**：流水线图里有"双模型分歧"，但 `bookflow.py all` 从不调用它，
-   也没有 CLI 入口。要么加阶段，要么从图里删掉。
-4. **跨页合段可疑处**：僧官制度史 47 处、规训与惩罚 37 处，都还没逐条人工核对。
-   建议用各自的 `out/qa.txt` 明细配合 `make_review.py` 出对照图逐条看。
-   注意其中大量是**参考书目/索引页**的正常分条（每条本身就是独立文献），不是错误。
-5. **`REVIEW.md` 收敛**：它记录的 23 条陈旧声明已经不再对应现状（根 README 已改成入口），
-   可以归档到 `docs/` 或直接删。

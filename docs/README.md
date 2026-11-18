@@ -52,17 +52,17 @@ $py = "python"
 | prune | `bookflow.py prune` | 删除可重生成的中间产物 |
 | verify | `bookflow.py verify` | 文字层与 OCR 交叉验证（`disagree.py` 的 A=文字层 / B=OCR），分歧进 `decisions.json` |
 | disagree | `bookflow.py disagree --ocr-alt ocr_alt` | 双模型交叉比对，产出候选清单。**不在 `all` 里**：需要第二版 OCR |
-| decisions | `bookflow.py decisions --from disagree` | 把各路候选（disagree/audit/旧队列）归一成 `out/decisions.json` |
-| table | `bookflow.py table` / `--import` | 裁决表 ↔ **人填的 Markdown 表格**：只填「判定」「替换整行」两列，按词对分组、组头一次定一组 |
-| **ui** | `bookflow.py ui` | **本地 Web 工作台**：预设、流水线看板（SSE）、键盘驱动裁决台、成书检视。不需要 `--work`，工作目录从界面里选 |
+| decisions | `bookflow.py decisions --from disagree` | 把各路候选（disagree/audit/旧队列）归一成 `review/decisions.json` |
+| table | `bookflow.py table` / `--import` | 校对清单 ↔ **人填的 Markdown 表格**：只填「判定」「替换整行」两列，按词对分组、组头一次定一组 |
+| **ui** | `bookflow.py ui` | **本地 Web 工作台**：任务列表、新建任务（三方案 + 参数确认）、处理进度（SSE）、键盘驱动校对、成品检视。不需要 `--work`，任务从界面里选 |
 | manifest | 每个阶段自动记 | 把「这次是怎么跑出来的」写进 `<work>/manifest.json`：输入 sha256、全部参数、每阶段 status/耗时。**旁路记录，写不进去不影响出书** |
 
 裁决闭环（人工/VLM 裁决后回填）：
 
 ~~~powershell
 & $py bookflow.py disagree --work ./run1 --ocr-alt ocr_alt   # 产出 out/disagree.json
-& $py bookflow.py decisions --work ./run1 --from disagree      # 归一成 out/decisions.json
-& $py bookflow.py table --work ./run1                          # 渲染 out/decisions.md（给人填）
+& $py bookflow.py decisions --work ./run1 --from disagree      # 归一成 review/decisions.json
+& $py bookflow.py table --work ./run1                          # 渲染 review/decisions.md（给人填）
 # ... 在 decisions.md 里填「判定」列（A 保留 / B 采用建议 / C 用整行覆盖 / ? 待定 / 留空=未裁决）...
 & $py bookflow.py table --work ./run1 --import                 # 合回 decisions.json（校验失败整份不写）
 & $py apply_decisions.py --work ./run1 --decisions out/decisions.json            # 默认 dry-run
@@ -106,23 +106,35 @@ OCR 同规模约 17.6 秒/页 × 927 ≈ 4.5 小时。抽样 13 页逐字对比�
 & $py bookflow.py ui --port 8800 --no-open
 ~~~
 
-五个页面，都是**纯静态文件**（原生 ES module + fetch + EventSource，零 npm、零 CDN、可离线）：
+五个页面，**浅色主题**，都是纯静态文件（原生 ES module + fetch + EventSource，零 npm、零 CDN、可离线）。
+界面规范（配色令牌、排版、校对页硬指标）见 [UI-DESIGN.md](UI-DESIGN.md)。
 
-| 页面 | 做什么 |
-|---|---|
-| `#/runs` | 运行列表：9 格阶段条（ok/degraded/failed/skipped/missing 用颜色分开）、进度、待裁决数、EPUB 徽章 |
-| `#/setup` | 新建任务三步：**选输入**（拖拽/上传/手输路径）→ **选预设**（三大场景）→ **审批并启动**（列出即将执行的路径/阶段/**最终生效参数**，勾选核对后按钮才可用） |
-| `#/run/:id` | 流水线看板：实时日志（SSE）+ 阶段进度 + 安全中断（走 `kill_tree` 清整棵进程树）+ 单阶段重跑 |
-| `#/run/:id/triage` | **裁决台**：左行级切片图、中 A/B 字符级高亮、右词频证据；键盘 `a/b/c/空格/j/k/Enter/u`；组头一次判一组；提交后强制走 **预览（干跑）→ 确认 → 执行** |
-| `#/run/:id/inspect` | 成书检视：目录树、脚注健康仪表盘、QA 问题、EPUB 下载、`book.md` 阅读预览、**manifest 原文**（这次是怎么跑出来的） |
+| 页面 | 路由 | 做什么 |
+|---|---|---|
+| **任务列表** | `#/tasks` | 每本书一张卡：书名、页数、9 个阶段点阵、待校对条数、是否已出成品；顶部合计与搜索 |
+| **新建任务** | `#/new` | 三步：**上传 PDF** → **书目信息 + 选方案**（古籍扫描 / 现代排版 / 前 20 页打样）→ **确认**（把生效参数逐项列表核对） |
+| **处理进度** | `#/task/:id` | 左栏 9 阶段时间线，右栏实时日志（SSE）；安全中断走 `kill_tree`，单阶段可重跑 |
+| **校对** | `#/task/:id/proofread` | 左分组 / 中证据图（带上下文行、可缩放）/ 右判定；键盘 `A``B``C``S`、`↑↓`、`Z` 切换整页、`1-4` 缩放；组内可整组采纳 |
+| **成品** | `#/task/:id/output` | EPUB 下载、目录树、脚注健康、质检问题、Markdown 预览、执行记录（manifest） |
+
+**校对页的三条硬指标**（改样式时别破坏）：
+1. 证据图容器不小于 420px 高、默认约视口 58%。**图太小就判不出形近字**。
+2. 差异字用 **700 字重 + 浅底深字**（替换=浅琥珀+棕、新增=浅绿+绿、删除=浅红+红删除线），
+   全部 ≥ 4.67:1。底色只负责定位，看清字形靠加粗——实测「橙底 `#ffb347` + 棕字」只有 3.33:1，字会糊。
+3. 判定按钮整行宽、44px 高、带键帽提示；提交必须走**预览 → 确认 → 执行**。
+
+后端 `webui/server.py` 仍是**纯标准库**（`http.server` + 手写路由 + SSE），不引 FastAPI——
+OCR 要跑在已经装好 GPU 依赖的那个解释器上，让用户为一个本地界面再动那套环境不划算。
+契约定死在 [../webui/API.md](../webui/API.md)：**改动先改契约，再改两端**。前端字段名（`pending_decisions`
+`verdict` `preset`）一律照抄契约，只把**显示文字**换成"任务 / 处理进度 / 校对 / 成品 / 方案 / 确认"。
 
 后端是 `webui/server.py`，**纯标准库**（`http.server` + 手写路由 + SSE），不引 FastAPI——
 OCR 要跑在已经装好 GPU 依赖的那个解释器上，让用户为一个本地界面再动那套环境不划算。
 契约定死在 [../webui/API.md](../webui/API.md)：改动先改契约，再改两端。
 
-### 审批闸门（这两处是刻意的，别顺手放开）
+### 确认闸门（这两处是刻意的，别顺手放开）
 
-1. `POST /api/runs` 之前必须在界面上核对**最终生效参数**（预设 + 覆盖合并后的那一份）。
+1. `POST /api/runs` 之前必须在界面上核对**最终生效参数**（方案 + 覆盖合并后的那一份）。
 2. `POST /api/runs/{id}/apply` 必须带 `confirm: true`，否则 400。回填会**原地覆写页级 JSON**，
    一次误点不可逆；正确路径是 `apply/preview`（干跑）→ 人看 counts → 再 `apply`。
 
