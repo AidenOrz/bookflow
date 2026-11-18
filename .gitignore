@@ -1,21 +1,51 @@
-# 运行产物（体积大、可重生成）
-pages/
-ocr/
-ocr_fix/
-ocr_alt/
-ocr_medium/
-ocr_merged/
-ocr_layout/
-run*/
-out/
-*.epub
-*.png
-*.jpg
-ocr.log
-*.log
+# ---------------------------------------------------------------------------
+# .gitignore — 分层布局 + 旧平铺布局两套规则并存
+#
+# 旧规则是**裸名**（pages/ ocr/ out/ ...），它们匹配**任意层级**，方向没错
+# （run-x/out/ 也该挡），但有三处过头或缺项（docs/IO-CONVENTIONS.md §1 I4 实测）：
+#   * "*.png" 把 assets/icon.png、docs 配图、tests 夹具一起挡了 —— 任何需要入库的
+#     图片都进不来。收窄成「只挡产物目录里的图」。
+#   * 缺 ocr_text/ 与 ocr_text_raw/，而 --text-layer 的**默认值就是 verify**：
+#     在仓库根跑一次 all 就会凭空多出两个未忽略的目录。
+#   * ".tmp-*" 只挡前缀式，jsonio 的临时文件是后缀式（xxx.json.tmp）。
+# ---------------------------------------------------------------------------
 
-# 临时文件
+# ---- 运行产物：中间态（可重生成，体积大）----
+/pages/
+/ocr/
+/ocr_fix/
+/ocr_alt/
+/ocr_medium/
+/ocr_merged/
+/ocr_layout/
+/ocr_text/
+/ocr_text_raw/
+/out/
+/run*/
+/dist/
+/runs/
+/input/*/source.pdf
+
+# 产物目录里的图片一律不入库（收窄后不再误伤 assets/ 与 tests/）
+/pages/*.png
+/out/*.png
+/out/images/
+ocr/*.png
+ocr_fix/*.png
+ocr_alt/*.png
+ocr_medium/*.png
+ocr_merged/*.png
+ocr_layout/*.png
+ocr_text/*.png
+ocr_text_raw/*.png
+
+# ---- 临时文件 ----
 .tmp-*
+*.json.tmp
+*.md.tmp
 __pycache__/
 *.pyc
 *.bak
+
+# ---- 交付物 ----
+*.epub
