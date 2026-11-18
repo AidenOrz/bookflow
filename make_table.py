@@ -301,8 +301,14 @@ def render(doc, title="", source="", only="eyes"):
                 "或者 OCR 把字认错后连原词都不在了。\n"
                 "\n"
                 "补法（IO-CONVENTIONS.md §9.4）：翻原书 → 找到**含错字的那一行** →\n"
-                "把「替换整行」填成改好的**完整一行**，判定填 `C`，「行 y0」留空。\n"
-                "判不动就留空——条目会被原样保留，不会消失。")
+                "把「替换整行」填成改好的**完整一行**，判定填 `C`，**并且必须把\n"
+                "「行 y0」填成那一行的真实 y0**（照抄原图里同一行左侧的坐标数，\n"
+                "或从页级 JSON 的 lines[].y0 里取）。\n"
+                "\n"
+                "为什么不能留空：回填要先按 y0 在页里**找到那一行**才能整行覆盖，\n"
+                "没有坐标就只能判 missing —— 导入看着成功，正文一个字都不会改。\n"
+                "判不动就留空——条目会被原样保留，不会消失（但填了 C 就必须有 y0，\n"
+                "否则导入会整份拒绝并报错）。")
     if eyes:
         section(eyes, "待裁决（差异含汉字，必须看原图）")
     if noise:
@@ -349,9 +355,15 @@ def parse(md_text):
             continue
         key = m.group(1)
         cells = _split_row(line)
-        if len(cells) < len(COLUMNS):
-            errors.append("第 %d 行：列数 %d，应为 %d（%s）"
-                          % (lineno, len(cells), len(COLUMNS), key))
+        if len(cells) != len(COLUMNS):
+            # 旧版只拒绝"列数不足"，多列照常读前 7 列。而多列最常见的来源正是
+            # **人在 C 的「替换整行」里写了一个没转义的竖线**：后半段被当成第 8 列丢掉，
+            # 而回填是整行覆盖——正文后半句就这么静默没了（实测复现：整行 '左边|右边'
+            # 读回来变成 '左边'，errors 还是空的）。所以多列同样必须整份拒绝。
+            more = ("；字面竖线要写成 `\\|`（否则后半段会被当成额外一列）"
+                    if len(cells) > len(COLUMNS) else "")
+            errors.append("第 %d 行：列数 %d，应为 %d（%s）%s"
+                          % (lineno, len(cells), len(COLUMNS), key, more))
             continue
         cell_v = _unbacktick(cells[COL_VERDICT])
         repl = _unbacktick(cells[COL_REPL])
@@ -381,7 +393,11 @@ def parse(md_text):
 
 
 def merge_into(doc, rows):
-    """把表格里填的判定合回 decisions 文档（按 key）。返回 (改了几条, 未知键列表)。
+    """把表格里填的判定合回 decisions 文档（按 key）。
+
+    **返回值保持旧签名**：先返回 (改了几条, 未知键列表)——CLI 早就按这两个值报错，
+    改签名会把调用方和测试一起打断。第三个返回值是 errors（需要回填但缺坐标之类的
+    **具体**错误），只在真出现时才有内容；只想拿前两个值的调用方继续解两个即可。
 
     只动 verdict / replacement / status 三个字段：A/B 原文一律以 JSON 为准，
     表格里那一列是投影，不回写。
@@ -390,7 +406,7 @@ def merge_into(doc, rows):
     """
     import decisions as dec
     by_key = {e.get("key"): e for e in (doc.get("decisions") or [])}
-    unknown, n = [], 0
+    unknown, errors, n = [], [], 0
     for r in rows:
         if not r["verdict"]:
             continue
@@ -405,12 +421,24 @@ def merge_into(doc, rows):
             e["y0"] = r["y0"]
             e["key"] = dec.key_of(e.get("page"), r["y0"])
             by_key[e["key"]] = e
+        # 判定已填、而且这一条**需要回填**（A/B/C 里的 A 什么都不做、? 是没裁决），
+        # 但坐标仍然没有 -> 回填端根本找不到那一行，只会判 missing。
+        # 旧版这里一声不响，人按表里的老提示"y0 留空"照做，导入成功、正文没变
+        # （实测复现：plan.kind == "missing"，reason「裁决没有 y0（未定位）」）。
+        # 与其静默丢，不如在导入这一步就具体报出来，整份不写。
+        if r["verdict"] in ("B", "C") and e.get("y0") is None:
+            errors.append("键 %s：判定 %s 需要回填，但这一条还没有「行 y0」"
+                          "（翻原书找到含错字的那一行，把它的真实 y0 填进「行 y0」列）"
+                          % (r["key"], r["verdict"]))
+            continue
         if e.get("verdict") == r["verdict"] and e.get("replacement") == r["replacement"]:
             continue                      # 没改就别动 status，保住幂等
         e["verdict"] = r["verdict"]
         e["replacement"] = r["replacement"] if r["verdict"] == "C" else None
         e["status"] = "pending"
         n += 1
+    if errors:
+        return n, unknown, errors
     return n, unknown
 
 
@@ -457,7 +485,17 @@ def main(argv=None):
             for e in errors[:30]:
                 sys.stderr.write("  " + e + "\n")
             return 2
-        n, unknown = merge_into(doc, rows)
+        got = merge_into(doc, rows)
+        n, unknown, errors = got[0], got[1], (got[2] if len(got) > 2 else [])
+        if errors:
+            # 和 parse/validate 的错误同一待遇：**整份不写**。
+            # 只提醒不拦的话，人看到"合入 N 条"就会以为这条已经生效，
+            # 而它其实连坐标都还没有，下一阶段只会判 missing。
+            sys.stderr.write("表格有 %d 条需要回填但缺「行 y0」，一条都没写回：\n"
+                             % len(errors))
+            for e in errors[:30]:
+                sys.stderr.write("  " + e + "\n")
+            return 2
         if unknown:
             sys.stderr.write("表格里有 %d 个键在裁决表中找不到（可能来自另一本书/旧表）：\n"
                              % len(unknown))

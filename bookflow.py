@@ -39,6 +39,9 @@ import subprocess
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import jsonio                       # noqa: E402  页级 JSON 统一读写（项目自带）
+import paths                         # noqa: E402  工作目录分层布局（见 paths.py）
+import manifest                      # noqa: E402  本次运行的事实源（manifest.json）
+import stage_manifest                # noqa: E402  把阶段结果记进 manifest（旁路，不挡路）
 PY = sys.executable
 
 # 依赖自检。本机常见坑：PATH 上的 python 是 anaconda，而依赖装在另一个 venv 里，
@@ -179,7 +182,7 @@ TEXTLAYER_META = "_textlayer.meta"
 
 def textlayer_meta(work):
     """读 <work>/ocr_text/_textlayer.meta；不存在或坏了返回 {}。"""
-    p = os.path.join(work, TEXTLAYER_DIR, TEXTLAYER_META)
+    p = os.path.join(paths.ocr_dir(work, TEXTLAYER_DIR), TEXTLAYER_META)
     if not os.path.exists(p):
         return {}
     try:
@@ -323,8 +326,8 @@ def complete_textlayer(work, ocr_src):
     每页 JSON 自带的 producer 字段会如实记录这一页是谁产的，不会含糊。
     返回补齐的页数；没有可补的来源时返回 -1（页数守恒做不到）。
     """
-    dst = os.path.join(work, TEXTLAYER_DIR)
-    raw = os.path.join(work, TEXTLAYER_RAW_DIR)
+    dst = paths.ocr_dir(work, TEXTLAYER_DIR)
+    raw = paths.ocr_dir(work, TEXTLAYER_RAW_DIR)
     if not (os.path.isdir(raw) and os.path.isdir(dst)):
         return -1
     index = page_image_index(work)
@@ -336,7 +339,7 @@ def complete_textlayer(work, ocr_src):
     if not missing:
         return 0
     for name in ("ocr_fix", "ocr_layout", "ocr_merged", "ocr"):
-        src = os.path.join(work, name)
+        src = paths.ocr_dir(work, name)
         if not (os.path.isdir(src) and _page_jsons(src)):
             continue
         by_no = {}
@@ -368,7 +371,7 @@ def ensure_textlayer_coverage(a):
     """
     if getattr(a, "text_layer", "verify") != "verify":
         return
-    if not os.path.isdir(os.path.join(a.work, TEXTLAYER_RAW_DIR)):
+    if not os.path.isdir(paths.ocr_dir(a.work, TEXTLAYER_RAW_DIR)):
         return                                  # 这本书压根没跑过文字层
     ok, _ = textlayer_state(a.work)
     if not ok:
@@ -376,7 +379,7 @@ def ensure_textlayer_coverage(a):
         # 这时**不要**用 OCR 去"补齐" ocr_text —— 那等于把 OCR 结果挂上文字层的名字，
         # 下次看目录的人会以为这本来是 PDF 自带的文字层。
         return
-    if os.path.isdir(os.path.join(a.work, TEXTLAYER_DIR)):
+    if os.path.isdir(paths.ocr_dir(a.work, TEXTLAYER_DIR)):
         complete_textlayer(a.work, "ocr_fix")
     got, total = textlayer_coverage(a.work)
     if total and got < total:
@@ -388,8 +391,8 @@ def ensure_textlayer_coverage(a):
 
 def textlayer_coverage(work):
     """(已覆盖页数, 原书页数)：ocr_text 与 raw 的页数对比。"""
-    raw = os.path.join(work, TEXTLAYER_RAW_DIR)
-    dst = os.path.join(work, TEXTLAYER_DIR)
+    raw = paths.ocr_dir(work, TEXTLAYER_RAW_DIR)
+    dst = paths.ocr_dir(work, TEXTLAYER_DIR)
     return (len(_page_jsons(dst)) if os.path.isdir(dst) else 0,
             len(_page_jsons(raw)) if os.path.isdir(raw) else 0)
 
@@ -427,7 +430,7 @@ def textlayer_state(work):
     if meta:
         return bool(meta.get("usable")), meta.get("reason") or ""
     for name in (TEXTLAYER_DIR, TEXTLAYER_RAW_DIR):
-        d = os.path.join(work, name)
+        d = paths.ocr_dir(work, name)
         if os.path.isdir(d) and _page_jsons(d):
             return textlayer_usable(textlayer_stats(d))
     return False, "还没有跑过 textlayer 阶段"
@@ -619,13 +622,90 @@ def sh_capture(cmd, **kw):
     return proc.returncode, out
 
 
+def pdf_page_count(path):
+    """PDF 的真实页数；读不到返回 None（**绝不 sys.exit**，pypdf 只是可选依赖）。
+
+    依次试两条路：
+      1. poppler 的 `pdfinfo`——与 pdftoppm 同源，能渲染就一定有它，解析 `Pages:` 行；
+      2. pypdf（纯 Python，md 那一步抽书签也用它），没装就是 ImportError。
+    两条都不行时返回 None：页数只用来**发现缺页**，拿不到页数不能因此让渲染阶段失败，
+    调用方必须退回"非空即完成"的旧判断（见 _render_skippable）。
+    """
+    if not path or not os.path.isfile(path):
+        return None
+    exe = shutil.which("pdfinfo")
+    if exe:
+        try:
+            r = subprocess.run([exe, path], capture_output=True, timeout=120,
+                               stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            r = None
+        if r is not None:
+            m = re.search(rb"^Pages:\s+(\d+)", r.stdout or b"", re.M)
+            if m:
+                return int(m.group(1))
+    try:
+        from pypdf import PdfReader
+        n = len(PdfReader(path).pages)
+        return n or None
+    except Exception:      # 没装 / 文件损坏 / 加密：都只是"读不到页数"
+        return None
+
+
+def _rendered_pages(pages):
+    """pages/ 里已经渲染出来的页号集合（只认 PNG，按文件名里的数字取页号）。"""
+    try:
+        names = os.listdir(pages)
+    except OSError:
+        return set()
+    return {_page_no(f) for f in names if f.lower().endswith(".png")} - {None}
+
+
+def _render_skippable(a, pages):
+    """pages/ 里的产物是不是**完整**的，完整才允许跳过。
+
+    旧判断是 `os.listdir(pages)` 非空就跳过，这在**中断续跑**时是错的：pdftoppm
+    渲到第 12 页被打断，目录里 12 个 PNG 非空，续跑直接跳过，后 288 页从未生成；
+    下游 OCR / md 都按现存 PNG 枚举，于是整本书静默少掉 288 页正文
+    （--text-layer off 时连文字层覆盖率检查都没有兜底）。
+
+    这里改用 PDF 真实页数 + 实际页号集合判断；页数读不到时退回旧行为，并且
+    **明确打一句**，免得用户以为这次真的核对过完整性。
+    """
+    if not os.listdir(pages):
+        return False                       # 空目录：旧行为也是照常渲染
+    n_pdf = pdf_page_count(getattr(a, "pdf", "") or "")
+    if n_pdf is None:
+        print("  无法读取 PDF 页数，按非空判断")
+        return True
+    # 打样模式（--limit-pages）只渲前 N 页，期望页集合必须跟着收窄，
+    # 否则每次续跑都会认为"缺了后 280 页"、把打样重渲一遍（白白浪费几分钟）。
+    limit = int(getattr(a, "limit_pages", 0) or 0)
+    want = set(range(1, (min(int(n_pdf), limit) if limit > 0 else int(n_pdf)) + 1))
+    missing = sorted(want - _rendered_pages(pages))
+    if not missing:
+        return True                        # 1..n_pdf 都在，渲染完整
+    more = " 等 %d 页" % len(missing) if len(missing) > 10 else ""
+    print("  pages 不完整：缺 %d/%d 页（%s%s），照常渲染补齐"
+          % (len(missing), len(want),
+             "、".join("%d" % n for n in missing[:10]), more))
+    return False
+
+
 def stage_render(a):
-    pages = os.path.join(a.work, "pages")
+    pages = paths.pages_dir(a.work)
     os.makedirs(pages, exist_ok=True)
-    if os.listdir(pages) and not a.force:
+    if not a.force and _render_skippable(a, pages):
         print("  pages 已存在，跳过（--force 可重做）")
         return
-    sh(["pdftoppm", "-r", str(a.dpi), "-gray", "-png", a.pdf, os.path.join(pages, "p")])
+    cmd = ["pdftoppm", "-r", str(a.dpi), "-gray", "-png", a.pdf, os.path.join(pages, "p")]
+    limit = int(getattr(a, "limit_pages", 0) or 0)
+    if limit > 0:
+        # 打样模式：只渲染前 N 页。**这是一本残书**，日志里必须说清楚，
+        # 否则"只有 20 页的书"会被当成程序坏了（--text-pages 的老坑同源）。
+        cmd += ["-f", "1", "-l", str(limit)]
+        print("  ！打样模式：只渲染前 %d 页，产出的是残书，不要拿去交付。" % limit)
+    sh(cmd)
     print("  页数 %d" % len(os.listdir(pages)))
 
 
@@ -648,8 +728,8 @@ def stage_textlayer(a):
     # **不能让它直接写 ocr_text**：一旦目录里有残缺的页，「部分页有文字」的书就会被
     # ocr_dir 当成正文源，没文字的那半本书直接消失（实测《一页纸学习法》10 页里 4 页
     # 是纯图片，直接用会丢 40% 正文）。raw 目录留着是为了能按页诊断"哪几页没文字"。
-    raw = os.path.join(a.work, TEXTLAYER_RAW_DIR)
-    dst = os.path.join(a.work, TEXTLAYER_DIR)
+    raw = paths.ocr_dir(a.work, TEXTLAYER_RAW_DIR)
+    dst = paths.ocr_dir(a.work, TEXTLAYER_DIR)
     meta = textlayer_meta(a.work)
     same_pdf = bool(meta.get("pdf")) and os.path.realpath(meta["pdf"]) == pdf
     have = os.path.isdir(raw) and bool(_page_jsons(raw))
@@ -769,20 +849,68 @@ def stage_textlayer(a):
     return ok, st, why
 
 
-def _merge_keep_status(old_doc, new_doc):
-    """合并两份裁决表时**保留旧条目的 status**。
+# 旧 status 里代表"这条已经被人处理过"的两种取值（apply_decisions 回写的）
+_HUMAN_STATUSES = ("applied", "missing")
+# "原文变了、需要重新核对"的告警里最多列几个 key（再多终端就没法看了）
+_MERGE_WARN_MAX = 10
 
-    dec.merge 是「后者覆盖前者」，直接拿它合并会把已经 applied 的条目打回 pending，
-    于是下一次 apply 又"重新应用"一遍（幂等性在数据里被抹掉）。这里只覆盖 A/B/verdict
-    这些内容字段，status 是运行状态，不能凭空重置。
+
+def _merge_keep_status(old_doc, new_doc):
+    """合并两份裁决表时**保留旧条目上人工做过的判断**，并让 status 与时态一致。
+
+    合并规则（每条都对应一次实测或一次明确的语义决定）：
+
+    1. **同 key 时，旧条目的 verdict / replacement / note 优先保留。**
+       dec.merge 是「后者覆盖前者」，直接拿它合并会把人工填的 verdict=C +
+       replacement 整条换成机器这次的新候选——那份文件是**唯一**保存人工裁决的地方，
+       丢了就没有第二份。机器候选只是"备料"，没资格覆盖人做过的判断。
+    2. **旧 status 是 applied/missing（说明已经落过盘）时，看原文 A/B 有没有变**：
+       * 新旧 A/B 完全相同 -> 保留旧 status，继续幂等（重跑 verify 不该让
+         apply 又"重新应用"一遍）；
+       * A/B 有变化 -> status 重置成 pending。旧 applied 说的是"这一行已经是 B 了"，
+         而 A/B 一变，这个断言就不再成立；把 applied 挂到新内容上等于宣称改过了、
+         实际没改（比不记录更糟）。这些 key 收集到"需要重新核对"列表里打给人看。
+    3. **旧 verdict 是人工判过的（!= "?")、新候选这次判不出（?）** -> 保留旧的
+       verdict/replacement。机器这次判不出不是因为人判错了，不能因此把人工结论降级。
+    4. 其余情况（旧的是 ? 且没跑过）-> 用新的候选，它至少不旧。
+
+    只返回 merged 文档（签名不变），告警在函数内部打印：本函数被 stage_verify 和
+    stage_decisions --merge 两处调用，任何一处 sys.exit 都会把整个阶段拦腰截断。
     """
     import decisions as dec
-    merged = dec.merge(old_doc, new_doc)
     before = {e.get("key"): e for e in (old_doc or {}).get("decisions") or []}
+    merged = dec.merge(old_doc, new_doc)
+    stale = []            # 原文变了、需要重新核对的 key
     for e in merged["decisions"]:
         old = before.get(e["key"])
-        if old and old.get("status") in ("applied", "missing"):
-            e["status"] = old["status"]
+        if not old:
+            continue                          # 新增候选：没有旧判断可保留
+        old_v = old.get("verdict") or "?"
+        # 规则 1+3：旧条目**判过**（verdict != "?"）就整条保留人的判断——包括
+        # 新候选这次退化成 "?" 的情况（机器判不出，不等于人判错了）。
+        # 旧 status 是 applied/missing 也算"处理过"，同样不拿机器候选盖掉。
+        # 规则 4：旧的是 "?" 且没跑过（pending），说明上一轮只是备料，用新候选刷新。
+        if old_v != "?" or old.get("status") in _HUMAN_STATUSES:
+            e["verdict"] = old_v
+            e["replacement"] = old.get("replacement")
+            e["note"] = old.get("note") or ""
+        if e.get("verdict") == "C" and not e.get("replacement"):
+            # 旧条目 verdict=C 却没有 replacement 是非法状态（validate 会拒绝整份），
+            # 不能把它原样带过来——退回机器候选，至少它是一份自洽的条目。
+            e["verdict"], e["replacement"] = "?", None
+        # 规则 2：status 跟"原文有没有变"走
+        if old.get("status") in _HUMAN_STATUSES:
+            if (old.get("A") or "") == (e.get("A") or "") and \
+                    (old.get("B") or "") == (e.get("B") or ""):
+                e["status"] = old["status"]
+            else:
+                e["status"] = "pending"
+                stale.append(e["key"])
+    if stale:
+        more = (" 等 %d 条" % (len(stale) - _MERGE_WARN_MAX)
+                if len(stale) > _MERGE_WARN_MAX else "")
+        print("  注意：%d 条裁决的原文 A/B 已变，status 已重置为 pending、需要重新核对："
+              "%s%s" % (len(stale), "、".join(stale[:_MERGE_WARN_MAX]), more))
     return merged
 
 
@@ -840,22 +968,21 @@ def stage_verify(a):
     ocr_merged、md 优先读它（ocr_merged 在 OCR_DIRS 里排在 ocr_text 之前，见那里）。
     """
     check_dict()
-    text_dir = os.path.join(a.work, TEXTLAYER_DIR)
+    text_dir = paths.ocr_dir(a.work, TEXTLAYER_DIR)
     if not (os.path.isdir(text_dir) and _page_jsons(text_dir)):
         sys.exit("verify 需要先跑 textlayer 阶段：找不到文字层结果 %s" % text_dir)
-    ocr_side = os.path.join(a.work, "ocr_fix")
+    ocr_side = paths.ocr_dir(a.work, "ocr_fix")
     if not (os.path.isdir(ocr_side) and _page_jsons(ocr_side)):
         sys.exit("verify 需要 OCR 结果做对照：找不到 %s\n"
                  "  纯文字层不想跑 OCR 的话用 --text-layer only。" % ocr_side)
-    out = os.path.join(a.work, "out")
-    os.makedirs(out, exist_ok=True)
+    out = paths.report_dir(a.work, create=True)
     sh([PY, os.path.join(HERE, "disagree.py"),
         "--a", text_dir, "--b", ocr_side,
         "--out", os.path.join(out, "disagree.json"),
         "--txt", os.path.join(out, "disagree.txt")])
 
     import decisions as dec
-    dst = a.out or os.path.join(out, "decisions.json")
+    dst = a.out or paths.decisions_path(a.work)
     picked = dec.load_any(os.path.join(out, "disagree.json"), kind="disagree",
                           report=os.path.join(out, "report.json"),
                           ocr=text_dir)
@@ -876,11 +1003,10 @@ def stage_verify(a):
 
 
 def stage_ocr(a):
-    ocr = os.path.join(a.work, "ocr")
-    os.makedirs(ocr, exist_ok=True)
+    ocr = paths.ocr_dir(a.work, "ocr", create=True)
     env = dict(os.environ)
     cmd = [PY, os.path.join(HERE, "run_ocr.py"),
-           "--src", os.path.join(a.work, "pages"), "--dst", ocr,
+           "--src", paths.pages_dir(a.work), "--dst", ocr,
            "--procs", str(a.procs), "--device", a.device, "--model", a.model]
     if a.force:
         cmd.append("--force")
@@ -889,12 +1015,12 @@ def stage_ocr(a):
 
 def stage_repair(a):
     """OCR 查漏补缺：整页识别会让异常长的行退化成几个乱字，这里逐行补识别。"""
-    src = os.path.join(a.work, "ocr")
+    src = paths.ocr_dir(a.work, "ocr")
     if not os.path.isdir(src):
         sys.exit("repair 需要先跑 ocr 阶段：找不到 %s" % src)
-    dst = os.path.join(a.work, "ocr_fix")
+    dst = paths.ocr_dir(a.work, "ocr_fix")
     cmd = [PY, os.path.join(HERE, "repair.py"),
-           "--src", src, "--pages", os.path.join(a.work, "pages"),
+           "--src", src, "--pages", paths.pages_dir(a.work),
            "--dst", dst, "--device", a.device]
     if a.force:
         cmd.append("--force")
@@ -984,6 +1110,22 @@ def _same_text(d1, d2, sample=3):
     return True
 
 
+def _dir_coverage(d, want):
+    """目录 d 对所需页集合 want 的覆盖率：返回 (比例, 命中的页数)。
+
+    按**页号**比而不是文件名：pages/ 里可能是 p-01.png，OCR 目录里可能是
+    p-001.png.json（pdftoppm 不补零，实测踩过），字符串相等在这里不可靠。
+    """
+    if not want:
+        return 1.0, 0
+    try:
+        have = {_page_no(f) for f in os.listdir(d) if f.endswith(".png.json")} - {None}
+    except OSError:
+        return 0.0, 0
+    n = len(want & have)
+    return float(n) / len(want), n
+
+
 def ocr_dir(a):
     """按优先级挑 OCR 结果目录；显式 --ocr-src 优先。
 
@@ -992,7 +1134,7 @@ def ocr_dir(a):
     此时必须告警——否则用户以为裁决生效了，实际 md 还在读旧数据。
     """
     if getattr(a, "ocr_src", ""):
-        d = os.path.join(a.work, a.ocr_src)
+        d = os.path.join(paths.work_dir(a.work), a.ocr_src)
         if not os.path.isdir(d):
             sys.exit("--ocr-src 指定的目录不存在: %s" % d)
         print("  OCR 源: %s（--ocr-src 指定）" % d)
@@ -1002,7 +1144,7 @@ def ocr_dir(a):
     dirs = active_dirs(a)
     picked = None
     for name in dirs:
-        d = os.path.join(a.work, name)
+        d = os.path.join(paths.work_dir(a.work), name)
         if not os.path.isdir(d):
             continue
         jsons = [f for f in os.listdir(d) if f.endswith(".json")]
@@ -1016,9 +1158,67 @@ def ocr_dir(a):
                  % ("/".join(dirs), a.work, _describe_dirs(a.work, dirs)))
 
     name, d = picked
+
+    # ---- 覆盖页检查：非空 != 完整 ----
+    # 旧逻辑只问"目录里有没有 JSON"。版面分析遇到某张图会**跳过该页并正常退出**，
+    # 于是 ocr_layout/ 可能只有 1 页却仍按优先级压住拥有全书的 ocr_fix/（实测复现）：
+    # 下游 md 只读一个目录，缺的页就是整段正文消失，而终端一行提示都没有。
+    # 这里按 <work>/pages/ 的页图算"这本书需要哪些页"，再算每个候选的页覆盖率。
+    want = {_page_no(f) for f in os.listdir(paths.pages_dir(a.work))
+            if f.lower().endswith(".png")} - {None} \
+        if os.path.isdir(paths.pages_dir(a.work)) else set()
+    if want:
+        # TEXTLAYER_DIR 不参与换源判断：它按设计只放"有正文的页"，缺的页由
+        # ensure_textlayer_coverage 用 OCR 结果补齐，覆盖率天然不到 1.0。
+        # 拿它当"不完整"去降级，等于把 verify 模式的整套设计判成 bug。
+        if name == TEXTLAYER_DIR:
+            cov, _n = _dir_coverage(d, want)
+            if cov < 1.0:
+                print("  提示：%s 覆盖 %d/%d 页（文字层只放有正文的页，缺的页由 "
+                      "ensure_textlayer_coverage 用 OCR 补齐，按设计不换源）"
+                      % (TEXTLAYER_DIR, _n, len(want)))
+        else:
+            cov, have = _dir_coverage(d, want)
+            if cov < 1.0:
+                best = None
+                for other in dirs[dirs.index(name) + 1:]:
+                    od = os.path.join(paths.work_dir(a.work), other)
+                    if not os.path.isdir(od):
+                        continue
+                    oc, oh = _dir_coverage(od, want)
+                    if oc > cov:
+                        best = (other, od, oc, oh)
+                        break
+                if best:
+                    print("  换源：%s 只覆盖 %d/%d 页，顺位更低的 %s 覆盖 %d/%d 页，"
+                          "改用后者" % (name, have, len(want), best[0], best[3], len(want)))
+                    name, d, cov, have = best[0], best[1], best[2], best[3]
+                if cov < 1.0:
+                    # 一个完整的都没有：取**覆盖最高**的那份（不能因为谁都不完整就
+                    # 按优先级随便挑，那会丢掉本来能拿到的页），并且醒目说出来。
+                    ranked = [(name, d, cov, have)]
+                    for other in dirs[dirs.index(name) + 1:]:
+                        od = os.path.join(paths.work_dir(a.work), other)
+                        if not os.path.isdir(od):
+                            continue
+                        oc, oh = _dir_coverage(od, want)
+                        ranked.append((other, od, oc, oh))
+                    ranked.sort(key=lambda x: -x[2])
+                    if ranked[0][0] != name and ranked[0][2] > cov:
+                        print("  换源：所有候选都不完整，改用覆盖最高的 %s（%d/%d 页）"
+                              % (ranked[0][0], ranked[0][3], len(want)))
+                        name, d, cov, have = ranked[0][0], ranked[0][1], ranked[0][2], ranked[0][3]
+                    print("  " + "!" * 68)
+                    print("  没有任何 OCR 结果覆盖整本书：%s 只有 %d/%d 页，"
+                          "%d 页正文会从成书里消失" % (name, have, len(want), len(want) - have))
+                    print("  现状：%s" % "  ".join("%s=%d/%d" % (n, h, len(want))
+                                                  for n, _d, _c, h in ranked))
+                    print("  先补跑 ocr / repair / layout，或加 --ocr-src 指定完整的那份。")
+                    print("  " + "!" * 68)
+
     mine = _dir_freshness(d)
     for other in dirs[dirs.index(name) + 1:]:
-        od = os.path.join(a.work, other)
+        od = os.path.join(paths.work_dir(a.work), other)
         if not os.path.isdir(od):
             continue
         theirs = _dir_freshness(od)
@@ -1036,16 +1236,16 @@ def ocr_dir(a):
     if name == TEXTLAYER_DIR:
         why = []
         for lower in ("ocr_merged", "ocr_fix", "ocr"):
-            od = os.path.join(a.work, lower)
+            od = os.path.join(paths.work_dir(a.work), lower)
             why.append("%s %s" % (lower, "存在" if os.path.isdir(od) else "未生成"))
         print("  正文源: %s（PDF 自带文字层；优先级高于 %s，且没有人工裁决过的 ocr_merged）"
               % (TEXTLAYER_DIR, "、".join(why)))
     elif (getattr(a, "text_layer", "verify") == "verify"
-          and os.path.isdir(os.path.join(a.work, TEXTLAYER_DIR))
+          and os.path.isdir(paths.ocr_dir(a.work, TEXTLAYER_DIR))
           and textlayer_state(a.work)[0]):
         # 选中的若是从文字层派生的目录，得说清楚"其实用的还是文字层的文本"，
         # 否则用户看到"正文源是 ocr_layout"会以为文字层没生效。
-        same = _same_text(d, os.path.join(a.work, TEXTLAYER_DIR))
+        same = _same_text(d, paths.ocr_dir(a.work, TEXTLAYER_DIR))
         if same:
             print("  正文源: %s（由文字层 %s 加 region 标签派生，正文文本仍是文字层的）"
                   % (name, TEXTLAYER_DIR))
@@ -1065,18 +1265,23 @@ def stage_layout_guarded(a):
     「跳过（缺页面图）」，region 一个都没打上，**退出码仍是 0**。
     版面分析是可选增强，这里把它降级成告警而不是让 all 中断。
     """
-    pages = os.path.join(a.work, "pages")
+    pages = paths.pages_dir(a.work)
     src = ocr_dir(a)
     have = set(os.listdir(pages)) if os.path.isdir(pages) else set()
     js = _page_jsons(src)
-    # _page_jsons 给的是 "p-01.png.json"，pages/ 里是 "p-01.png"：必须去掉 .json 再比，
-    # 否则两边永远不相交，版面分析会被误判成"文件名对不上"而整本跳过（实测踩过）。
-    want = {f[:-5] for f in js}
-    if have and want and not (want & have):
+    # 比较**页号**，不是文件名：`_page_jsons` 给的是 "p-001.png.json"，而 pdftoppm
+    # 按页数决定补零位数（9 页的书出 p-1.png，300 页的书出 p-001.png）。
+    # 原来用 want & have 求文件名交集，在**页数 < 100 的书上永远是空集**，
+    # 于是版面分析被整本跳过——而实测 9 页那本书退出码全程是 0，
+    # 只有脚注因此降级成页尾注，从成书上完全看不出来。
+    want_nos = {_page_no(f) for f in js} - {None}
+    have_nos = {_page_no(f) for f in have if f.lower().endswith(".png")} - {None}
+    if have_nos and want_nos and not (want_nos & have_nos):
         print("  " + "!" * 68)
-        print("  版面分析跳过：%s 里的页级 JSON 与 pages/ 里的页图文件名对不上" % os.path.basename(src))
-        print("    JSON 例：%s" % js[0])
-        print("    页图例：%s" % next(iter(sorted(have))))
+        print("  版面分析跳过：%s 里的页级 JSON 与 pages/ 里的页图**页号对不上**"
+              % os.path.basename(src))
+        print("    JSON 页号例：%s" % min(want_nos))
+        print("    页图页号例：%s" % min(have_nos))
         print("  版面分析只是可选增强（脚注/页眉/页码分流），本轮继续出书，只是没有 region。")
         print("  " + "!" * 68)
         return
@@ -1103,20 +1308,24 @@ def stage_layout(a):
     # 而且会让 ocr_layout 的 mtime 永远最新、永久压住更新的 ocr_merged。
     # 但显式 --ocr-src 是用户的明确意图（例如拿旧结果做重入实验），不替他改。
     if not getattr(a, "ocr_src", "") and os.path.basename(os.path.normpath(src)) == "ocr_layout":
-        for name in OCR_DIRS[1:]:
-            cand = os.path.join(a.work, name)
+        # 重选上游必须复用 active_dirs(a)，不能另写一套 OCR_DIRS[1:]：后者是**未过滤**的
+        # 顺序，会把 --text-layer off 已经排除掉的 ocr_text 重新放回候选——用户要求
+        # "回到 OCR 来源"，结果布局又把文字层写进 ocr_layout，后续出书仍用它（实测复现）。
+        dirs = tuple(d for d in active_dirs(a) if d != "ocr_layout")
+        for name in dirs:
+            cand = os.path.join(paths.work_dir(a.work), name)
             if os.path.isdir(cand) and [f for f in os.listdir(cand) if f.endswith(".json")]:
                 print("  布局源改用 %s（避免读自己上一次的输出）" % cand)
                 src = cand
                 break
     elif getattr(a, "ocr_src", "") and os.path.basename(os.path.normpath(src)) == "ocr_layout":
         print("  布局源按 --ocr-src 使用 %s（原地重跑，不自动换源）" % src)
-    dst = os.path.join(a.work, "ocr_layout")
+    dst = paths.ocr_dir(a.work, "ocr_layout")
     if os.path.abspath(src) == os.path.abspath(dst) and not a.force:
         print("  提示：源与输出同为 ocr_layout，run_layout 会跳过已存在的页；"
               "要真正重跑请加 --force")
     cmd = [PY, os.path.join(HERE, "run_layout.py"),
-           "--src", src, "--pages", os.path.join(a.work, "pages"),
+           "--src", src, "--pages", paths.pages_dir(a.work),
            "--dst", dst, "--device", a.device]
     if a.force:
         cmd.append("--force")
@@ -1126,14 +1335,20 @@ def stage_layout(a):
 def stage_md(a):
     ensure_textlayer_coverage(a)
     src = ocr_dir(a)
-    sh([PY, os.path.join(HERE, "make_md.py"),
-        "--src", src, "--out", os.path.join(a.work, "out"),
-        "--title", a.title, "--author", a.author, "--publisher", a.publisher])
+    cmd = [PY, os.path.join(HERE, "make_md.py"),
+           "--src", src, "--out", paths.report_dir(a.work, create=True),
+           "--title", a.title, "--author", a.author, "--publisher", a.publisher]
+    # conservative_fix 一直存在于 make_md.py，但 bookflow 从没往下传过：
+    # docs/architecture.md 说「--conservative-fix 可让单字级只出候选」，
+    # 而 CLI 上根本没有这个开关（这次为 WebUI 的 scan 预设补上）。
+    if getattr(a, "conservative_fix", False):
+        cmd.append("--conservative-fix")
+    sh(cmd)
 
 
 def stage_audit(a):
     """审核：列出"字数正常但字认错"的可疑处，并生成可批量核对的对照图。"""
-    out = os.path.join(a.work, "out")
+    out = paths.report_dir(a.work)
     if not os.path.exists(os.path.join(out, "book.md")):
         sys.exit("audit 需要先跑 md 阶段：找不到 %s" % os.path.join(out, "book.md"))
     sh([PY, os.path.join(HERE, "audit.py"),
@@ -1145,10 +1360,25 @@ def stage_audit(a):
     if os.path.exists(js) and os.path.getsize(js) > 2:
         sh([PY, os.path.join(HERE, "make_review.py"),
             "--audit", js, "--ocr", ocr_dir(a),
-            "--pages", os.path.join(a.work, "pages"),
+            "--pages", paths.pages_dir(a.work),
             "--out", os.path.join(out, "review.png"), "--n", "40"])
     print("  审核清单 -> out/audit.txt，对照图 -> out/review.png（不自动改，需人工/VLM 裁决）")
 
+
+def _deliverable_name(title, ext=".epub"):
+    """交付物文件名：<slug>__<YYYYMMDD><ext>。
+
+    两段各有硬用途（IO-CONVENTIONS §4.2）：
+      * slug 用**清洗过的书名**而不是拼音——拼音要引第三方依赖，违反零依赖约束，
+        而且「章太炎」->「zhang-taiyan」对中文读者毫无可读性；
+      * 日期段让「同一本书哪一版」在文件名里就能看出来。原来的名字只有 <title>.epub，
+        两次运行直接覆盖，回滚只能靠回忆时间点（O2）。
+    清洗只做**去掉文件系统敏感字符**，不改词：书名本身仍完整保存在 OPF 元数据里。
+    """
+    import datetime
+    safe = re.sub(r'[\\/:*?"<>|\r\n\t]', "-", (title or "book").strip()) or "book"
+    safe = re.sub(r"\s+", " ", safe).strip(" .-") or "book"
+    return "%s__%s%s" % (safe[:60], datetime.date.today().strftime("%Y%m%d"), ext)
 
 def stage_epub(a):
     """Markdown → EPUB3。用项目自带的 epub3.py，不用外部脚本。
@@ -1158,13 +1388,13 @@ def stage_epub(a):
     弹窗语义（noteref → aside[epub:type=footnote]），Apple Books / Thorium /
     Kobo 会直接浮层显示，必须自己拼 XML 才能用上。
     """
-    md = os.path.join(a.work, "out", "book.md")
+    md = os.path.join(paths.report_dir(a.work), "book.md")
     if not os.path.exists(md) or os.path.getsize(md) == 0:
         sys.exit("epub 需要非空的 book.md：%s" % md)
     # 元数据回落：md 阶段已把 title/author/publisher 写进 report.json，
     # 这里在命令行没给的时候捡回来——重打包不必每次重新敲作者和出版社。
     book = {}
-    rep_p = os.path.join(a.work, "out", "report.json")
+    rep_p = os.path.join(paths.report_dir(a.work), "report.json")
     if os.path.exists(rep_p):
         try:
             with open(rep_p, encoding="utf-8") as f:
@@ -1174,14 +1404,22 @@ def stage_epub(a):
     title = a.title or book.get("title") or "未命名"
     author = a.author or book.get("author") or ""
     publisher = a.publisher or book.get("publisher") or ""
-    out = os.path.join(a.work, "out", title + ".epub")
+    # 交付物与中间产物分家（IO-CONVENTIONS §3 的四类边界）：
+    #   flat   -> 仍出在 <work>/out/（四个旧目录的既有脚本不受影响）
+    #   tiered -> 出到仓库级 dist/<book-id>/，且文件名带日期段
+    # 两者都出的话会出现「两份 epub 谁是真的」，所以**只出一份**。
+    if paths.layout_of(a.work) == paths.LAYOUT_TIERED:
+        book_id = os.path.basename(os.path.abspath(a.work))
+        out = os.path.join(paths.dist_dir(book_id, create=True), _deliverable_name(title))
+    else:
+        out = os.path.join(paths.report_dir(a.work), title + ".epub")
 
     # 封面先备好，再一次性交给 epub3.py 打包（避免二次改写 zip）
-    cover_jpg = os.path.join(a.work, "out", "cover.jpg")
+    cover_jpg = os.path.join(paths.report_dir(a.work), "cover.jpg")
     if a.cover and os.path.exists(a.cover):
         cover_jpg = a.cover
     elif not os.path.exists(cover_jpg):
-        first = os.path.join(a.work, "pages", "p-001.png")
+        first = os.path.join(paths.pages_dir(a.work), "p-001.png")
         if os.path.exists(first):
             subprocess.run([PY, os.path.join(HERE, "cover.py"), "--page", first,
                             "--jpg", cover_jpg], check=False)
@@ -1208,10 +1446,9 @@ def stage_disagree(a):
     它还需要 jieba 词表，缺依赖时会让跑了半小时 OCR 的全流程死在最后一步。
     """
     check_dict()
-    out = os.path.join(a.work, "out")
-    os.makedirs(out, exist_ok=True)
+    out = paths.report_dir(a.work, create=True)
     src = ocr_dir(a)
-    alt = os.path.join(a.work, a.ocr_alt) if a.ocr_alt else ""
+    alt = os.path.join(paths.work_dir(a.work), a.ocr_alt) if a.ocr_alt else ""
     if not alt or not os.path.isdir(alt):
         sys.exit("disagree 需要第二版 OCR 目录：用 --ocr-alt 指定子目录（相对 --work）。\n"
                  "  现状：%s" % _describe_dirs(a.work))
@@ -1228,9 +1465,8 @@ def stage_decisions(a):
     裁决表是 apply_decisions 的唯一输入。这里只做格式归一，**不做任何裁决**。
     """
     import decisions as dec
-    out = os.path.join(a.work, "out")
-    os.makedirs(out, exist_ok=True)
-    dst = a.out or os.path.join(out, "decisions.json")
+    out = paths.report_dir(a.work, create=True)
+    dst = a.out or paths.decisions_path(a.work)
     src_map = {
         "disagree": os.path.join(out, "disagree.json"),
         "audit": os.path.join(out, "audit.json"),
@@ -1265,8 +1501,8 @@ def stage_table(a):
       python bookflow.py table --work run1                    # 渲染 out/decisions.md
       python bookflow.py table --work run1 --import           # 把表里填的判定合回 JSON
     """
-    out = os.path.join(a.work, "out")
-    dec_path = a.out or os.path.join(out, "decisions.json")
+    out = paths.report_dir(a.work, create=True)
+    dec_path = a.out or paths.decisions_path(a.work)
     cmd = [PY, os.path.join(HERE, "make_table.py"),
            "--decisions", dec_path,
            "--out", os.path.join(out, "decisions.md"),
@@ -1302,7 +1538,7 @@ def stage_prune(a):
     for name, mb in targets.items():
         if name in want:
             continue
-        d = os.path.join(a.work, name)
+        d = os.path.join(paths.work_dir(a.work), name)
         if not os.path.isdir(d):
             continue
         size = sum(os.path.getsize(os.path.join(d, f))
@@ -1313,13 +1549,37 @@ def stage_prune(a):
     print("  共释放 %.1f MB（保留：%s）" % (freed, ", ".join(want) or "无"))
 
 
+def build_args(**kw):
+    """造一个阶段函数认识的 args 命名空间（测试与 WebUI 共用）。
+
+    为什么需要它：阶段函数读 ~BT~a.work / a.dpi / a.text_layer~BT~ 等十几个字段，
+    而 argparse 是唯一的生产者。测试里手写 Namespace 会漏字段（漏一个就是
+    AttributeError，且只在特定分支触发）；WebUI 里手写 Namespace 更危险——
+    它会**猜**参数语义，猜错的表现是"选源悄悄变了"。
+
+    这里直接复用 main() 的默认值，保证只有一处定义。
+    """
+    defaults = {
+        "work": "", "pdf": "", "title": "", "author": "", "publisher": "",
+        "cover": "", "dpi": 300, "procs": 5, "device": "auto", "model": "small",
+        "toc_depth": 3, "ocr_src": "", "force": False, "keep": "",
+        "no_layout": False, "text_layer": "verify", "pages": "",
+        "ocr_alt": "", "from_": "disagree", "out": "", "merge": False,
+        "do_import": "", "only": "eyes", "conservative_fix": False,
+        "limit_pages": 0, "port": 0, "no_open": False,
+        "_explicit_textlayer": False, "stage": "",
+    }
+    defaults.update(kw)
+    return argparse.Namespace(**defaults)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("stage", choices=["render", "textlayer", "ocr", "repair", "layout",
                                       "md", "audit", "epub", "all", "prune", "disagree",
-                                      "decisions", "table", "verify"])
+                                      "decisions", "table", "verify", "ui"])
     ap.add_argument("--pdf", help="源 PDF")
-    ap.add_argument("--work", required=True, help="工作目录")
+    ap.add_argument("--work", default="", help="工作目录（ui 阶段可省略）")
     ap.add_argument("--title", default="")
     ap.add_argument("--author", default="")
     ap.add_argument("--publisher", default="")
@@ -1366,10 +1626,25 @@ def main():
                     help="table 阶段渲染哪些条目：eyes=差异含汉字（默认，"
                          "实测 run-lacan 2825 条里只有 999 条属此类）/ noise=纯标点空白"
                          "/ all=全部")
+    ap.add_argument("--conservative-fix", action="store_true",
+                    help="形近字一律只出候选、正文不动（make_md 的 --conservative-fix）")
+    ap.add_argument("--limit-pages", dest="limit_pages", type=int, default=0,
+                    help="只渲染前 N 页做打样（给 WebUI 的 sample 预设用）。"
+                         "产出的是一本**残书**，只适合看排版，不要拿去交付")
+    ap.add_argument("--port", type=int, default=0, help="ui 阶段：监听端口（0=自动挑）")
+    ap.add_argument("--no-open", action="store_true", help="ui 阶段：不自动打开浏览器")
     a = ap.parse_args()
 
     # 参数校验放在建目录之前：参数错了就一个字节都别写，
     # 否则用户看到的是"多了一个空工作目录 + 一条报错"，还得手工清。
+    # ui 阶段不需要 --work，也不需要 PDF：它起的是本地面板，工作目录从界面里选
+    if a.stage == "ui":
+        sys.path.insert(0, os.path.join(HERE, "webui"))
+        import server as _webui
+        try:
+            return _webui.serve(port=a.port, open_browser=not a.no_open)
+        except OSError as e:
+            sys.exit("WebUI 起不来：%s\n  换个端口试试：--port 8800" % e)
     if a.stage in ("render", "ocr", "textlayer", "all") and not a.pdf:
         sys.exit("render/ocr/textlayer 阶段需要 --pdf")
     # --text-pages 只给 textlayer 单阶段做试跑用。**不能和 all / 下游阶段组合**：
@@ -1382,48 +1657,98 @@ def main():
                  "  局部页跑全流程会产出一本残书，而且 audit/make_review 要按全书页名\n"
                  "  去 pages/ 找图，必然找不到。整本跑请留空 --text-pages。" % a.stage)
 
+    # --work 校验放在 --text-pages 之后：两者都错时，先报出"这个参数组合本身就不成立"，
+    # 那才是真正的原因；先报缺 --work 会让人以为是路径写错了（实测踩过）。
+    if not a.work:
+        sys.exit("%s 阶段需要 --work（ui 阶段除外）" % a.stage)
+
     os.makedirs(a.work, exist_ok=True)
+    # 新工作目录一律建成分层布局；已有目录按原布局（paths.is_tiered 判），
+    # 所以四个旧目录不会因为这一行被就地改造。
+    if not os.listdir(a.work) or paths.is_tiered(a.work):
+        paths.ensure_tiered(a.work)
     # 用户显式点名 textlayer 阶段时，"抽不出来"必须报错而不是悄悄退化——
     # 他本来就是奔着文字层来的，静默降级等于骗他。all 流程里才允许退化（那是加速通道）。
     a._explicit_textlayer = (a.stage == "textlayer")
+    # ---- manifest：这次是怎么跑出来的（不挡路，失败只告警）----
+    stage_manifest.params(a.work, dpi=a.dpi, procs=a.procs, device=a.device,
+                          model=a.model, text_layer=a.text_layer,
+                          no_layout=bool(a.no_layout),
+                          conservative_fix=bool(a.conservative_fix),
+                          toc_depth=a.toc_depth,
+                          limit_pages=a.limit_pages or None)
+    if a.pdf:
+        stage_manifest.inputs(a.work, pdf=a.pdf, title=a.title, author=a.author,
+                              publisher=a.publisher,
+                              pages=pdf_page_count(a.pdf))
+        stage_manifest.check_pdf(a.work, a.pdf, force=a.force)
     if a.stage == "render":
         check_pdftoppm()
     check_env(a.stage, no_layout=a.no_layout)
     if a.stage == "all":
-        stage_render(a)
+        # 每个阶段都过 stage_manifest.stage：它只做旁路记录（ok/degraded/failed + 耗时），
+        # 失败时照常向上抛。没有这层，"跑到哪了"只能靠猜目录（IO-CONVENTIONS §2 O5）。
+        stage_manifest.stage(a.work, "render", lambda: stage_render(a),
+                             count_of=lambda _r: len(_page_jsons(paths.pages_dir(a.work))))
         # 文字层：默认 verify（抽出来与 OCR 交叉验证）；off 时这一段一个字节都不碰。
         tl_ok = False
         if a.text_layer != "off":
-            tl_ok, _st, _why = stage_textlayer(a)
+            tl_ok, _st, _why = stage_manifest.stage(a.work, "textlayer",
+                                                    lambda: stage_textlayer(a))
         if a.text_layer == "only":
             # 只抽文字层，完全不跑 OCR：这是"快 40 倍"的那条路。
             print("  --text-layer only：跳过 ocr / repair（不跑识别）")
+            stage_manifest.note(a.work, "ocr", "skipped", detail="--text-layer only")
+            stage_manifest.note(a.work, "repair", "skipped", detail="--text-layer only")
         else:
             if a.text_layer == "verify" and not tl_ok:
                 print("  文字层不可用 → 本轮自动退化为跑 OCR（等价于 --text-layer off）")
-            stage_ocr(a)
-            stage_repair(a)
+            stage_manifest.stage(a.work, "ocr", lambda: stage_ocr(a),
+                                 count_of=lambda _r: len(_page_jsons(paths.ocr_dir(a.work, "ocr"))))
+            stage_manifest.stage(a.work, "repair", lambda: stage_repair(a),
+                                 count_of=lambda _r: len(_page_jsons(paths.ocr_dir(a.work, "ocr_fix"))))
         if not a.no_layout:
+            # 版面分析是可选增强，失败只告警（stage_layout_guarded 自己吞掉异常），
+            # 所以这里不能用 stage_manifest.stage——它会把"没抛异常"记成 ok。
+            # 改用"跑完再看产物"的方式记录：ocr_layout 里有页才算 ok。
             stage_layout_guarded(a)     # 可选增强：脚注/页眉/页码分流
-        stage_md(a)
+            _n = len(_page_jsons(paths.ocr_dir(a.work, "ocr_layout")))
+            stage_manifest.note(a.work, "layout", "ok" if _n else "skipped", count=_n,
+                                detail="" if _n else "版面分析没有产出页（见上方告警）")
+        else:
+            stage_manifest.note(a.work, "layout", "skipped", detail="--no-layout")
+        stage_manifest.stage(a.work, "md", lambda: stage_md(a))
         # 交叉验证要在 md 之后：md 已经能出，验证只是给人工裁决备料，不能让它挡住出书。
         # 因此这里**兜住所有失败**：缺 jieba、disagree.py 崩、页面对不齐……都只告警。
         # 默认模式把 verify 变成必跑项，一旦它能把整本书挡死，就把"默认安全"变成了
         # "默认更脆"——那正是本条需求最不能接受的方向。
         if a.text_layer == "verify" and tl_ok:
             stage_verify_guarded(a)
-        stage_audit(a)      # 只出清单，不改文本
-        stage_epub(a)
+        else:
+            stage_manifest.note(a.work, "verify", "skipped",
+                                detail="--text-layer %s" % a.text_layer)
+        stage_manifest.stage(a.work, "audit", lambda: stage_audit(a))      # 只出清单，不改文本
+        stage_manifest.stage(a.work, "epub", lambda: stage_epub(a))
         # disagree 不自动跑（需要第二版 OCR），但检出时提醒一声，否则这条通道等于不存在
-        if os.path.isdir(os.path.join(a.work, "ocr_alt")):
+        if os.path.isdir(os.path.join(paths.work_dir(a.work), "ocr_alt")):
             print("\n  提示：检出 ocr_alt，可跑双模型交叉验证：\n"
                   "    python bookflow.py disagree --work %s --ocr-alt ocr_alt" % a.work)
         return
-    {"render": stage_render, "ocr": stage_ocr, "repair": stage_repair,
-     "layout": stage_layout, "md": stage_md, "audit": stage_audit,
-     "epub": stage_epub, "prune": stage_prune, "textlayer": stage_textlayer,
-     "disagree": stage_disagree, "decisions": stage_decisions,
-     "table": stage_table, "verify": stage_verify}[a.stage](a)
+    # 单阶段也记 manifest：重跑一个阶段同样要能在界面上看出"它跑过、跑成什么样"。
+    #
+    # 主干阶段必须**包在 stage_manifest.stage 里**，不能"跑完再补一条 ok"：
+    # 那些阶段函数失败时是 sys.exit(...)，补 ok 那一行根本走不到，
+    # 于是状态永远停在 running（实测：界面显示"正在跑"，日志早就报错退出了）。
+    # prune/table/disagree/decisions 不是出书必经阶段，不包（它们不进进度条）。
+    fn = {"render": stage_render, "ocr": stage_ocr, "repair": stage_repair,
+          "layout": stage_layout, "md": stage_md, "audit": stage_audit,
+          "epub": stage_epub, "prune": stage_prune, "textlayer": stage_textlayer,
+          "disagree": stage_disagree, "decisions": stage_decisions,
+          "table": stage_table, "verify": stage_verify}[a.stage]
+    if a.stage in manifest.STAGES:
+        stage_manifest.stage(a.work, a.stage, lambda: fn(a))
+    else:
+        fn(a)
 
 
 if __name__ == "__main__":

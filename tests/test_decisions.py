@@ -17,6 +17,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -242,6 +243,81 @@ class TestCrossLine(unittest.TestCase):
         self.assertIn("「人狱」→「入狱」", e["note"])
 
 
+class TestSameLineInlineAndCrossLine(unittest.TestCase):
+    """P2：同一行既有行内错词、又有行尾跨行错词时，两份候选必须合成**一条**。
+
+    实测复现（REVIEW-2026-11-18 §4）：页文本 y0=100「错误介人和刚刚人」、
+    y0=180「狱开始」，audit 两项 介人→介入 / 人狱→入狱。旧版跨行命中直接 append，
+    于是同一 key 出现两条，validate() 报「decisions[1] key 重复」拒绝整份文件。
+    """
+
+    def _mk(self):
+        d = tempfile.mkdtemp(prefix="xl2-")
+        self.addCleanup(shutil.rmtree, d, True)
+        ocr = os.path.join(d, "ocr")
+        os.makedirs(ocr)
+        jsonio.write(os.path.join(ocr, "p-001.png.json"),
+                     {"name": "p-001.png", "w": 2000, "h": 3000,
+                      "lines": [{"x0": 100, "y0": 100.0, "x1": 1800, "y1": 160,
+                                 "t": "错误介人和刚刚人", "s": 0.99},
+                                {"x0": 100, "y0": 180.0, "x1": 1800, "y1": 240,
+                                 "t": "狱开始", "s": 0.99}]})
+        return ocr
+
+    AUDIT = [{"wrong": "介人", "right": "介入", "pos": 3, "freq": 1, "page": 1},
+             {"wrong": "人狱", "right": "入狱", "pos": 9, "freq": 1, "page": 1}]
+
+    def test_keys_are_unique_and_valid(self):
+        """同一 key 只能有一条，且整份必须通过 validate。"""
+        doc = dec.from_audit(self.AUDIT, None, self._mk())
+        keys = [e["key"] for e in doc["decisions"]]
+        self.assertEqual(keys, ["p-001.png@100"], "同一行只能有一条裁决")
+        self.assertEqual(dec.validate(doc), [])
+
+    def test_both_replaces_are_applied(self):
+        """叠加后整行要同时含行内替换（介入）与跨行替换（入狱 -> 行尾入）。"""
+        doc = dec.from_audit(self.AUDIT, None, self._mk())
+        e = doc["decisions"][0]
+        self.assertEqual(e["verdict"], "B")
+        self.assertEqual(e["A"], "错误介人和刚刚人")
+        self.assertEqual(e["B"], "错误介入和刚刚入")
+        # 两种说明都要在 note 里（人要知道这一条同时改了两个地方）
+        self.assertIn("介人→介入", e["note"])
+        self.assertIn("人狱", e["note"])
+
+    def test_cross_line_only_still_gives_actionable_b(self):
+        """只有跨行候选时仍按 B 给出定位好的整行（不能因为改成归并就退回 ?）。"""
+        ocr = self._mk()
+        doc = dec.from_audit([{"wrong": "人狱", "right": "入狱", "pos": 9,
+                               "freq": 1, "page": 1}], None, ocr)
+        e = doc["decisions"][0]
+        self.assertEqual(e["verdict"], "B")
+        self.assertEqual(e["y0"], 100.0)
+        self.assertEqual(e["B"], "错误介人和刚刚入")
+
+    def test_conflict_becomes_single_question_entry(self):
+        """两段改法叠加不上时，合成一条 verdict=?（同 key 两条会被 validate 拒绝）。"""
+        d = tempfile.mkdtemp(prefix="xl3-")
+        self.addCleanup(shutil.rmtree, d, True)
+        ocr = os.path.join(d, "ocr")
+        os.makedirs(ocr)
+        jsonio.write(os.path.join(ocr, "p-001.png.json"),
+                     {"name": "p-001.png", "w": 2000, "h": 3000,
+                      "lines": [{"x0": 100, "y0": 100.0, "x1": 1800, "y1": 160,
+                                 "t": "甲乙丙", "s": 0.99},
+                                {"x0": 100, "y0": 180.0, "x1": 1800, "y1": 240,
+                                 "t": "丁戊", "s": 0.99}]})
+        doc = dec.from_audit([{"wrong": "乙丙", "right": "乙己", "pos": 1,
+                               "freq": 1, "page": 1},
+                              {"wrong": "丙丁", "right": "巳丁", "pos": 5,
+                               "freq": 1, "page": 1}], None, ocr)
+        self.assertEqual(len(doc["decisions"]), 1)
+        e = doc["decisions"][0]
+        self.assertEqual(e["verdict"], "?")
+        self.assertIn("同一行有两种改法", e["note"])
+        self.assertEqual(dec.validate(doc), [])
+
+
 class TestMergeAndIO(unittest.TestCase):
     def test_merge_later_wins(self):
         """按 key 合并，后者覆盖前者（重新裁决时以新为准），且保序。"""
@@ -369,6 +445,7 @@ class TestDryRun(unittest.TestCase):
             after = {n: read_bytes(os.path.join(ocr, n))
                      for n in os.listdir(ocr)}
             self.assertEqual(before, after, "dry-run 绝不能改文件")
+            # 备份不能落在被备份的目录内部（O10）：路径必须指向 <work>/.backup/
             self.assertFalse(os.path.exists(os.path.join(ocr, ".bak")))
             s = summary(out)
             self.assertTrue(s["dry_run"])
@@ -402,8 +479,13 @@ class TestApply(unittest.TestCase):
             self.assertIn("mie Verlag，Berlin 1964.（哥特弗利德",
                           [L["t"] for L in got["lines"]])
 
-            # 备份：一次运行一个时间戳目录，且只放本次真要改的页
-            bakroot = os.path.join(ocr, ".bak")
+            # 备份：一次运行一个时间戳目录，且只放本次真要改的页。
+            # **位置**是 $(work)/.backup/<src名>/<ts>/，不再是 <src>/.bak/
+            # （IO-CONVENTIONS §2 O10：备份落在数据目录内部会被 prune 连根删掉）。
+            bakroot = os.path.join(d, ".backup", "ocr_merged")
+            self.assertTrue(os.path.isdir(bakroot), bakroot)
+            self.assertFalse(os.path.exists(os.path.join(ocr, ".bak")),
+                             "备份不许留在被备份的目录里")
             subs = os.listdir(bakroot)
             self.assertEqual(len(subs), 1)
             files = sorted(os.listdir(os.path.join(bakroot, subs[0])))
@@ -470,7 +552,7 @@ class TestApply(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             ocr, dp = _fixture(d)
             run_ap("--work", d, "--decisions", dp, "--apply", "--no-backup")
-            self.assertFalse(os.path.exists(os.path.join(ocr, ".bak")))
+            self.assertFalse(os.path.exists(os.path.join(d, ".backup")))
 
     def test_backup_dir_override(self):
         with tempfile.TemporaryDirectory() as d:

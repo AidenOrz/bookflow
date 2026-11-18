@@ -355,6 +355,95 @@ class TestMergeKeepStatus(unittest.TestCase):
         merged = bookflow._merge_keep_status(old, new)
         self.assertEqual(merged["decisions"][0]["status"], "applied")
 
+    def test_human_verdict_c_survives_rerun(self):
+        """人工填的 C 与替换整行不能被机器新候选(B)覆盖——这是唯一存人判断的地方。"""
+        old = {"version": 1, "source": {}, "match": {},
+               "decisions": [{"key": "p-001.png@100", "page": "p-001.png", "y0": 100.0,
+                              "A": "甲", "B": "乙", "verdict": "C",
+                              "replacement": "人工确认", "level": "L1",
+                              "note": "人看原书定的", "status": "applied"}]}
+        new = {"version": 1, "source": {}, "match": {},
+               "decisions": [{"key": "p-001.png@100", "page": "p-001.png", "y0": 100.0,
+                              "A": "甲", "B": "乙", "verdict": "B",
+                              "replacement": None, "level": "L1", "note": "机器候选",
+                              "status": "pending"}]}
+        e = bookflow._merge_keep_status(old, new)["decisions"][0]
+        self.assertEqual(e["verdict"], "C")
+        self.assertEqual(e["replacement"], "人工确认")
+        self.assertEqual(e["note"], "人看原书定的")
+        # A/B 没变 -> 继续 applied（重跑 verify 不该让 apply 又改一遍）
+        self.assertEqual(e["status"], "applied")
+
+    def test_changed_text_resets_status_to_pending(self):
+        """A/B 变了 -> status 必须回 pending：旧 applied 说的是"这一行已经是 B 了"。"""
+        old = {"version": 1, "source": {}, "match": {},
+               "decisions": [{"key": "p-001.png@100", "page": "p-001.png", "y0": 100.0,
+                              "A": "甲", "B": "乙", "verdict": "C",
+                              "replacement": "人工确认", "level": "L1", "note": "",
+                              "status": "applied"}]}
+        new = {"version": 1, "source": {}, "match": {},
+               "decisions": [{"key": "p-001.png@100", "page": "p-001.png", "y0": 100.0,
+                              "A": "甲甲", "B": "丙丙", "verdict": "B",
+                              "replacement": None, "level": "L1", "note": "",
+                              "status": "pending"}]}
+        e = bookflow._merge_keep_status(old, new)["decisions"][0]
+        self.assertEqual(e["verdict"], "C", "原文变了也不能把人工裁决换掉")
+        self.assertEqual(e["replacement"], "人工确认")
+        self.assertEqual(e["status"], "pending", "旧 applied 不能挂到新内容上")
+        # 新候选的 A/B 仍要刷新，人才能看见"原文变了"
+        self.assertEqual(e["A"], "甲甲")
+
+    def test_human_veto_survives_machine_question(self):
+        """人工否决(A) + 机器这次判不出(?) -> 仍是 A，不能被降级成 ?。"""
+        old = {"version": 1, "source": {}, "match": {},
+               "decisions": [{"key": "p-001.png@100", "page": "p-001.png", "y0": 100.0,
+                              "A": "甲", "B": "乙", "verdict": "A",
+                              "replacement": None, "level": "L1", "note": "人否决",
+                              "status": "applied"}]}
+        new = {"version": 1, "source": {}, "match": {},
+               "decisions": [{"key": "p-001.png@100", "page": "p-001.png", "y0": 100.0,
+                              "A": "甲", "B": "乙", "verdict": "?",
+                              "replacement": None, "level": "L1", "note": "",
+                              "status": "pending"}]}
+        e = bookflow._merge_keep_status(old, new)["decisions"][0]
+        self.assertEqual(e["verdict"], "A")
+        self.assertEqual(e["note"], "人否决")
+
+    def test_unjudged_entry_takes_new_candidate(self):
+        """旧的是 ? 且没跑过 -> 用新候选（不能因为"保留人工"把备料永远冻住）。"""
+        old = {"version": 1, "source": {}, "match": {},
+               "decisions": [{"key": "p-001.png@100", "page": "p-001.png", "y0": 100.0,
+                              "A": "甲", "B": "乙", "verdict": "?", "replacement": None,
+                              "level": "L1", "note": "", "status": "pending"}]}
+        new = {"version": 1, "source": {}, "match": {},
+               "decisions": [{"key": "p-001.png@100", "page": "p-001.png", "y0": 100.0,
+                              "A": "甲", "B": "乙", "verdict": "B", "replacement": None,
+                              "level": "L1", "note": "机器判 B", "status": "pending"}]}
+        e = bookflow._merge_keep_status(old, new)["decisions"][0]
+        self.assertEqual(e["verdict"], "B")
+        self.assertEqual(e["note"], "机器判 B")
+
+    def test_stale_warning_lists_keys(self):
+        """原文变了要在终端说清是哪几条（一行，最多 10 个 key），但不能 sys.exit。"""
+        import io
+        from contextlib import redirect_stdout
+        ents_old = [{"key": "p-%03d.png@1" % i, "page": "p-%03d.png" % i, "y0": 1.0,
+                     "A": "旧", "B": "旧乙", "verdict": "B", "replacement": None,
+                     "level": "L1", "note": "", "status": "applied"}
+                    for i in range(1, 13)]
+        ents_new = [dict(e, A="新甲", B="新乙", status="pending") for e in ents_old]
+        old = {"version": 1, "source": {}, "match": {}, "decisions": ents_old}
+        new = {"version": 1, "source": {}, "match": {}, "decisions": ents_new}
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            merged = bookflow._merge_keep_status(old, new)
+        out = buf.getvalue()
+        self.assertEqual(len(out.strip().splitlines()), 1, "告警必须只占一行")
+        self.assertIn("等 2 条", out)          # 12 条只列前 10 条
+        self.assertIn("p-001.png@1", out)
+        self.assertNotIn("p-012.png@1", out)
+        self.assertEqual({e["status"] for e in merged["decisions"]}, {"pending"})
+
     def test_new_entries_kept(self):
         old = {"decisions": [{"key": "p-001.png@100", "page": "p-001.png", "y0": 100.0,
                               "verdict": "B", "status": "applied"}]}
@@ -363,6 +452,145 @@ class TestMergeKeepStatus(unittest.TestCase):
         merged = bookflow._merge_keep_status(old, new)
         keys = {e["key"] for e in merged["decisions"]}
         self.assertEqual(keys, {"p-001.png@100", "p-002.png@200"})
+
+
+# ---------------------------------------------------------------------------
+# 渲染与选源的完整性（非空 != 完整）
+# ---------------------------------------------------------------------------
+
+class TestRenderAndSourceCompleteness(unittest.TestCase):
+    """P1：非空目录被当成完整产物，中断续跑会缺页出书。
+
+    实测复现：pages/ 只有 p-001.png 时 stage_render() 根本不调用渲染命令；
+    ocr_layout/ 只有第 1 页、ocr_fix/ 有第 1、2 页时仍按优先级选了 ocr_layout。
+    """
+
+    def setUp(self):
+        self.work = mk_work()
+
+    def tearDown(self):
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    def _pages(self, *nos, padding=3):
+        d = os.path.join(self.work, "pages")
+        os.makedirs(d, exist_ok=True)
+        for n in nos:
+            open(os.path.join(d, ("p-%0" + str(padding) + "d.png") % n), "wb").close()
+
+    def _render(self, n_pdf):
+        """跑 stage_render()，返回截获到的 sh() 命令列表（空 = 没渲染，即跳过）。"""
+        calls = []
+        a = args(self.work, "off", pdf=os.path.join(self.work, "x.pdf"))
+        a.dpi = 300
+        with mock.patch.object(bookflow, "pdf_page_count", lambda p: n_pdf), \
+                mock.patch.object(bookflow, "sh", lambda cmd, **kw: calls.append(cmd)), \
+                mock.patch("sys.stdout"):
+            bookflow.stage_render(a)
+        return calls
+
+    def test_partial_pages_still_renders(self):
+        """只有第 1 页、PDF 有 3 页 -> 必须渲（pdftoppm 会把缺的页补齐），不能跳过。"""
+        self._pages(1)
+        self.assertEqual(len(self._render(3)), 1, "缺页时不能当已完成")
+
+    def test_complete_pages_skips(self):
+        """1..3 页都在 -> 跳过（否则每次续跑都要重渲整本）。"""
+        self._pages(1, 2, 3)
+        self.assertEqual(self._render(3), [])
+
+    def test_unknown_page_count_falls_back_to_nonempty(self):
+        """页数读不到（没 pdfinfo / 没 pypdf）-> 退回"非空即跳过"，不能因此失败。"""
+        self._pages(1)
+        self.assertEqual(self._render(None), [])
+
+    def test_limit_pages_sample_is_idempotent(self):
+        """--limit-pages 打样时，期望页集合只到 N，不能每次续跑都重渲一遍。"""
+        self._pages(1, 2)
+        calls = []
+        a = args(self.work, "off", pdf="x.pdf")
+        a.dpi = 300
+        a.limit_pages = 2
+        with mock.patch.object(bookflow, "pdf_page_count", lambda p: 300), \
+                mock.patch.object(bookflow, "sh", lambda cmd, **kw: calls.append(cmd)), \
+                mock.patch("sys.stdout"):
+            bookflow.stage_render(a)
+        self.assertEqual(calls, [], "打样 2 页已渲完，不该再渲")
+
+    def test_force_always_renders(self):
+        """--force 行为不变：完整也重渲。"""
+        self._pages(1, 2, 3)
+        calls = []
+        a = args(self.work, "off", pdf="x.pdf", force=True)
+        a.dpi = 300
+        with mock.patch.object(bookflow, "pdf_page_count", lambda p: 3), \
+                mock.patch.object(bookflow, "sh", lambda cmd, **kw: calls.append(cmd)), \
+                mock.patch("sys.stdout"):
+            bookflow.stage_render(a)
+        self.assertEqual(len(calls), 1)
+
+    def test_pdf_page_count_without_tools_returns_none(self):
+        """两条路都不可用时返回 None，绝不 sys.exit（pypdf 是可选依赖）。"""
+        with mock.patch("shutil.which", lambda n: None), \
+                mock.patch.dict(sys.modules, {"pypdf": None}):
+            self.assertIsNone(bookflow.pdf_page_count(__file__))
+
+    def test_ocr_dir_prefers_complete_source(self):
+        """ocr_layout 只 1 页、ocr_fix 有 1、2 页 -> 必须换到 ocr_fix（实测复现）。"""
+        self._pages(1, 2)
+        write_page(os.path.join(self.work, "ocr_layout"), "p-001.png", cjk(300))
+        write_page(os.path.join(self.work, "ocr_fix"), "p-001.png", cjk(300))
+        write_page(os.path.join(self.work, "ocr_fix"), "p-002.png", cjk(300))
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            picked = bookflow.ocr_dir(args(self.work, "off"))
+        self.assertEqual(os.path.basename(os.path.normpath(picked)), "ocr_fix")
+        self.assertIn("换源", buf.getvalue())
+
+    def test_ocr_dir_without_pages_dir_keeps_old_behaviour(self):
+        """没有 pages/ 时跳过覆盖率检查，仍选 ocr_layout（老测试与老工作目录不能被打挂）。"""
+        write_page(os.path.join(self.work, "ocr_layout"), "p-001.png", cjk(300))
+        write_page(os.path.join(self.work, "ocr_fix"), "p-001.png", cjk(300))
+        write_page(os.path.join(self.work, "ocr_fix"), "p-002.png", cjk(300))
+        picked = bookflow.ocr_dir(args(self.work, "off"))
+        self.assertEqual(os.path.basename(os.path.normpath(picked)), "ocr_layout")
+
+    def test_ocr_text_not_swapped_out(self):
+        """ocr_text 按设计只放有正文的页，覆盖率<1 只提示、不换源。"""
+        self._pages(1, 2, 3)
+        write_page(os.path.join(self.work, bookflow.TEXTLAYER_DIR), "p-001.png", cjk(300))
+        write_page(os.path.join(self.work, "ocr_fix"), "p-001.png", cjk(300))
+        write_page(os.path.join(self.work, "ocr_fix"), "p-002.png", cjk(300))
+        write_page(os.path.join(self.work, "ocr_fix"), "p-003.png", cjk(300))
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            picked = bookflow.ocr_dir(args(self.work, "verify"))
+        self.assertEqual(os.path.basename(os.path.normpath(picked)),
+                         bookflow.TEXTLAYER_DIR)
+        self.assertIn("按设计不换源", buf.getvalue())
+
+    def test_layout_source_respects_text_layer_off(self):
+        """P2：layout 换源必须走 active_dirs —— off 模式下不许把 ocr_text 又捡回来。"""
+        self._pages(1, 2)
+        for name in (bookflow.TEXTLAYER_DIR, "ocr_fix", "ocr_layout"):
+            write_page(os.path.join(self.work, name), "p-001.png", cjk(300))
+            write_page(os.path.join(self.work, name), "p-002.png", cjk(300))
+        a = args(self.work, "off", force=True)
+        a.device = "cpu"
+        calls = []
+        with mock.patch.object(bookflow, "sh_capture",
+                               lambda cmd, **kw: (0, "")), \
+                mock.patch.object(bookflow, "sh", lambda cmd, **kw: calls.append(cmd)), \
+                mock.patch("sys.stdout"):
+            bookflow.stage_layout(a)
+        cmd = calls[-1]
+        src = cmd[cmd.index("--src") + 1]
+        self.assertNotEqual(os.path.basename(os.path.normpath(src)),
+                            bookflow.TEXTLAYER_DIR,
+                            "off 模式下 layout 又把文字层当上游读了")
 
 
 # ---------------------------------------------------------------------------

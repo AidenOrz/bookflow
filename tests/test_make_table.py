@@ -42,6 +42,15 @@ def ent(page, y0, A, B, verdict="?", note="", status="pending"):
     return dec.make_decision(page, y0, A=A, B=B, verdict=verdict, note=note, status=status)
 
 
+def write_page(d, name, text):
+    """造一页最小页级 JSON（回填计划要按 y0 找到行）。"""
+    os.makedirs(d, exist_ok=True)
+    jsonio.write(os.path.join(d, name + ".json"),
+                 {"name": name, "w": 2000, "h": 3000,
+                  "lines": [{"x0": 100, "y0": 732.5, "x1": 1800, "y1": 790,
+                             "t": text, "s": 0.99}]})
+
+
 def run_main(*args):
     """跑 make_table.main()，返回 (退出码, stdout, stderr)。"""
     out, err = io.StringIO(), io.StringIO()
@@ -207,6 +216,111 @@ class TestValidation(unittest.TestCase):
                 lines[i] = "|" + "|".join(cells) + "|"
         _, errors = mt.parse("\n".join(lines))
         self.assertTrue(any("必须留空" in e for e in errors))
+
+
+class TestColumnCount(unittest.TestCase):
+    """P2：多列同样必须拒绝——多列最常见的来源是 C 的整行里写了没转义的竖线。"""
+
+    def test_unescaped_pipe_in_replacement_is_rejected(self):
+        """整行里裸写竖线 -> 列数变 8，必须报错并把「写成 \\|」写进提示。"""
+        md = ("| `p-001.png@100` | p-001 | 原文 | 建议 | 100 | C | 左边|右边 |")
+        rows, errors = mt.parse(md)
+        self.assertEqual(rows, [], "多列不能照常读前 7 列（会把整行截断）")
+        self.assertTrue(errors, "多列必须报错")
+        self.assertIn("列数", errors[0])
+        self.assertIn("\\|", errors[0])
+
+    def test_extra_columns_do_not_truncate_replacement(self):
+        """列数不足仍然报错（旧行为不能丢）。"""
+        md = ("| `p-001.png@100` | p-001 | 原文 | 建议 | 100 | C |")
+        rows, errors = mt.parse(md)
+        self.assertEqual(rows, [])
+        self.assertTrue(errors)
+
+
+class TestUnlocatedNeedsY0(unittest.TestCase):
+    """P2：未定位条目的填表提示必须要求补真实行 y0，否则导入成功、正文不变。"""
+
+    def _doc(self):
+        un = dec.make_decision(2, None, A="", B="", verdict="?",
+                               note="未定位行：p-002.png.json 里没有含「介人」的行；"
+                                    "建议人工翻原书核对「介人」→「介入」")
+        return doc_of(un)
+
+    def _render_and_fill(self, verdict="C", y0="732.5", repl="狱还是即将出狱"):
+        md = mt.render(self._doc())
+        lines = md.splitlines()
+        for i, L in enumerate(lines):
+            if L.startswith("| `p-002.png@?`"):
+                cells = mt._split_row(L)
+                cells[mt.COL_VERDICT] = verdict
+                cells[mt.COL_REPL] = repl
+                cells[mt.COL_Y0] = y0
+                lines[i] = "|" + "|".join(cells) + "|"
+        return md, "\n".join(lines)
+
+    def test_instructions_demand_real_y0(self):
+        """渲染出的说明不能再要求"y0 留空"。"""
+        md = mt.render(self._doc())
+        self.assertIn("行 y0", md)
+        self.assertIn("必须", md)
+        self.assertNotIn("「行 y0」留空", md)
+
+    def test_fill_y0_leads_to_apply(self):
+        """按新说明填 C + 替换整行 + y0 -> parse/merge/plan 得到 kind=apply。"""
+        import apply_decisions as ap
+        _, filled = self._render_and_fill()
+        rows, errors = mt.parse(filled)
+        self.assertEqual(errors, [])
+        doc = self._doc()
+        got = mt.merge_into(doc, rows)
+        self.assertEqual(len(got), 2, "没有错误时保持旧的两元返回")
+        n, unknown = got
+        self.assertEqual((n, unknown), (1, []))
+        e = doc["decisions"][0]
+        self.assertEqual(e["y0"], 732.5)
+        self.assertEqual(e["verdict"], "C")
+        self.assertEqual(e["replacement"], "狱还是即将出狱")
+        # 真跑一遍回填计划：必须判 apply，而不是 missing
+        with tempfile.TemporaryDirectory() as d:
+            ocr = os.path.join(d, "ocr_merged")
+            write_page(ocr, "p-002.png", "狱还是即将出出狱")   # 原书的错字行
+            items, _ = ap.plan(doc, ocr)
+        self.assertEqual([it["kind"] for it in items], ["apply"])
+
+    def test_missing_y0_is_an_error(self):
+        """填了 C 却没补 y0 -> merge 返回具体错误，CLI 整份不写并退出 2。"""
+        _, filled = self._render_and_fill(y0="")
+        rows, errors = mt.parse(filled)
+        self.assertEqual(errors, [])
+        doc = self._doc()
+        got = mt.merge_into(doc, rows)
+        self.assertEqual(len(got), 3, "有错时必须带回 errors")
+        n, unknown, errs = got
+        self.assertEqual(n, 0)
+        self.assertTrue(any("行 y0" in e for e in errs), errs)
+
+    def test_cli_exit_code_2_when_y0_missing(self):
+        with tempfile.TemporaryDirectory() as d:
+            dp = os.path.join(d, "decisions.json")
+            dec.write(dp, self._doc())
+            md = os.path.join(d, "decisions.md")
+            rc, _, _ = run_main("--decisions", dp, "--out", md)
+            self.assertEqual(rc, 0)
+            text = jsonio.read_text(md)
+            lines = text.splitlines()
+            for i, L in enumerate(lines):
+                if L.startswith("| `p-002.png@?`"):
+                    cells = mt._split_row(L)
+                    cells[mt.COL_VERDICT] = "C"
+                    cells[mt.COL_REPL] = "狱还是即将出狱"
+                    lines[i] = "|" + "|".join(cells) + "|"
+            jsonio.write_text(md, "\n".join(lines))
+            before = jsonio.read_text(dp)
+            rc, out, err = run_main("--decisions", dp, "--out", md, "--import", md)
+            self.assertEqual(rc, 2, out + err)
+            self.assertIn("行 y0", err)
+            self.assertEqual(before, jsonio.read_text(dp), "整份不写")
 
 
 class TestMerge(unittest.TestCase):

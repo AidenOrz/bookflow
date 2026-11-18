@@ -270,6 +270,36 @@ def find_cross_line(ocr_dir, page, wrong, right):
     return None
 
 
+def _overlay_line(target, cross_new, wrong, right):
+    """把"跨行替换算出来的整行"叠加到"行内替换算出来的整行"上。
+
+    返回 (叠加后的整行, None) 或 (None, 不能叠加的原因)。
+
+    为什么不能直接拼：两条建议给出的都是**这一行**的样子，各自以原文 A 为底稿。
+    跨行条目改的是这一行末尾的那半截词（前半截错）或行首那半截（后半截错）——
+    find_cross_line 已经把"改哪一行"定死了，所以这里只在行内结果里找那半截、
+    换成跨行结果里的对应半截。
+
+    必须唯一命中：同一个字在行里出现两次时（实测「…刚刚人」里有两个人），
+    猜错一个就是改坏正文，宁可返回"不能叠加"让人看。
+    """
+    wrong, right = wrong or "", right or ""
+    if not target or not wrong:
+        return None, "行内替换后的整行为空"
+    for k in range(len(wrong) - 1, 0, -1):
+        head = wrong[:k]
+        if cross_new.endswith(right[:k]) and len(cross_new) >= k:
+            # 跨行条目落的是**前半截**（在行尾）：把行内结果末尾的 head 换成 right[:k]
+            if not target.endswith(head) or target.count(head) != 1:
+                continue
+            return target[: len(target) - k] + right[:k], None
+        if cross_new.startswith(right[k:]) and target.startswith(head) \
+                and target.count(head) == 1:
+            # 跨行条目落的是**后半截**（在行首）：把行内结果开头的 head 换成 right[:k]
+            return right[:k] + target[k:], None
+    return None, "行内替换后的「%s」里找不到跨行那段「%s」" % (target, wrong)
+
+
 def from_audit(audit_list, report_json_path=None, ocr_dir=""):
     """audit.json（词表可疑字）-> decisions。audit 只出清单、不自动改，这里补上回路。
 
@@ -313,19 +343,31 @@ def from_audit(audit_list, report_json_path=None, ocr_dir=""):
             cross = find_cross_line(ocr_dir, page, wrong, right) if page is not None else None
             if cross:
                 L, new = cross
-                out.append(make_decision(
-                    page, L.get("y0"), A=L.get("t") or "", B=new,
-                    verdict="B", replacement=None, level="L1",
-                    # note 里必须带「X」→「Y」这个词对：make_table 用它分组，
-                    # 否则跨行条目会按"差异段"分到别的组里去（实测把
-                    # 「人狱→入狱」混进了「介人→介入」的组，组头一填就一起改了）。
-                    # 也要说清到底改哪一行：错字可能在前半截（本行）也可能在后半截（下一行）。
-                    note="跨行定位：「%s」→「%s」（词被行长切断，%s）；"
-                         "整行覆盖只作用在错误那一行，另一半留在原来的行"
-                         % (wrong, right,
-                            "错字是前半截，就在本行"
-                            if L is not None and (L.get("t") or "").endswith(wrong[:1])
-                            else "错字是后半截，落在下一行")))
+                page = page_name(page)
+                k = key_of(page, L.get("y0"))
+                g = grouped.get(k)
+                if g is None:
+                    g = grouped[k] = {"page": page, "y0": L.get("y0"),
+                                      "A": L.get("t") or "", "B": L.get("t") or "",
+                                      "pairs": [], "freq": [], "cross": []}
+                # 跨行候选**必须走同一套按行归并**：同一行完全可能既有行内错词、
+                # 又有行尾被切断的跨行错词。旧版这里直接 out.append，于是同一 key
+                # 出现两条，validate() 报「key 重复」拒绝整份（实测复现：
+                # 「错误介人和刚刚人」+「狱开始」，audit 两项 介人→介入 / 人狱→入狱）。
+                #
+                # note 里必须带「X」→「Y」这个词对：make_table 用它分组，
+                # 否则跨行条目会按"差异段"分到别的组里去（实测把「人狱→入狱」
+                # 混进了「介人→介入」的组，组头一填就一起改了）。
+                # 也要说清到底改哪一行：错字可能在前半截（本行）也可能在后半截（下一行）。
+                g["cross"].append({
+                    "wrong": wrong, "right": right, "new": new,
+                    "note": "跨行定位：「%s」→「%s」（词被行长切断，%s）；"
+                            "整行覆盖只作用在错误那一行，另一半留在原来的行"
+                            % (wrong, right,
+                               "错字是前半截，就在本行"
+                               if L is not None and (L.get("t") or "").endswith(wrong[:1])
+                               else "错字是后半截，落在下一行"),
+                })
                 continue
             if page is None:
                 why = "缺页码映射（report.json 的 layout.page_map），无法定位到页"
@@ -346,8 +388,10 @@ def from_audit(audit_list, report_json_path=None, ocr_dir=""):
         k = key_of(page, L.get("y0"))
         g = grouped.get(k)
         if g is None:
+            # "cross" 也要在这里初始化：跨行命中可能先建组、行内命中后合进来，
+            # 反过来也可能（同一行既有行内错词又有行尾跨行错词）。
             g = grouped[k] = {"page": page, "y0": L.get("y0"), "A": t, "B": t,
-                              "pairs": [], "freq": []}
+                              "pairs": [], "freq": [], "cross": []}
         if wrong in g["B"]:            # 同一处被重复命中，只叠一次替换
             g["B"] = g["B"].replace(wrong, right, 1)
             g["pairs"].append("%s→%s" % (wrong, right))
@@ -357,12 +401,50 @@ def from_audit(audit_list, report_json_path=None, ocr_dir=""):
 
     for k, g in grouped.items():
         pairs = "、".join(g["pairs"])
-        note = "audit 词表建议 %s；需看图确认" % pairs
+        note = "audit 词表建议 %s；需看图确认" % pairs if pairs else "需看图确认"
         if g.get("multi"):
             note += "；本页有 %d 行含该词，取首行" % g["multi"]
-        out.append(make_decision(
-            g["page"], g["y0"], A=g["A"], B=g["B"],
-            verdict="B", replacement=None, level="L1", note=note))
+        cross = g.get("cross") or []
+        if not cross:
+            out.append(make_decision(
+                g["page"], g["y0"], A=g["A"], B=g["B"],
+                verdict="B", replacement=None, level="L1", note=note))
+            continue
+        # 同一行既有行内替换、又有跨行替换：先算出"行内替换后的整行"，
+        # 再在这个结果上叠加跨行替换。两者都以这一行的 A 为底稿，
+        # 直接相加等于互相覆盖一半（实测的错法）。
+        base = g["B"] if g["pairs"] else g["A"]
+        target, ok, extra = base, True, []
+        for c in cross:
+            cand, why = _overlay_line(target, c["new"], c["wrong"], c["right"])
+            if cand is not None:
+                target = cand
+            else:
+                ok = False
+                extra.append(why)
+        if ok:
+            out.append(make_decision(
+                g["page"], g["y0"], A=g["A"], B=target,
+                verdict="B", replacement=None, level="L1",
+                note="；".join([note] + [c["note"] for c in cross])))
+        elif not g["pairs"]:
+            # 这一行**只有**跨行建议（叠加失败只可能是页里找不到它的上下文）：
+            # 仍然按 B 给出定位好的那一行，别把人能直接用的建议降级成 "?"。
+            out.append(make_decision(
+                g["page"], g["y0"], A=g["A"], B=cross[0]["new"],
+                verdict="B", replacement=None, level="L1",
+                note="；".join([note] + [cross[0]["note"]])))
+        else:
+            # 行内替换与跨行替换无法安全叠加：合成**一条** verdict="?"（同 key 两条会被
+            # validate 拒绝），A/B 都留空，写清两种改法各自是什么，让人裁决。
+            out.append(make_decision(
+                g["page"], g["y0"], A="", B="", verdict="?", replacement=None,
+                level="L3",
+                note="同一行有两种改法，须人工裁决：①行内 %s → 「%s」；②跨行 %s"
+                     "（按行内替换先算，叠加后仍不等于期望：%s）"
+                     % (pairs or "（无）", base,
+                        "；".join(c["note"] for c in cross),
+                        "、".join(extra) or "结果不一致")))
     return _doc(out, queue_from="audit")
 
 

@@ -41,7 +41,8 @@ sys.path.insert(0, HERE)
 
 import jsonio                     # noqa: E402
 import decisions as dec           # noqa: E402
-import pagedoc                    # noqa: E402
+import pagedoc
+import paths                    # noqa: E402
 import stdio                      # noqa: E402
 
 # 回填目标目录：相对 --work
@@ -282,7 +283,15 @@ def backup_dir_for(src, decisions_path, backup_dir=None):
     旧版是 p-xxx.json.bak、且只在第一次创建——第二次运行不刷新，回滚拿到的是
     最老的一份，等于没有备份。时间戳目录保证每次运行的"改动前快照"都在。
     """
-    root = backup_dir or os.path.join(src, ".bak")
+    if backup_dir:
+        root = backup_dir
+    else:
+        # 备份不能落在被备份的目录内部（IO-CONVENTIONS §2 O10 / §9.5）：
+        # 旧路径 <src>/.bak/ 是数据目录的子目录，只看顶层的统计看不见它，
+        # 而 prune 删掉整个 ocr_merged 时会连备份一起删（实测过）。
+        # 统一落到 <work>/.backup/<src名>/：数据目录里只剩页文件，备份活过一次 prune。
+        s = os.path.abspath(src.rstrip("/\\"))
+        root = os.path.join(os.path.dirname(s), ".backup", os.path.basename(s))
     stamp = time.strftime("%Y%m%d-%H%M%S")
     name = os.path.basename(decisions_path) or "decisions.json"
     return os.path.join(root, "%s-%s" % (stamp, name))
@@ -440,8 +449,14 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     work = os.path.abspath(a.work)
-    src = a.src if os.path.isabs(a.src) else os.path.join(work, a.src)
-    decisions_path = a.decisions or os.path.join(work, "out", "decisions.json")
+    # --src 是"OCR 子目录名"，实际位置由布局决定（tiered 在 work/ 下，flat 在根下）。
+    # 直接 os.path.join(work, a.src) 对分层布局是错的：会拼成 <run>/ocr_layout，
+    # 而它在 <run>/work/ocr_layout —— 表现为"找不到 OCR 目录"、退出码 1，
+    # 而 WebUI 那边只看到"作业失败"（实测踩了这一下）。
+    src = a.src if os.path.isabs(a.src) else os.path.join(paths.work_dir(work), a.src)
+    # 裁决表位置也由布局决定：tiered 在 review/decisions.json，flat 在 out/decisions.json。
+    # 写死 out/ 会让分层布局的书"找不到裁决表"——而这正是全项目唯一不可重建的产物。
+    decisions_path = a.decisions or paths.decisions_path(work)
 
     # ---- 迁移分支 ----
     if a.export_legacy is not None:
