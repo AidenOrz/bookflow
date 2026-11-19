@@ -332,9 +332,15 @@ EPUB3 有专门的脚注语义，主流阅读器（Apple Books / Thorium / Kobo�
 python -m unittest discover -s tests -v
 ~~~
 
-298 个用例（test_layout 55 + test_textlayer 56 + test_decisions 39 + test_textlayer_cli 38 +
-test_make_table 23 + test_outline_robust 23 + test_pdf_robust 20 + test_pagedoc 17 + test_epub3 16 +
-test_smallfixes 11），
+**303 个用例**（test_textlayer_cli 53 + test_decisions 35 + test_layout 35 + test_textlayer 28 +
+test_migrate_layout 20 + test_stage_run 17 + test_paths 15 + test_webui 14 + test_make_table 13 +
+test_outline_robust 13 + test_epub3 12 + test_layout_tiers 11 + test_manifest_stage 11 +
+test_pagedoc 11 + test_pdf_robust 11 + test_smallfixes 4）。
+
+用例数少不代表查得少：同一判据的正例/反例/边界合进一个方法用 `subTest` 分跑。
+按「实际执行的断言次数」对账，**303 个用例执行 2483 次断言**，比合并前
+450 个用例的 2473 次还多 10 次。
+
 全部来自真实踩过的坑（正文首行被当书眉删、标题残片漏消费、重复页、
 空输入静默成功、fix 规则误伤、脚注误连、EPUB 断链、单页目录判不出、
 「第X部分」被压平到与「第X章」同级、章节撞到分部扉页、星号注错配、

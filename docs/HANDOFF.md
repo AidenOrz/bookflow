@@ -70,6 +70,35 @@ textlayer——而那一步跑了还是 10 汉字/页。所以理由先算出来
 > （ocr_text 里一页 JSON 都没有）：每页平均只有 10.0 个汉字（阈值 50）：
 > 文字层要么是纯扫描件（实测 0），要么只剩页眉/页码（实测 10 汉字/页）
 
+### 4. 测试精简：450 → 303 个用例，验证能力不减反增
+
+450 个用例里 293 个只有 ≤2 条断言，大量「一个类一个方法」的散装类
+（`test_epub3` 曾 12 个类、每类 1 个方法）。同一判据的正例/反例/边界被拆成
+三四个方法，读的人得挨个点开才知道这一层保证什么。
+
+按**判据**归并：同一判据的多组输入合进一个方法，用 `subTest` 分跑。
+合并的是方法个数，不是断言。
+
+**硬证据**（在运行期给 `TestCase.assert*` 打补丁统计实际执行次数，含 subTest 循环）：
+
+| 项 | 改前 | 改后 |
+|---|---|---|
+| 用例 | 450 | **303**（−33%） |
+| 实际执行断言 | 2473 | **2483**（+10） |
+
+只数语句行数不算数——一个 `assertEqual` 放进 for 循环里执行 6 次，语句 1 行
+但检查了 6 组输入。
+
+合并过程中被逼出三个真问题（都不是数字好看的问题）：
+`TestCoverTitleEscaping` 复用同一个 epub 时 `cover.inject` 对已存在 cover.xhtml
+的包是**跳过而非覆盖**，断言读到的是上一个书名；`TestLayoutGuard` 一个用例里
+seed 两轮时上一轮文件残留，**反例的前提根本没成立**（只有断言是绿的）；
+`epub3.validate()` 被写到 `TemporaryDirectory` 的 with 块外，临时文件已删。
+
+**刻意没做**：没删任何断言（少数字段反而是补齐的）；没动
+`test_textlayer_cli` / `test_manifest_stage` / `test_migrate_layout`——
+它们本来就是「一个方法一个场景」，没有同形可合并的。
+
 ### 顺手修的两个
 
 - **空态被挤进 200px 分组栏**：`.pr-body` 是三栏 grid，`clear(body)` 后直接 append
@@ -81,7 +110,7 @@ textlayer——而那一步跑了还是 10 汉字/页。所以理由先算出来
 ### 验收（全部实跑）
 
 ```powershell
-python -X utf8 -m unittest discover -s tests -q     # Ran 450 tests ... OK (skipped=3)
+python -X utf8 -m unittest discover -s tests -q     # Ran 303 tests ... OK (skipped=2)
 Get-FileHash runs\hegel\report\book.md,runs\lacan\report\book.md,runs\guixun\report\book.md,runs\sengguan\report\book.md -Algorithm SHA256
 # 320A586E / 457413BA / E5053BDD / 0BA1E017（四条逐字节未变）
 # runs/lacan/review/decisions.json = 87547EA9, 1157481 字节（未变）
