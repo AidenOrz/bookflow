@@ -106,6 +106,27 @@
   font-size: var(--fs-xs); color: var(--fg-muted);
   line-height: 1.45;
 }
+/* 跑不了：理由必须写在行内。只挂 title 等于没写——鼠标不悬停就永远看不见，
+   而这条理由正是它跑不了的原因（如文字层不可用、源 PDF 已不在本机）。
+   注意它不只属于「未跑」：跑过的阶段同样可能已经跑不动了（四本书的 render 都是
+   状态 ok 但源 PDF 不在了），所以这条样式不能挂在 .pg-stage.is-missing 下面。 */
+.pg-stage-why {
+  margin-top: var(--sp-1);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  color: var(--warn);
+}
+/* 已跑过但现在重跑不了（产物齐全，只是源 PDF 不在了之类）：
+   这件事不需要人去处理，用次要文字色，别和「永远跑不出来」一个强调等级。 */
+.pg-stage-why.is-done { color: var(--fg-faint); }
+/* 禁用的「运行」仍要能悬停出 title：base.css 的 .btn[disabled] 是 pointer-events:none，
+   那样鼠标扫过去连理由都不弹。视觉上仍保持禁用态（不可点）。 */
+.pg-rerun:disabled {
+  opacity: .45;
+  color: var(--fg-faint);
+  pointer-events: auto;
+  cursor: not-allowed;
+}
 
 /* 执行中的旋转指示 */
 .pg-spin {
@@ -119,6 +140,10 @@
 
 .pg-rerun { flex: 0 0 auto; margin-left: var(--sp-2); opacity: .55; transition: opacity .12s; }
 .pg-stage:hover .pg-rerun, .pg-rerun:focus-visible { opacity: 1; }
+/* 可点的「运行」/「重跑」：这是这一行唯一的操作入口，必须一直看得见。
+   默认 .55 的透明度是给「整页随手扫一眼」的静态行留的，而这一行是要动手的行。 */
+.pg-rerun.pg-run { opacity: .9; color: var(--accent); }
+.pg-rerun.pg-run:hover { background: var(--accent-soft); }
 
 /* ---------- 右栏：日志 ---------- */
 .pg-log-card {

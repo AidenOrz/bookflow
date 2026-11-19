@@ -50,7 +50,8 @@ python bookflow.py ui --port 8800 --no-open
       "epub_name": "拉康式主体：在语言与享乐之间.epub",
       "pending_decisions": 2380,
       "stages": [
-        {"stage": "render", "status": "ok", "at": "2026-11-15T20:41:03", "count": 310, "detail": ""}
+        {"stage": "render", "status": "ok", "at": "2026-11-15T20:41:03", "count": 310,
+         "detail": "", "can_run": true, "why_not": ""}
       ],
       "progress": {"done": 7, "total": 10, "percent": 70.0, "current": "epub"}
     }
@@ -61,6 +62,11 @@ python bookflow.py ui --port 8800 --no-open
 - `layout`：`"tiered"`（`work/ report/ review/` 三层）或 `"flat"`（旧的单层 `pages/ out/`）。
 - `stages`：**固定顺序** `render,textlayer,ocr,repair,layout,md,verify,audit,epub`；
   状态取 `ok | degraded | failed | skipped | missing`；`missing` 表示还没跑。
+- `can_run` / `why_not`：**现在**点「运行/重跑」会不会当场失败，以及跑不了的人话理由。
+  它与 `status` 正交——`status=ok` 也可能 `can_run=false`（产物齐全，但源 PDF 已不在本机，
+  重跑必然失败；实测四本书的 `render` 都是这种）。判据在 `runs.stage_runnable()`：
+  纯文件系统检查、绝不抛异常，因为 `/api/state` 会对每本书、每个阶段调它。
+  前端必须给每一行都画操作入口，并把 `why_not` **写在行内**（只放 tooltip 等于没写）。
 - `pending_decisions`：`decisions.json` 里 `verdict == "?"` 的条数；没有裁决表时为 0。
 
 ### POST /api/upload

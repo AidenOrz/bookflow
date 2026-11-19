@@ -128,6 +128,10 @@ export function mount(ctx) {
     }
     if (rec.elapsed) bits.push("耗时 " + fmt.dur(rec.elapsed));
     if (rec.detail) bits.push(rec.detail);
+    // 跑不了时理由也要进 tooltip，不论跑过没有（跑过但现在跑不动的情况真实存在，
+    // 见 stageRow 里的说明）。状态不在这里重复算：原来这里自己算了一遍
+    // effective status，就为了判断要不要加这句——判据改掉之后它没有存在的理由了。
+    if (!rec.can_run && rec.why_not) bits.push("跑不了：" + rec.why_not);
     return bits.join("\n");
   }
 
@@ -162,13 +166,48 @@ export function mount(ctx) {
       metaNodeRow.appendChild(el("span", { text: text }));
     });
 
-    // 只有跑过的阶段才给「重跑」：未跑的阶段没有可覆盖的产物
-    const rerunBtn = status !== "missing"
-      ? el("button", {
-          class: "btn btn-sm btn-ghost pg-rerun", type: "button",
-          title: "只重跑「" + (STAGE_LABELS[name] || name) + "」这一阶段",
-          onclick: (ev) => doRerun(name, ev.target)
-        }, "重跑")
+    // 按钮分三种，区别在「这一阶段现在点下去会不会当场失败」：
+    //   已跑过 -> 「重跑」（产物会被覆盖，确认文案要说清）；
+    //   未跑 + 能跑 -> 「运行」（本来一个按钮都没有，所有未跑阶段都是死行）；
+    //   未跑 + 跑不了 -> 禁用的「运行」+ 行内理由。
+    // 最后一种最要紧：理由只挂在 title 上等于没写——鼠标不悬停就永远看不见，
+    // 而这条理由（例如「文字层每页只有 10 个汉字」）恰恰是这个阶段永远跑不了的原因。
+    const isMissing = status === "missing";
+    const label = STAGE_LABELS[name] || name;
+    const whyNot = String(rec.why_not || "");
+    // 老后端没有 can_run 字段时按「能跑」处理：宁可让人点一下看到真实报错，
+    // 也不要因为字段缺失把所有阶段一次性做成死按钮。
+    const canRun = rec.can_run !== false;
+
+    // 判据只有一条：**现在点下去会不会当场失败**。
+    // 不能按「跑过没有」来分——跑过的阶段同样可能已经跑不动了：
+    // 四本书的 render 都跑过，但源 PDF 已不在本机（input/<id>/source.pdf 没有），
+    // 重跑必然 sys.exit；hegel 的 verify 状态是 ok，可 ocr_text 里一页 JSON 都没有，
+    // 重跑同样必然失败。给一个点了就报错的按钮，比不给按钮更浪费时间。
+    const runLabel = isMissing ? "运行" : "重跑";
+    let actionBtn = null;
+    if (canRun) {
+      actionBtn = el("button", {
+        class: "btn btn-sm btn-ghost pg-rerun pg-run", type: "button",
+        title: (isMissing ? "只跑" : "只重跑") + "「" + label + "」这一阶段",
+        onclick: (ev) => doRerun(name, ev.currentTarget, isMissing ? "run" : "rerun")
+      }, runLabel);
+    } else {
+      actionBtn = el("button", {
+        class: "btn btn-sm btn-ghost pg-rerun", type: "button", disabled: true,
+        title: whyNot || "这一阶段现在跑不了"
+      }, runLabel);
+    }
+
+    // 理由的强调程度要分两种，否则整页都是红字：
+    //   未跑 + 跑不了 = 这一阶段**永远**跑不出来，是要人处理的事，用 --warn；
+    //   已跑 + 跑不了 = 产物齐全，只是现在重跑不了（如源 PDF 已不在本机），
+    //   用 --fg-muted 就够了——那本书是好的，不需要人去修什么。
+    const whyNode = (!canRun && whyNot)
+      ? el("div", {
+          class: "pg-stage-why" + (isMissing ? "" : " is-done"),
+          text: (isMissing ? "跑不了：" : "现在无法重跑：") + whyNot
+        })
       : null;
 
     return el("div", { class: "pg-stage" + (running ? " is-running" : "") },
@@ -181,14 +220,15 @@ export function mount(ctx) {
       ),
       el("div", { class: "pg-stage-body" },
         el("div", { class: "pg-stage-top" },
-          el("span", { class: "pg-stage-name", title: STAGE_HINTS[name] || "", text: STAGE_LABELS[name] || name }),
+          el("span", { class: "pg-stage-name", title: STAGE_HINTS[name] || "", text: label }),
           running ? el("span", { class: "pg-spin", title: "正在执行" }) : null,
           el("span", { class: "spacer" }),
           el("span", { class: "pg-stage-status is-" + status, text: STATUS_LABELS[status] || status }),
-          rerunBtn
+          actionBtn
         ),
         metaNodeRow,
-        rec.detail ? el("div", { class: "pg-stage-detail", text: rec.detail }) : null
+        rec.detail ? el("div", { class: "pg-stage-detail", text: rec.detail }) : null,
+        whyNode
       )
     );
   }
@@ -416,31 +456,39 @@ export function mount(ctx) {
     }
   }
 
-  async function doRerun(stage, btn) {
+  // mode: "rerun"（已有产物，会被覆盖）| "run"（未跑过，不覆盖任何东西）
+  async function doRerun(stage, btn, mode) {
     const label = STAGE_LABELS[stage] || stage;
+    const isRerun = mode !== "run";
+    // 确认文案必须区分这两种：把「只跑这一阶段」说成「重跑」会让人以为
+    // 自己上一次的产物要没了——而那一次根本没跑过。
     const ok = await confirmDialog({
-      title: "重跑阶段",
-      message: "将只重跑「" + label + "」这一阶段，沿用当前任务已确定的参数，" +
-               "这一阶段已有的产物会被覆盖。确定继续吗？",
-      confirmText: "重跑",
+      title: isRerun ? "重跑阶段" : "运行阶段",
+      message: isRerun
+        ? "将只重跑「" + label + "」这一阶段，沿用当前任务已确定的参数，" +
+          "这一阶段已有的产物会被覆盖。确定继续吗？"
+        : "将只跑这一阶段：「" + label + "」。沿用当前任务已确定的参数，" +
+          "这一阶段还没有产物，不会覆盖任何东西。确定继续吗？",
+      confirmText: isRerun ? "重跑" : "只跑这一阶段",
       cancelText: "取消",
-      danger: true
+      danger: isRerun
     });
     if (!ok || !ctx.alive()) return;
+    const restLabel = isRerun ? "重跑" : "运行";
     if (btn) { btn.disabled = true; btn.textContent = "启动中…"; }
     try {
       const res = await rerunStage(taskId, stage, {});
       const jid = res && res.job_id ? String(res.job_id) : "";
       if (!jid) {
-        if (btn) { btn.disabled = false; btn.textContent = "重跑"; }
+        if (btn) { btn.disabled = false; btn.textContent = restLabel; }
         toast("后端没有返回执行 id，无法跟踪日志", "error", 8000);
         return;
       }
       toast("已启动「" + label + "」，正在进入日志面板", "success");
       ctx.navigate(taskHash(taskId) + "?job=" + encodeURIComponent(jid));
     } catch (err) {
-      if (btn) { btn.disabled = false; btn.textContent = "重跑"; }
-      if (ctx.alive()) toast("重跑失败：" + describeError(err), "error", 9000);
+      if (btn) { btn.disabled = false; btn.textContent = restLabel; }
+      if (ctx.alive()) toast(restLabel + "失败：" + describeError(err), "error", 9000);
     }
   }
 

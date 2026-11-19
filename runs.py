@@ -27,6 +27,7 @@ run-sengguan/ocr_text 只剩一个 _textlayer.meta 文件、一个页 JSON 都�
 """
 import os
 import re
+import shutil
 
 import jsonio
 import manifest as mf
@@ -169,15 +170,43 @@ def _title(run_root):
     return bid
 
 
-def _textlayer_status(run_root):
-    """文字层的状态：读 _textlayer.meta 的 usable/reason。没跑过返回 (None, "")。"""
-    p = os.path.join(paths.work_dir(run_root), "ocr_text", "_textlayer.meta")
+# 文字层目录名。bookflow.TEXTLAYER_DIR 是同一个值，但这里**不能** import bookflow：
+# webui/server.py 有意不 import 它（见那个文件开头），runs 是两边共用的那一层，
+# 一旦 import 就把 rapidocr 那串重量级依赖拖进了「只是想列一下书」的调用里。
+TEXTLAYER_DIR = "ocr_text"
+
+# 判断「md 能读到哪份 OCR 结果」时的查找顺序，与 bookflow.OCR_DIRS 同源
+# （规则是唯一的，只是这份清单不能从 bookflow 里 import，理由同上）。
+# ocr_merged 是回填过的结果，本模块只判断"有没有页"，不需要它的优先级语义，
+# 但顺序照抄可以避免「界面说能跑、md 实际选了另一份」这种分歧。
+OCR_PRIORITY = ("ocr_layout", "ocr_merged", "ocr_text", "ocr_fix", "ocr")
+
+
+def _page_jsons(d):
+    """目录下的页级 JSON 文件名。模块内自己数，不 import bookflow。"""
+    if not os.path.isdir(d):
+        return []
+    try:
+        return [f for f in os.listdir(d) if f.lower().endswith(".png.json")]
+    except OSError:
+        return []
+
+
+def _textlayer_meta(run_root):
+    """读 _textlayer.meta（文字层的自述），没有或坏了返回 {}。"""
+    p = os.path.join(paths.ocr_dir(run_root, TEXTLAYER_DIR), "_textlayer.meta")
     if not os.path.exists(p):
-        return None, ""
+        return {}
     try:
         meta = jsonio.read(p) or {}
     except (ValueError, OSError):
-        return None, ""
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _textlayer_status(run_root):
+    """文字层的状态：读 _textlayer.meta 的 usable/reason。没跑过返回 (None, "")。"""
+    meta = _textlayer_meta(run_root)
     if not meta:
         return None, ""
     ok = bool(meta.get("usable"))
@@ -216,11 +245,164 @@ def _infer_stages(run_root):
     return stages
 
 
+def _source_pdf(run_root):
+    """(源 PDF 的绝对路径, "") 或 ("", 一句为什么找不到)。
+
+    两条来源，顺序不能反：
+      1. manifest.input.pdf —— textlayer/render 真的跑过时记下的那一份（相对 run 根）；
+      2. input/<book-id>/source.pdf —— WebUI 上传的落点。新书刚建好、还没跑过任何
+         阶段时 manifest 里连这条记录都没有，但 PDF 已经在磁盘上了。
+
+    run_root **不一定**是 runs/<id>：测试会传仓库根或临时目录，所以 book-id 只能
+    取目录名，路径必须经 paths.input_dir() 拼（与 paths.work_dir 同一套规矩）。
+    """
+    run_root = os.path.abspath(run_root)
+    rel = str(((mf.read(run_root).get("input") or {}).get("pdf") or "")).strip()
+    if rel:
+        cand = rel if os.path.isabs(rel) else os.path.join(run_root, rel.replace("/", os.sep))
+        if os.path.isfile(cand):
+            return os.path.abspath(cand), ""
+    book_id = os.path.basename(run_root)
+    if book_id:
+        cand = os.path.join(paths.input_dir(book_id), "source.pdf")
+        if os.path.isfile(cand):
+            return cand, ""
+    return "", ("没有源 PDF：先在「新建任务」里上传，或把它放到 input/%s/source.pdf"
+                % (book_id or "<book-id>"))
+
+
+def _report_has(run_root, name, need_nonempty=False):
+    """报告目录里有没有这个文件；need_nonempty 时连「是空文件」也算没有。"""
+    p = os.path.join(paths.report_dir(run_root), name)
+    if not os.path.isfile(p):
+        return False
+    if need_nonempty:
+        try:
+            return os.path.getsize(p) > 0
+        except OSError:
+            return False
+    return True
+
+
+def stage_runnable(run_root, stage):
+    """这个阶段现在点「运行」会不会当场失败：返回 (能不能跑, 不能跑的人话理由)。
+
+    ## 为什么要在界面上回答这个问题
+
+    两个实测后果叠在一起（详见 task 记录与 IO-CONVENTIONS §2 O5）：
+    一是 progress.js 原来只给**已跑过**的阶段画按钮，于是所有未跑阶段在界面上
+    连按钮都没有；二是补上按钮之后更糟——《中国僧官制度史》（runs/sengguan）的
+    文字层 usable=false（每页平均 10 个汉字），verify 的 A 侧根本没有页 JSON，
+    点下去必然 sys.exit("verify 需要先跑 textlayer 阶段")。那行报错只说明「缺什么
+    文件」，不说明「为什么这本永远跑不了」。所以理由必须**先写在界面上**。
+
+    ## 三条约束
+
+    1. **纯文件系统检查**：只看 os.path.exists / isfile / 数文件名，不读大 JSON、
+       不跑子进程。summary() 会被 /api/state 对每一本书调用，这里一旦变重，
+       整个界面就跟着变慢。唯一读的文件是 manifest.json 和 _textlayer.meta，
+       两者都是小文件（前者本来就是 stage_list 要读的）。
+    2. **绝不抛异常**：任何一个 OSError/ValueError 都吞成「不可运行 + 理由」，
+       因为调用它的是一条渲染路径——一个列不出目录的权限问题没有资格让整页报错。
+    3. 用 paths 的目录函数解析位置，**不写死 "work/"/"report/"**：这里拿到的
+       run_root 既可能是 tiered 的 runs/<id>，也可能是 flat 的旧目录或仓库根。
+    """
+    try:
+        return _stage_runnable(run_root, stage)
+    except (OSError, ValueError) as e:
+        return False, "检查前置条件时出错：%s" % e
+
+
+def _stage_runnable(run_root, stage):
+    run_root = os.path.abspath(run_root)
+    # 目录一律经 paths 解析（ocr_dir/pages_dir 内部走 work_dir）：这里拿到的 run_root
+    # 可能是 tiered 的 runs/<id>，也可能是 flat 的旧目录甚至仓库根，拼 "work/" 会三者全错。
+
+    if stage == "render":
+        pdf, why = _source_pdf(run_root)
+        return (True, "") if pdf else (False, why)
+
+    if stage == "textlayer":
+        pdf, why = _source_pdf(run_root)
+        if not pdf:
+            return False, why
+        # 文字层走 poppler 的 pdftotext，与 render 用的 pdftoppm 同包但不一定同装；
+        # 缺它时 textlayer 会在 check_pdftotext() 里 sys.exit，所以先查 PATH。
+        if shutil.which("pdftotext") is None:
+            return False, ("需要 poppler 的 pdftotext（PATH 里找不到）：文字层靠它抽取，"
+                           "装好 poppler 并加进 PATH 再来；只要 OCR 的话这本可以跳过文字层")
+        return True, ""
+
+    if stage == "ocr":
+        if _count_suffix(paths.pages_dir(run_root), ".png"):
+            return True, ""
+        return False, "还没有页图（pages 目录是空的）：先跑「渲染」"
+
+    if stage == "repair":
+        if _page_jsons(paths.ocr_dir(run_root, "ocr")):
+            return True, ""
+        return False, "还没有 OCR 识别结果（ocr 目录里没有页 JSON）：先跑「OCR」"
+
+    if stage == "layout":
+        if (_page_jsons(paths.ocr_dir(run_root, "ocr_fix"))
+                or _page_jsons(paths.ocr_dir(run_root, "ocr"))):
+            return True, ""
+        return False, "还没有可打标签的 OCR 结果（ocr_fix / ocr 都是空的）：先跑「修复」"
+
+    if stage == "md":
+        for name in OCR_PRIORITY:
+            if _page_jsons(paths.ocr_dir(run_root, name)):
+                return True, ""
+        return False, "没有任何 OCR 结果目录里有页 JSON：先跑「OCR」"
+
+    if stage == "verify":
+        # A 侧 = 文字层，B 侧 = ocr_fix。两侧缺一不可，缺哪侧说哪侧——
+        # 但文字层的缺失更值得展开：它不是「还没跑」，而是「跑了也跑不出来」
+        # （扫描件没有文字层），这句话必须连同 _textlayer.meta 的原文理由一起给出，
+        # 否则用户会一直以为是流程顺序问题、反复重试。
+        meta = _textlayer_meta(run_root)
+        if not _page_jsons(paths.ocr_dir(run_root, TEXTLAYER_DIR)):
+            reason = str(meta.get("reason") or "").strip()
+            if meta.get("usable") is False and reason:
+                return False, ("核对需要文字层与 OCR 两侧逐行对账，文字层不可用就没有 A 侧"
+                               "（%s 里一页 JSON 都没有）：%s" % (TEXTLAYER_DIR, reason))
+            return False, ("核对需要文字层与 OCR 两侧逐行对账，%s 里没有页 JSON：先跑「文字层」"
+                           % TEXTLAYER_DIR)
+        if not _page_jsons(paths.ocr_dir(run_root, "ocr_fix")):
+            return False, "核对要拿 OCR 结果做 B 侧对照，ocr_fix 里没有页 JSON：先跑「修复」"
+        return True, ""
+
+    if stage == "audit":
+        if _report_has(run_root, "book.md"):
+            return True, ""
+        return False, "还没有成书正文（report/book.md）：先跑「Markdown」"
+
+    if stage == "epub":
+        # 比 audit 多查一次「非空」：stage_epub 对 0 字节的 book.md 是直接 sys.exit 的，
+        # 不存在和空文件在那里是同一个失败，界面也照同一个口径说。
+        if _report_has(run_root, "book.md", need_nonempty=True):
+            return True, ""
+        return False, "还没有非空的成书正文（report/book.md）：先跑「Markdown」"
+
+    return False, "未知阶段：%s" % stage
+
+
+def _annotate_runnable(run_root, stages):
+    """就地给每个 stages[] 元素补 can_run / why_not（只加字段，不改既有字段）。"""
+    for st in stages:
+        ok, why = stage_runnable(run_root, st.get("stage") or "")
+        st["can_run"] = bool(ok)
+        st["why_not"] = "" if ok else why
+    return stages
+
+
 def stage_list(run_root):
     """固定顺序的 9 个阶段 + 状态。有 manifest 就用 manifest，缺的再用推断补。"""
     rec = mf.read(run_root).get("stages") or {}
     if not rec:
-        return _infer_stages(run_root)
+        # 没有 manifest 的旧书：整份状态都是推断的，但仍然要知道「现在点了能不能跑」，
+        # 否则界面上未跑阶段全是死按钮（这正是本次要修的第一条根因）。
+        return _annotate_runnable(run_root, _infer_stages(run_root))
     inferred = {s["stage"]: s for s in _infer_stages(run_root)}
     out = []
     for s in mf.STAGES:
@@ -233,7 +415,7 @@ def stage_list(run_root):
             g = dict(inferred.get(s) or {"stage": s, "status": "missing"})
             g["inferred"] = True
             out.append(g)
-    return out
+    return _annotate_runnable(run_root, out)
 
 
 def pending_decisions(run_root):
