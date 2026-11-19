@@ -37,17 +37,12 @@
   --danger:        #d64545;  --danger-soft:  #fdeeee;
   --neutral:       #78828f;  --neutral-soft: #f0f2f5;
 
-  /* 差异高亮（校对页专用）
-     底色只用来**定位**是哪个字，真正让人看清字形的是加粗（mark 上是 700）。
-     实测过的边界：橙底 #ffb347 + 棕字 #8a5a00 只有 3.33:1，
-     14px 下字形糊在底色里，分不清「已」和「己」——那正是最需要看清的地方。
-     所以底色一律取浅色，文字取深色，全部 >= 5.2:1。 */
-  --diff-replace-bg: #fdf0d0;   /* 替换：浅琥珀 */
-  --diff-replace-fg: #8a5a00;   /* 棕，5.24:1 */
-  --diff-insert-bg:  #d8f5e3;   /* 新增：浅绿 */
-  --diff-insert-fg:  #0f7a3d;   /* 绿，4.67:1 */
-  --diff-delete-bg:  #fbdcdc;   /* 删除：浅红 */
-  --diff-delete-fg:  #a92b2b;   /* 红，5.34:1 */
+  /* 差异高亮**故意没有颜色令牌**。
+     用过三套配色（含实测 5.24:1 的浅琥珀底 + 棕字），结论是底色帮倒忙：
+     它把一块色铺在字周围，形近字（已/己）的笔画反而糊在色块边缘；
+     一行里出现两三处差异时，视线被色块牵走，真正要看的那两个笔画没人看。
+     现在靠字形本身说话：700 字重 + 2px 划线，文字色沿用正文色。
+     见 css/view-proofread.css 的 .pr-cand-body mark。 */
 
   /* 形状与投影 */
   --radius-sm: 6px;
@@ -419,6 +414,51 @@ kbd {
   color: var(--fg-muted); background: var(--surface-2);
   border: 1px solid var(--border-strong); border-bottom-width: 2px;
   border-radius: 4px;
+}
+
+/* 3.15.5 设置面板 · 快捷键 */
+.keys-panel { display: flex; flex-direction: column; gap: var(--sp-3); }
+.keys-table {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  overflow: hidden;
+}
+.keys-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center; gap: var(--sp-3);
+  padding: 7px var(--sp-3);
+  border-top: 1px solid var(--border);
+  font-size: var(--fs-sm);
+}
+.keys-row:first-child { border-top: none; }
+.keys-head {
+  background: var(--surface-2); color: var(--fg-faint);
+  font-size: var(--fs-xs); font-weight: 500;
+  padding-top: var(--sp-2); padding-bottom: var(--sp-2);
+}
+.keys-label { color: var(--fg-muted); overflow: hidden; text-overflow: ellipsis; }
+.keys-note {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: var(--fs-xs); color: var(--fg-faint); line-height: 1.6;
+}
+
+/* 键帽按钮：外观刻意与静态 kbd 一致，但它是可点的——
+   静态和可点长得一样，人才不会去找「哪里能改键」 */
+.keycap {
+  min-width: 44px; height: 26px; padding: 0 8px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-family: var(--mono); font-size: var(--fs-xs); font-weight: 600;
+  color: var(--fg); background: var(--surface);
+  border: 1px solid var(--border-strong); border-bottom-width: 2px;
+  border-radius: 4px; cursor: pointer;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.keycap:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.keycap:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 1px; }
+/* 等待按键时反色：这是唯一一个「你现在按什么都算数」的状态，
+   必须和静止态一眼分得开，否则用户会以为没点上而反复点击 */
+.keycap.is-capturing {
+  background: var(--accent); border-color: var(--accent); color: var(--accent-fg);
+  animation: pulse 1.2s ease-in-out infinite;
 }
 
 /* 3.16 分段控件 */

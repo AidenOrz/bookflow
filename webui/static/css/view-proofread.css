@@ -45,6 +45,9 @@
 }
 
 .pr-pane { background: var(--bg); min-height: 0; display: flex; flex-direction: column; }
+/* 空态 / 错误态：必须跨满三栏。.pr-body 是 grid，不带这个类的东西只会落在
+   第一列，实测被挤进 200px 的分组栏，标题竖排成一行三个字。 */
+.pr-emptywrap { grid-column: 1 / -1; display: flex; align-items: center; justify-content: center; }
 .pr-pane-evidence { background: var(--surface-2); }
 .pr-pane-decide { background: var(--surface); }
 
@@ -167,16 +170,29 @@
 }
 .pr-cand.is-chosen .pr-cand-body { border-color: var(--accent); background: var(--accent-soft); }
 .pr-cand-body mark {
-  padding: 1px 1px; border-radius: 2px; text-decoration: none;
-  /* 先靠**加粗 + 颜色**把那个字顶出来，不靠大面积底色。
-     底色只是辅助定位；字形本身能不能看清，靠的是笔画粗细与足够的明度差。
-     棕色 #8a5a00 配浅琥珀 #fdf0d0 实测 5.24:1，正文小字达标；
-     再叠一层 700 字重，形近字（已/己、己/已）的笔画差别才分得出来。 */
+  /* 差异字：**无底色 + 加粗 + 划线**。
+     底色试过又撤掉了：它会在字周围铺一块色，形近字（已/己、己/已）的笔画
+     反而糊在色块边缘里；而且整行里出现两三处差异时，视线被色块拉走，
+     真正要看的那两个笔画差别没人看。
+     现在底色只在**整块候选被选中**时出现在 .pr-cand-body 上（见上一条），
+     单个字只用字形本身说话：700 字重 + 2px 划线。
+     文字颜色沿用正文色，不加色相——颜色一多，「哪个是我该看的」又要多解释一遍。 */
+  background: none;
+  color: inherit;
   font-weight: 700;
+  padding: 0;
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  /* 3px 而不是 2px：汉字的下缘本身就画到基线以下，2px 时划线会贴住笔画，
+     实测在「已」上看起来像一坨黑边，反而让字形更难认。 */
+  text-underline-offset: 3px;
 }
-.pr-cand-body mark.d-replace { background: var(--diff-replace-bg); color: var(--diff-replace-fg); text-decoration: underline; text-decoration-thickness: 1.5px; }
-.pr-cand-body mark.d-insert  { background: var(--diff-insert-bg);  color: var(--diff-insert-fg); }
-.pr-cand-body mark.d-delete  { background: var(--diff-delete-bg);  color: var(--diff-delete-fg); text-decoration: line-through; text-decoration-thickness: 1.5px; }
+.pr-cand-body mark.d-insert { text-decoration-style: solid; }
+/* 删除用删除线：它在这一侧本来就不该存在，划掉比加下划线更符合语义 */
+.pr-cand-body mark.d-delete {
+  text-decoration: line-through;
+  text-decoration-thickness: 2px;
+}
 .pr-cand-note { margin-top: 4px; font-size: var(--fs-xs); color: var(--fg-faint); }
 
 /* 判定按钮：整行宽、44px 高、一眼可辨 */

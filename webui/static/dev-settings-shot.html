@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>设置面板（截图用）</title>
+<!-- 这个页面只做一件事：打开「设置」弹窗，给 docs/ui/settings.png 截图用。
+     不带它就没法复现那张截图——无头 Edge 的 --screenshot 只能拍页面，
+     没法先点一下顶栏的「设置」再拍。它不参与产品流程，也没有任何业务逻辑。
+     生成命令见 docs/UI-DESIGN.md §6.5。 -->
+<link rel="stylesheet" href="css/base.css">
+<link rel="stylesheet" href="css/view-proofread.css">
+</head>
+<body>
+<div id="toasts"></div>
+<script type="module">
+import { openSettings } from "./js/settings.js";
+openSettings({});
+</script>
+</body>
+</html>

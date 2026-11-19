@@ -5,6 +5,7 @@ import { el, clear, fmt, toast, errorBar, emptyState, openModal, confirmDialog,
          progressBar, kbd, skeleton } from "./ui.js";
 import { getDecisions, postDecisions, applyPreview, applyRun, pageUrl, cropUrl,
          describeError } from "./api.js";
+import { matchKey, keyLabel, keys } from "./keys.js";
 
 // 本地未提交状态：key -> {verdict, replacement}
 // verdict: "" 未判定 / "A" / "B" / "C" / "?"
@@ -250,8 +251,13 @@ export function mount(ctx) {
     pendingBadge.textContent = n > 0 ? fmt.num(n) + " 条待提交" : "无待提交";
     pendingBadge.className = "badge " + (n > 0 ? "badge-warn" : "badge-neutral");
     submitBtn.disabled = n === 0;
+    // 0 / 0 不能说「全书已校对完」：那是「还没有清单」，两件事不能混。
+    // 实测《中国僧官制度史》没有核对阶段产物时，顶栏显示「已校对 0 / 0 条 ·
+    // 全书已校对完」——看着像干完了，其实是根本还没开始。
     const pend = Math.max(0, total - done);
-    progSub.textContent = pend > 0 ? ("待校对 " + fmt.num(pend) + " 条") : "全书已校对完";
+    if (!total) progSub.textContent = "还没有校对清单";
+    else if (pend > 0) progSub.textContent = "待校对 " + fmt.num(pend) + " 条";
+    else progSub.textContent = "全书已校对完";
   }
 
   // ---- 左栏分组 ----
@@ -327,7 +333,6 @@ export function mount(ctx) {
     const y0 = item.y0;
     evMeta.textContent = page + (y0 !== undefined && y0 !== null ? " · y=" + y0 : "");
 
-    const key = mode === "crop" ? "crop" : "page";
     const url = mode === "crop" ? cropUrl(taskId, page, y0) : pageUrl(taskId, page);
 
     const wrap = el("div", { class: "pr-shot-wrap" });
@@ -448,17 +453,18 @@ export function mount(ctx) {
     customWrap.appendChild(customInput);
     customWrap.appendChild(el("div", { class: "field-hint", text: "整行覆盖：把这一行的完整内容写对，不只是改那个字。" }));
 
-    // 判定按钮
+    // 判定按钮。键帽显示的是**当前生效**的绑定，所以在设置里改过键之后
+    // 这里会跟着变——常量 "A"/"B"/"C"/"S" 会让改完键的界面直接说谎。
     const actions = el("div", { class: "pr-actions" });
     const btnA = el("button", { class: "pr-btn pr-btn-a", type: "button", onclick: () => judge("A") },
-      el("span", { class: "pr-btn-label", text: "采用 A" }), kbd("A"));
+      el("span", { class: "pr-btn-label", text: "采用 A" }), kbd(keyLabel(keys().useA)));
     const btnB = el("button", { class: "pr-btn pr-btn-b", type: "button", onclick: () => judge("B") },
-      el("span", { class: "pr-btn-label", text: "采用 B" }), kbd("B"));
+      el("span", { class: "pr-btn-label", text: "采用 B" }), kbd(keyLabel(keys().useB)));
     const btnC = el("button", { class: "pr-btn pr-btn-c", type: "button",
       onclick: () => { customWrap.hidden = false; customInput.focus(); } },
-      el("span", { class: "pr-btn-label", text: "自行输入" }), kbd("C"));
+      el("span", { class: "pr-btn-label", text: "自行输入" }), kbd(keyLabel(keys().useC)));
     const btnS = el("button", { class: "pr-btn pr-btn-s", type: "button", onclick: () => judge("?") },
-      el("span", { class: "pr-btn-label", text: "跳过这一条" }), kbd("S"));
+      el("span", { class: "pr-btn-label", text: "跳过这一条" }), kbd(keyLabel(keys().skip)));
 
     actions.appendChild(btnA);
     actions.appendChild(btnB);
@@ -773,8 +779,10 @@ export function mount(ctx) {
       renderAll();
       showBanner();
       if (!flat.length) {
+        // 空态要**跨满三栏**：.pr-body 是 grid，直接 append 一个 div 会落在第一列
+        // （实测被挤进 200px 的分组栏，正文竖排成一行三个字）。
         clear(body);
-        body.appendChild(el("div", { style: { padding: "48px" } },
+        body.appendChild(el("div", { class: "pr-emptywrap" },
           emptyState("这本书还没有校对条目",
             "没有找到待校对的差异。先跑完「核对」阶段生成分歧清单，或这本书本身就没有文字层可对账。",
             el("a", { class: "btn btn-primary", href: taskHash(taskId) }, "回到处理进度"))
@@ -785,32 +793,43 @@ export function mount(ctx) {
 
   // ================= 键盘 =================
 
+  // 键盘绑定不写死在这里：哪颗键干什么由 keys.js 决定（用户可在「设置」里改），
+  // 这里只把「动作 id」翻译成具体行为。
   function onKey(ev) {
     if (!alive()) return;
     const t = ev.target;
     const tag = t && t.tagName ? t.tagName.toLowerCase() : "";
     if (tag === "input" || tag === "textarea" || tag === "select") return;
+    // 内容可编辑的元素（将来若有）也要放过，否则在里面打字会被当成判定
+    if (t && t.isContentEditable) return;
+    // 弹窗开着时一律不接管：设置面板正在捕获按键，判定跳条会打断改键
     if (document.querySelector(".modal-backdrop")) return;
 
-    const k = ev.key;
-    if (k === "a" || k === "A") { ev.preventDefault(); judge("A"); }
-    else if (k === "b" || k === "B") { ev.preventDefault(); judge("B"); }
-    else if (k === "s" || k === "S") { ev.preventDefault(); judge("?"); }
-    else if (k === "c" || k === "C") {
+    const action = matchKey(ev);
+    if (!action) return;
+
+    if (action === "useA") { ev.preventDefault(); judge("A"); }
+    else if (action === "useB") { ev.preventDefault(); judge("B"); }
+    else if (action === "skip") { ev.preventDefault(); judge("?"); }
+    else if (action === "useC") {
       ev.preventDefault();
-      const ta = decideHost.querySelector(".pr-custom textarea");
       const wrap = decideHost.querySelector(".pr-custom");
+      const ta = decideHost.querySelector(".pr-custom textarea");
       if (wrap) wrap.hidden = false;
       if (ta) ta.focus();
     }
-    else if (k === "ArrowDown" || k === "j") { ev.preventDefault(); move(1); }
-    else if (k === "ArrowUp" || k === "k") { ev.preventDefault(); move(-1); }
-    else if (k === "z" || k === "Z") { ev.preventDefault(); mode = mode === "crop" ? "page" : "crop"; renderEvidence(); }
-    else if (k === "1") { zoom = 1; renderEvidence(); }
-    else if (k === "2") { zoom = 1.5; renderEvidence(); }
-    else if (k === "3") { zoom = 2; renderEvidence(); }
-    else if (k === "4") { zoom = 3; renderEvidence(); }
-    else if (k === "/") { ev.preventDefault(); filterInput.focus(); }
+    else if (action === "next") { ev.preventDefault(); move(1); }
+    else if (action === "prev") { ev.preventDefault(); move(-1); }
+    else if (action === "toggle") {
+      ev.preventDefault();
+      mode = mode === "crop" ? "page" : "crop";
+      renderEvidence();
+    }
+    else if (action === "zoom100") { ev.preventDefault(); zoom = 1; renderEvidence(); }
+    else if (action === "zoom150") { ev.preventDefault(); zoom = 1.5; renderEvidence(); }
+    else if (action === "zoom200") { ev.preventDefault(); zoom = 2; renderEvidence(); }
+    else if (action === "zoom300") { ev.preventDefault(); zoom = 3; renderEvidence(); }
+    else if (action === "filter") { ev.preventDefault(); filterInput.focus(); }
   }
 
   document.addEventListener("keydown", onKey);

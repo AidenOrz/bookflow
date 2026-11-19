@@ -9,6 +9,7 @@ import * as newView from "./new.js";
 import * as progressView from "./progress.js";
 import * as proofreadView from "./proofread.js";
 import * as outputView from "./output.js";
+import { openSettings } from "./settings.js";
 
 // ---- 全局 store ----
 export const store = {
@@ -93,7 +94,20 @@ function renderHeader() {
         loadState(true).then(() => { navigate(location.hash, true); })
           .catch((e) => toast(describeError(e), "error"));
       }
-    }, "刷新")
+    }, "刷新"),
+    // 设置放顶栏而不是塞进校对页：快捷键是跨任务的偏好，
+    // 而校对页每次按键都要落到「判定」上，多一个入口就多一次误点。
+    el("button", {
+      class: "btn btn-ghost btn-sm", type: "button", title: "设置（快捷键等）",
+      onclick: () => openSettings({
+        // 改完键要立刻反映到界面：校对页的键帽显示的是当前绑定，
+        // 不重渲染就会停在旧值上，看着像没生效
+        onChange: () => {
+          const path = currentPath();
+          if (path.indexOf("/proofread") >= 0) navigate(location.hash, true);
+        }
+      })
+    }, "设置")
   ));
 }
 
