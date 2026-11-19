@@ -82,9 +82,9 @@ tiered（新书，runs/<book-id>/）        flat（四个既有工作目录，�
 | `paths.py` | **布局解析** | 三种布局判定 + 角色到路径的映射。`is_tiered()` **不看 manifest**（见 §2.1）；`backup_dir()` 把备份从被备份目录内部搬到 `work/.backup/` |
 | `manifest.py` | **本次运行的事实源** | `manifest.json` 读写：`input.sha256` 是唯一输入身份、`stages[*].status` 取 ok/degraded/failed/skipped。缺失/损坏一律返回空骨架，**绝不抛** |
 | `stage_manifest.py` | 阶段记录层 | 把阶段包一层：跑前记 running、跑完按结果记 ok/failed。记录失败只告警，不挡路 |
-| `runs.py` | run 发现与进度 | run id 白名单校验（拒绝绝对路径与路径穿越）、9 阶段状态（manifest 权威 / 旧书推断且标 `inferred`）、进度计算（**failed 不算做完**） |
+| `runs.py` | run 发现与进度 | run id 白名单校验（拒绝绝对路径与路径穿越）、9 阶段状态（manifest 权威 / 旧书推断且标 `inferred`）、进度计算（**failed 不算做完**）、`stage_runnable()` 算「这一阶段现在点运行会不会当场失败」（纯文件系统检查、绝不抛，结果进 `stages[*].can_run/why_not`） |
 | `webui/server.py` | **本地 Web 后端** | 纯标准库 `http.server` + 手写路由 + SSE。作业调度、`kill_tree` 中断、行级切片图、裁决读写闸门（校验失败整份不写）。契约见 `webui/API.md` |
-| `webui/static/` | **本地 Web 前端** | 原生 ES module，零构建零依赖，浅色主题。五页：任务列表 / 新建任务 / 处理进度 / 校对 / 成品。样式分 `css/base.css`（令牌+共用组件）+ `css/view-*.css`；规范见 [UI-DESIGN.md](UI-DESIGN.md) |
+| `webui/static/` | **本地 Web 前端** | 原生 ES module，零构建零依赖，浅色主题。五页：任务列表 / 新建任务 / 处理进度 / 校对 / 成品。样式分 `css/base.css`（令牌+共用组件）+ `css/view-*.css`；`js/keys.js` 是键盘绑定的唯一事实源（默认值 + localStorage 覆盖），`js/settings.js` 是改键面板；规范见 [UI-DESIGN.md](UI-DESIGN.md) |
 | `tools/migrate_layout.py` | 布局迁移 | 平铺 → 分层，默认预演；`--apply` 写 `.migration-<ts>.json`，`--rollback` 按记录搬回 |
 | `cover.py` | 封面 | 从首页裁封面，按墨迹密度去水印带；不合适的页返回 None；`alt` 属性走 `epub3.esc_attr` |
 | `make_md.py` | md 阶段入口 | 调 layout → fix → qa，三个产物原子写 |
@@ -203,6 +203,11 @@ tiered（新书，runs/<book-id>/）        flat（四个既有工作目录，�
 | WebUI 后端用**纯标准库**，不引 FastAPI | OCR 要跑在已装好 GPU 依赖的解释器上（`E:/ocr-venv`）。为了一个本地界面让用户再动那套环境，代价远大于收益；单用户工具只需要一个线程化 HTTP server + SSE |
 | 前端**零构建**（原生 ES module） | 无 npm/无 CDN/可离线，`bookflow.py ui` 一条命令就能起完整界面。代价是没有组件生态——对这个规模的界面不值得 |
 | 回填**必须** `confirm: true` + 先干跑 | 回填会原地覆写页级 JSON，一次误点不可逆。界面强制走「预览 → 确认 → 执行」，且预览复用 `apply_decisions.plan()`，不重写判定逻辑 |
+| 阶段入口按**现在点下去会不会失败**给，不按「跑过没有」给 | 两个实测：所有未跑阶段原来连按钮都没有（死行）；而「有产物」并不等于「还能重跑」——四本书的 `render` 都是 `ok` 但源 PDF 已不在本机，hegel 的 `verify` 是 `ok` 但 `ocr_text` 里一页 JSON 都没有。判据统一成 `stage_runnable()`，跑不了的把理由写在行内 |
+| `stage_runnable()` **纯文件系统检查、绝不抛** | 它挂在 `/api/state` 的渲染链上（对每本书、每个阶段调一次），读大 JSON 或跑子进程会拖慢整页；而一个列不出目录的权限问题没有资格让整页报错，所以异常一律降级成「不可运行 + 理由」 |
+| 键盘绑定**抽成 `js/keys.js`**，视图只认动作 id | 视图里写 `if (k === "a")` 时，改键就必须改视图，而按钮上的键帽还得另找地方同步——两处一旦不同步，按钮上写着 A、按下 A 却什么都没发生。现在 `matchKey(ev)` 返回动作 id，键帽取 `keyLabel(keys().useA)`，同一个事实源 |
+| 一个动作一颗键，**不收双绑** | 原先 `↑↓` 与 `j/k` 双绑。双绑让「设置面板里当前生效的是哪颗」说不清，也让人没法只改掉自己不想用的那颗。缩放保留 4 颗独立键而不是「一颗键循环」：一次按到 300%，不用按三次还盯着画面数 |
+| 改键偏好**存不住只降级不报错** | 隐私模式下 `localStorage.setItem` 会抛异常。存不住偏好是小事，为它白屏是大事 |
 
 ## 6. 为什么不用 pandoc
 
