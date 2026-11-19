@@ -212,26 +212,28 @@ class TestCrossLine(unittest.TestCase):
                                 for y, t in lines]})
         return d, ocr
 
-    def test_error_in_first_half_targets_that_line(self):
-        """p-287 形态：「…刚刚人」+「狱还是…」，错的是本行末字。"""
+    def test_cross_line_targets_the_right_line(self):
+        """词被行长切断时，改上一行还是下一行取决于错字落在哪半。
+
+        p-287 形态：「…刚刚人」+「狱还是…」，错的是本行末字；
+        p-272 形态：「…言语介」+「人可怕…」，错的是下一行首字。
+        判错的后果很重：整行覆盖会把两行内容互换。
+        """
         d, ocr = self._mk([(640.9, "无论他是刚刚人"), (735.6, "狱还是即将出狱")])
         L, new = dec.find_cross_line(ocr, 1, "人狱", "入狱")
         self.assertEqual(L["y0"], 640.9)
         self.assertEqual(new, "无论他是刚刚入")
 
-    def test_error_in_second_half_targets_next_line(self):
-        """p-272 形态：「…言语介」+「人可怕…」，错的是下一行首字。"""
         d, ocr = self._mk([(1866.9, "人们的言语介"), (1959.9, "人可怕的沉默")])
         L, new = dec.find_cross_line(ocr, 1, "介人", "介入")
         self.assertEqual(L["y0"], 1959.9, "应改下一行，不能改上一行（整行覆盖会互换两行内容）")
         self.assertEqual(new, "入可怕的沉默")
 
-    def test_no_cross_hit_returns_none(self):
+    def test_cross_line_refuses_to_guess(self):
+        """跨行是推断：命中不了、或有两个候选时不猜（猜错比不给更糟）。"""
         d, ocr = self._mk([(100.0, "完全无关的一行")])
         self.assertIsNone(dec.find_cross_line(ocr, 1, "介人", "介入"))
 
-    def test_ambiguous_hit_returns_none(self):
-        """两个候选行时不给建议：跨行是推断，猜错比不给更糟。"""
         d, ocr = self._mk([(100.0, "甲介"), (200.0, "人乙"),
                            (300.0, "丙介"), (400.0, "人丁")])
         self.assertIsNone(dec.find_cross_line(ocr, 1, "介人", "介入"))
@@ -273,16 +275,18 @@ class TestSameLineInlineAndCrossLine(unittest.TestCase):
     AUDIT = [{"wrong": "介人", "right": "介入", "pos": 3, "freq": 1, "page": 1},
              {"wrong": "人狱", "right": "入狱", "pos": 9, "freq": 1, "page": 1}]
 
-    def test_keys_are_unique_and_valid(self):
-        """同一 key 只能有一条，且整份必须通过 validate。"""
+    def test_same_line_conflicts_merge_into_one_entry(self):
+        """同一行既有行内错词、又有行尾跨行错词时，两份候选必须合成**一条**。
+
+        实测复现（REVIEW-2026-11-18 §4）：旧版跨行命中直接 append，同一 key
+        出现两条，validate() 报「decisions[1] key 重复」拒绝整份文件。
+        """
         doc = dec.from_audit(self.AUDIT, None, self._mk())
         keys = [e["key"] for e in doc["decisions"]]
         self.assertEqual(keys, ["p-001.png@100"], "同一行只能有一条裁决")
         self.assertEqual(dec.validate(doc), [])
 
-    def test_both_replaces_are_applied(self):
-        """叠加后整行要同时含行内替换（介入）与跨行替换（入狱 -> 行尾入）。"""
-        doc = dec.from_audit(self.AUDIT, None, self._mk())
+        # 叠加后整行要同时含行内替换（介入）与跨行替换（入狱 -> 行尾入）
         e = doc["decisions"][0]
         self.assertEqual(e["verdict"], "B")
         self.assertEqual(e["A"], "错误介人和刚刚人")
@@ -291,18 +295,16 @@ class TestSameLineInlineAndCrossLine(unittest.TestCase):
         self.assertIn("介人→介入", e["note"])
         self.assertIn("人狱", e["note"])
 
-    def test_cross_line_only_still_gives_actionable_b(self):
-        """只有跨行候选时仍按 B 给出定位好的整行（不能因为改成归并就退回 ?）。"""
-        ocr = self._mk()
+    def test_cross_line_only_and_unmergeable_conflict(self):
+        """只有跨行候选时仍按 B 给出定位好的整行；两段改法叠加不上时合成 ?。"""
         doc = dec.from_audit([{"wrong": "人狱", "right": "入狱", "pos": 9,
-                               "freq": 1, "page": 1}], None, ocr)
+                               "freq": 1, "page": 1}], None, self._mk())
         e = doc["decisions"][0]
         self.assertEqual(e["verdict"], "B")
         self.assertEqual(e["y0"], 100.0)
         self.assertEqual(e["B"], "错误介人和刚刚入")
 
-    def test_conflict_becomes_single_question_entry(self):
-        """两段改法叠加不上时，合成一条 verdict=?（同 key 两条会被 validate 拒绝）。"""
+        # 两段改法叠加不上（会互相破坏）-> 一条 verdict=?，而不是两条同 key
         d = tempfile.mkdtemp(prefix="xl3-")
         self.addCleanup(shutil.rmtree, d, True)
         ocr = os.path.join(d, "ocr")
@@ -325,7 +327,7 @@ class TestSameLineInlineAndCrossLine(unittest.TestCase):
 
 
 class TestMergeAndIO(unittest.TestCase):
-    def test_merge_later_wins(self):
+    def test_merge_semantics(self):
         """按 key 合并，后者覆盖前者（重新裁决时以新为准），且保序。"""
         a = dec.from_disagree([
             {"page": "p-001.png", "y0": 100.0, "A": "甲", "B": "乙", "verdict": "?"},
@@ -335,14 +337,12 @@ class TestMergeAndIO(unittest.TestCase):
             {"page": "p-001.png", "y0": 100.0, "A": "甲", "B": "乙", "verdict": "B"},
         ])
         m = dec.merge(a, b)
-        self.assertEqual(len(m["decisions"]), 2)
+        self.assertEqual(len(m["decisions"]), 2, "同 key 合并，不是追加")
         self.assertEqual([e["key"] for e in m["decisions"]],
-                         ["p-001.png@100", "p-002.png@200"])
-        self.assertEqual(m["decisions"][0]["verdict"], "B")
+                         ["p-001.png@100", "p-002.png@200"], "顺序不能变")
+        self.assertEqual(m["decisions"][0]["verdict"], "B", "后来的覆盖先前的")
         self.assertEqual(m["decisions"][1]["verdict"], "?")
-
-    def test_merge_accepts_bare_lists(self):
-        """bookflow 的 decisions 阶段是 dec.merge(dec.read(dst), picked) —— 两者都是整份文档。"""
+        # 裸列表（没有 decisions 外壳）同样接受，且后者赢
         m = dec.merge([dec.make_decision("p-001.png", 1.0, B="乙", verdict="B")],
                       {"version": 1, "source": {}, "match": {},
                        "decisions": [dec.make_decision("p-001.png", 1.0, B="丙",
@@ -350,44 +350,19 @@ class TestMergeAndIO(unittest.TestCase):
         self.assertEqual(len(m["decisions"]), 1)
         self.assertEqual(m["decisions"][0]["B"], "丙")
 
-    def test_write_read_roundtrip(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "out", "decisions.json")
-            src = dec.from_disagree([{"page": "p-001.png", "y0": 1.0,
-                                      "A": "甲", "B": "乙", "verdict": "B"}])
-            dec.write(p, src)
-            self.assertTrue(os.path.exists(p))
-            back = dec.read(p)
-            self.assertEqual(back["decisions"][0]["key"], "p-001.png@1")
-            self.assertEqual(back["decisions"][0]["B"], "乙")
+    def test_key_normalization(self):
+        """主键必须归一：浮点尾差、数字页码与页名都要落在同一个空间。
 
-    def test_load_any_dispatches_by_content(self):
-        """同一入口按内容分派：audit 的 hit 有 wrong/right，disagree 有 A/B+why。"""
-        with tempfile.TemporaryDirectory() as d:
-            pa = os.path.join(d, "audit.json")
-            jsonio.write(pa, [{"pos": 1, "len": 2, "wrong": "甲", "right": "乙"}])
-            doc = dec.load_any(pa, ocr=os.path.join(d, "nope"))
-            self.assertEqual(doc["source"]["queue_from"], "audit")
-            self.assertEqual(doc["decisions"][0]["verdict"], "?")   # 定位不到 -> 保留
-
-            pd = os.path.join(d, "disagree.json")
-            jsonio.write(pd, [{"page": "p-001.png", "y0": 1.0, "A": "甲", "B": "乙",
-                               "verdict": "B", "why": "w"}])
-            doc = dec.load_any(pd)
-            self.assertEqual(doc["source"]["queue_from"], "disagree")
-
-    def test_key_normalizes_float_noise(self):
-        """y0 的浮点尾差不能造出两个 key（否则 status 回写与 merge 去重全失效）。"""
+        y0 的浮点尾差造出两个 key，status 回写与 merge 去重会全部失效；
+        页码与页名不归一，audit 与 disagree 两条来源就永远对不上。
+        """
         self.assertEqual(dec.key_of("p-001.png", 2109.6), "p-001.png@2109.6")
         self.assertEqual(dec.key_of("p-001.png", 2109.6000000000004),
                          "p-001.png@2109.6")
         self.assertEqual(dec.key_of("p-001.png", 2109.0), "p-001.png@2109")
-
-    def test_page_number_normalized_to_page_name(self):
-        """audit 给的是数字页码、disagree 给的是页名，key 必须落在同一个空间。"""
-        self.assertEqual(dec.page_name(53), "p-053.png")
-        self.assertEqual(dec.page_name("53"), "p-053.png")
-        self.assertEqual(dec.page_name("p-053.png"), "p-053.png")
+        for raw in (53, "53", "p-053.png"):
+            with self.subTest(page=raw):
+                self.assertEqual(dec.page_name(raw), "p-053.png")
 
     def test_validate_rejects_bad_entries(self):
         """裁决表写错宁可报错停下，也不能像旧版那样静默跳过某条裁决。"""
@@ -408,13 +383,33 @@ class TestMergeAndIO(unittest.TestCase):
         self.assertTrue(any("缺 replacement" in p for p in probs))
         self.assertTrue(any("key 重复" in p for p in probs))
 
+    def test_io_roundtrip_and_dispatch(self):
+        """写盘/读回一致；load_any 按内容分派（audit 的 hit 有 wrong/right，
+        disagree 有 A/B+why），定位不到的保留成 ?。"""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "out", "decisions.json")
+            src = dec.from_disagree([{"page": "p-001.png", "y0": 1.0,
+                                      "A": "甲", "B": "乙", "verdict": "B"}])
+            dec.write(p, src)
+            self.assertTrue(os.path.exists(p))
+            back = dec.read(p)
+            self.assertEqual(back["decisions"][0]["key"], "p-001.png@1")
+            self.assertEqual(back["decisions"][0]["B"], "乙")
 
-# ---------------------------------------------------------------------------
-# apply_decisions.py：配置驱动的回填
-# ---------------------------------------------------------------------------
+            pa = os.path.join(d, "audit.json")
+            jsonio.write(pa, [{"pos": 1, "len": 2, "wrong": "甲", "right": "乙"}])
+            doc = dec.load_any(pa, ocr=os.path.join(d, "nope"))
+            self.assertEqual(doc["source"]["queue_from"], "audit")
+            self.assertEqual(doc["decisions"][0]["verdict"], "?")   # 定位不到 -> 保留
+
+            pd = os.path.join(d, "disagree.json")
+            jsonio.write(pd, [{"page": "p-001.png", "y0": 1.0, "A": "甲", "B": "乙",
+                               "verdict": "B", "why": "w"}])
+            self.assertEqual(dec.load_any(pd)["source"]["queue_from"], "disagree")
+
 
 def _fixture(d, extra_lines=None):
-    """造一份"两个多差异段 + 一个单差异段"的 OCR 目录，返回 (ocr 目录, decisions 路径)。"""
+    """造一份"两个多差异段"的 OCR 目录，返回 (ocr 目录, decisions 路径)。"""
     ocr = os.path.join(d, "ocr_merged")
     write_pages(ocr, {
         "p-048.png": page_json("p-048.png", extra_lines or [
@@ -479,8 +474,7 @@ class TestApply(unittest.TestCase):
 
             # 文本真的改了（整行覆盖，两处/三处差异段都生效）
             got = jsonio.read(os.path.join(ocr, "p-048.png.json"))
-            texts = [L["t"] for L in got["lines"]]
-            self.assertIn("fang ist Tat，就是这个意思。", texts)
+            self.assertIn("fang ist Tat，就是这个意思。", [L["t"] for L in got["lines"]])
             got = jsonio.read(os.path.join(ocr, "p-303.png.json"))
             self.assertIn("mie Verlag，Berlin 1964.（哥特弗利德",
                           [L["t"] for L in got["lines"]])
@@ -511,6 +505,18 @@ class TestApply(unittest.TestCase):
             self.assertEqual(s2["already_applied"], 2)
             self.assertEqual(s2["applied"], 0)
 
+    def test_backup_can_be_disabled_or_redirected(self):
+        """备份的两个开关：--no-backup 不留备份，--backup-dir 换位置。"""
+        with tempfile.TemporaryDirectory() as d:
+            ocr, dp = _fixture(d)
+            run_ap("--work", d, "--decisions", dp, "--apply", "--no-backup")
+            self.assertFalse(os.path.exists(os.path.join(d, ".backup")))
+        with tempfile.TemporaryDirectory() as d:
+            ocr, dp = _fixture(d)
+            bak = os.path.join(d, "baks")
+            run_ap("--work", d, "--decisions", dp, "--apply", "--backup-dir", bak)
+            self.assertEqual(len(os.listdir(bak)), 1)
+
     def test_page_path_tolerates_padding_mismatch(self):
         """页名补零位数与磁盘不一致时也必须能回填。
 
@@ -522,7 +528,7 @@ class TestApply(unittest.TestCase):
             ocr = os.path.join(d, "ocr_merged")
             # 磁盘上是 3 位补零，裁决里写的是不补零的页名
             write_pages(ocr, {"p-001.png": page_json("p-001.png",
-                                                     [(10.0, "他引人了新方法。")])})
+                                                      [(10.0, "他引人了新方法。")])})
             doc = {"version": 1, "source": {"a": "t"}, "match": {"y_tol": 1.0},
                    "decisions": [
                        {"key": "p-1.png@10", "page": "p-1.png", "y0": 10.0,
@@ -554,25 +560,12 @@ class TestApply(unittest.TestCase):
             self.assertEqual([it["kind"] for it in items], ["missing"])
             self.assertIn("找不到页文件", items[0]["reason"])
 
-    def test_no_backup(self):
-        with tempfile.TemporaryDirectory() as d:
-            ocr, dp = _fixture(d)
-            run_ap("--work", d, "--decisions", dp, "--apply", "--no-backup")
-            self.assertFalse(os.path.exists(os.path.join(d, ".backup")))
-
-    def test_backup_dir_override(self):
-        with tempfile.TemporaryDirectory() as d:
-            ocr, dp = _fixture(d)
-            bak = os.path.join(d, "baks")
-            run_ap("--work", d, "--decisions", dp, "--apply", "--backup-dir", bak)
-            self.assertEqual(len(os.listdir(bak)), 1)
-
     def test_verdict_c_overrides_whole_line(self):
         """verdict=C 用 replacement 整行覆盖（两者都不对时人工给的写法）。"""
         with tempfile.TemporaryDirectory() as d:
             ocr = os.path.join(d, "ocr_merged")
             write_pages(ocr, {"p-001.png": page_json("p-001.png",
-                                                     [(10.0, "原行文本甲。")])})
+                                                      [(10.0, "原行文本甲。")])})
             dp = os.path.join(d, "out", "decisions.json")
             dec.write(dp, {"version": 1, "source": {}, "match": {},
                            "decisions": [dec.make_decision(

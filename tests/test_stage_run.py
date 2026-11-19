@@ -91,39 +91,37 @@ class TestVerify(unittest.TestCase):
         _pages_json(paths.ocr_dir(self.root, "ocr_fix", create=True),
                     ["p-001.png.json", "p-002.png.json"])
 
-    def test_unusable_textlayer_blocks_with_meta_reason(self):
-        """文字层不可用 -> 不能跑，且理由必须带上 _textlayer.meta 里的原文。
+    def test_textlayer_side_blocks_with_reason(self):
+        """A 侧（文字层）缺失的三种形态，理由要各不相同。
 
-        只写「先跑文字层」是不够的：这本的文字层**跑过了**，结论是不可用。
-        用户照那句话去重跑，只会再得到一次 usable=false。
+        最要紧的是「跑过了但不可用」：只说「先跑文字层」会让人去重跑，
+        而重跑只会再得到一次 usable=false。所以必须把 meta 里的原文理由
+        和「为什么这一侧是必需品」一起写出来。
         """
+        # 1) 压根没跑过：理由指向「先跑文字层」，不复制 meta 文案
+        ok, why = runs.stage_runnable(self.root, "verify")
+        self.assertFalse(ok)
+        self.assertIn("文字层", why)
+        self.assertNotIn("汉字", why)
+
+        # 2) 跑过了，结论是不可用：带 meta 原文 + 说明 A 侧为什么必需
         _textlayer_meta(self.root, False, TL_REASON)
         ok, why = runs.stage_runnable(self.root, "verify")
         self.assertFalse(ok)
         self.assertIn("汉字", why)
         self.assertIn(TL_REASON.split("：")[0], why)
         self.assertIn("文字层", why)
-        # 必须说清「为什么这一侧是必需品」，而不是只说缺文件
         self.assertIn("A 侧", why)
 
-    def test_blocks_when_textlayer_never_ran(self):
-        """meta 都没有（压根没跑过文字层）：理由换成「先跑文字层」，不复制 meta 文案。"""
-        ok, why = runs.stage_runnable(self.root, "verify")
-        self.assertFalse(ok)
-        self.assertIn("文字层", why)
-        self.assertNotIn("汉字", why)
-
-    def test_runnable_when_both_sides_have_pages(self):
+    def test_both_sides_ready_and_b_side_missing(self):
+        """两侧齐了才能跑；A 侧齐了但缺 ocr_fix 时理由要指向 B 侧。"""
         tl = _textlayer_meta(self.root, True, "350/350 页有文字，每页平均 620.0 个汉字")
         _pages_json(tl, ["p-001.png.json", "p-002.png.json"])
         ok, why = runs.stage_runnable(self.root, "verify")
         self.assertTrue(ok, why)
         self.assertEqual(why, "")
 
-    def test_blocks_when_ocr_side_missing(self):
-        """A 侧齐了但没有 ocr_fix：理由要指向 B 侧，不能笼统说「跑不了」。"""
-        tl = _textlayer_meta(self.root, True, "可用")
-        _pages_json(tl, ["p-001.png.json"])
+        # B 侧缺失：理由要指向 ocr_fix，不能笼统说「跑不了」
         shutil.rmtree(paths.ocr_dir(self.root, "ocr_fix"), ignore_errors=True)
         ok, why = runs.stage_runnable(self.root, "verify")
         self.assertFalse(ok)
@@ -140,21 +138,32 @@ class TestVerify(unittest.TestCase):
 
 
 class TestRenderAndTextlayer(_TmpCase):
-    def test_render_needs_a_pdf(self):
+    def test_render_needs_a_pdf_from_any_source(self):
+        """render 的判据只有一个：找得到源 PDF。三种来源都要认。
+
+        manifest.input.pdf 是**相对 run 根**的路径（manifest.py:rel），不是仓库相对；
+        它指向的文件消失后不能算能跑（I1 那个悬空 PDF）；WebUI 上传落点
+        input/<book-id>/source.pdf 也算有源（此时 manifest 还是空的）。
+        """
         root = self.run_root()
         ok, why = runs.stage_runnable(root, "render")
         self.assertFalse(ok)
         self.assertIn("没有源 PDF", why)
 
-    def test_render_runnable_with_manifest_pdf(self):
-        """manifest.input.pdf 是相对 run 根的路径（manifest.py:rel），不能当仓库相对。"""
-        root = self.run_root()
+        # manifest 记着的相对路径
         pdf = os.path.join(root, "src", "book.pdf")
         os.makedirs(os.path.dirname(pdf))
         open(pdf, "wb").close()
         mf.set_input(root, pdf=pdf)
         self.assertEqual(mf.read(root)["input"]["pdf"], "src/book.pdf")
-        ok, why = runs.stage_runnable(root, "render")
+        self.assertTrue(runs.stage_runnable(root, "render")[0])
+
+        # WebUI 上传落点同样算有源（此时 manifest 里还没有 input.pdf）
+        up = self.run_root("uploaded")
+        with mock.patch.object(paths, "repo_root", lambda: self.d):
+            dst = os.path.join(paths.input_dir("uploaded", create=True), "source.pdf")
+            open(dst, "wb").close()
+            ok, why = runs.stage_runnable(up, "render")
         self.assertTrue(ok, why)
 
     def test_manifest_pdf_that_no_longer_exists_is_not_runnable(self):
@@ -165,24 +174,16 @@ class TestRenderAndTextlayer(_TmpCase):
         self.assertFalse(ok)
         self.assertIn("没有源 PDF", why)
 
-    def test_render_accepts_uploaded_source_pdf(self):
-        """WebUI 上传落点 input/<book-id>/source.pdf 也算有源（此时 manifest 还是空的）。"""
-        root = self.run_root("uploaded")
-        with mock.patch.object(paths, "repo_root", lambda: self.d):
-            dst = os.path.join(paths.input_dir("uploaded", create=True), "source.pdf")
-            open(dst, "wb").close()
-            ok, why = runs.stage_runnable(root, "render")
-        self.assertTrue(ok, why)
+    def test_textlayer_needs_pdf_and_poppler_in_that_order(self):
+        """文字层的两条前置要按顺序判：没 PDF 时说 PDF，有 PDF 时才说 poppler。
 
-    def test_textlayer_needs_pdf_first(self):
-        """没 PDF 时文字层的理由是「没有源 PDF」，不是「缺 poppler」——顺序不能反。"""
+        顺序反了会误导人——先去装 poppler，装完发现还是跑不了。
+        """
         root = self.run_root()
         ok, why = runs.stage_runnable(root, "textlayer")
         self.assertFalse(ok)
         self.assertIn("没有源 PDF", why)
 
-    def test_textlayer_needs_pdftotext(self):
-        root = self.run_root()
         pdf = os.path.join(root, "b.pdf")
         open(pdf, "wb").close()
         mf.set_input(root, pdf=pdf)
@@ -191,11 +192,6 @@ class TestRenderAndTextlayer(_TmpCase):
         self.assertFalse(ok)
         self.assertIn("pdftotext", why)
 
-    def test_textlayer_runnable_with_pdf_and_poppler(self):
-        root = self.run_root()
-        pdf = os.path.join(root, "b.pdf")
-        open(pdf, "wb").close()
-        mf.set_input(root, pdf=pdf)
         with mock.patch.object(runs.shutil, "which", lambda _n: "C:/poppler/pdftotext.exe"):
             ok, why = runs.stage_runnable(root, "textlayer")
         self.assertTrue(ok, why)
@@ -204,54 +200,56 @@ class TestRenderAndTextlayer(_TmpCase):
 class TestChain(_TmpCase):
     """上游产物决定下游能不能跑：这条链上任何一环都不能假定「目录在 = 产物在」。"""
 
-    def test_ocr_needs_rendered_pages(self):
+    def test_each_stage_needs_its_upstream_artifact(self):
+        """上游产物决定下游能不能跑：这条链上任何一环都不能假定「目录在 = 产物在」。
+
+        逐段验：OCR 要页图、修复要 ocr、版面要 ocr_fix（没有就退回 ocr）、
+        Markdown 要任一 OCR 目录有页 JSON（空目录不算）。
+        """
         root = self.run_root()
-        self.assertFalse(runs.stage_runnable(root, "ocr")[0])
+        # 空目录：每一环都不可跑，且理由指向它的**直接上游**（不能笼统说「跑不了」）
+        for stage, upstream in (("ocr", "渲染"), ("repair", "OCR"),
+                                ("layout", "修复"), ("md", "OCR")):
+            with self.subTest(stage=stage):
+                ok, why = runs.stage_runnable(root, stage)
+                self.assertFalse(ok)
+                self.assertIn(upstream, why)
+
+        # 补页图 -> OCR 可跑
         open(os.path.join(paths.pages_dir(root, create=True), "p-001.png"), "wb").close()
         self.assertTrue(runs.stage_runnable(root, "ocr")[0])
 
-    def test_repair_needs_ocr(self):
-        root = self.run_root()
-        self.assertFalse(runs.stage_runnable(root, "repair")[0])
+        # 补 ocr 页 JSON -> 修复可跑；版面分析退回 ocr 读，也算可跑（不是死按钮）
         _pages_json(paths.ocr_dir(root, "ocr", create=True), ["p-001.png.json"])
         self.assertTrue(runs.stage_runnable(root, "repair")[0])
-
-    def test_layout_falls_back_to_ocr(self):
-        """ocr_fix 空但 ocr 有页：layout 读得到东西，就该说能跑（不是死按钮）。"""
-        root = self.run_root()
-        self.assertFalse(runs.stage_runnable(root, "layout")[0])
-        _pages_json(paths.ocr_dir(root, "ocr", create=True), ["p-001.png.json"])
         self.assertTrue(runs.stage_runnable(root, "layout")[0])
+        # 有了 ocr_fix 之后仍然可跑（两种情况都要认）
         _pages_json(paths.ocr_dir(root, "ocr_fix", create=True), ["p-001.png.json"])
         self.assertTrue(runs.stage_runnable(root, "layout")[0])
 
-    def test_md_accepts_any_ocr_dir(self):
-        root = self.run_root()
-        ok, why = runs.stage_runnable(root, "md")
-        self.assertFalse(ok)
-        self.assertIn("OCR", why)
+        # md 认任一 OCR 目录：只有 ocr_text 有页也该认
+        self.assertTrue(runs.stage_runnable(root, "md")[0])
         _pages_json(paths.ocr_dir(root, "ocr_text", create=True), ["p-001.png.json"])
         self.assertTrue(runs.stage_runnable(root, "md")[0])
 
-    def test_md_ignores_dirs_that_exist_but_have_no_pages(self):
-        """目录在、一个页 JSON 都没有（O5 那种状态）：不能当成「有产物」。"""
+    def test_empty_dirs_and_flat_layout_are_handled(self):
+        """两个容易判错的形状：目录在但一页没有（O5 那种状态）不能当有产物；
+        旧书是 flat 布局（pages/ 直接躺在 run 根），不能因为写死 work/ 就判成没页图。"""
         root = self.run_root()
         for name in ("ocr_layout", "ocr_fix", "ocr", "ocr_text"):
             os.makedirs(paths.ocr_dir(root, name, create=True), exist_ok=True)
-        self.assertFalse(runs.stage_runnable(root, "md")[0])
+        self.assertFalse(runs.stage_runnable(root, "md")[0], "空目录不算有产物")
         _pages_json(paths.ocr_dir(root, "ocr_layout"), ["p-001.png.json"])
         self.assertTrue(runs.stage_runnable(root, "md")[0])
 
-    def test_flat_layout_is_resolved_through_paths(self):
-        """旧书是 flat 布局（pages/ 直接躺在 run 根）：不能因为写死 work/ 就判成没页图。"""
-        root = os.path.join(self.d, "flatbook")
-        os.makedirs(os.path.join(root, "pages"))
-        open(os.path.join(root, "pages", "p-001.png"), "wb").close()
-        _pages_json(os.path.join(root, "ocr"), ["p-001.png.json"])
-        self.assertEqual(paths.layout_of(root), paths.LAYOUT_FLAT)
-        self.assertTrue(runs.stage_runnable(root, "ocr")[0])
-        self.assertTrue(runs.stage_runnable(root, "repair")[0])
-        self.assertTrue(runs.stage_runnable(root, "md")[0])
+        flat = os.path.join(self.d, "flatbook")
+        os.makedirs(os.path.join(flat, "pages"))
+        open(os.path.join(flat, "pages", "p-001.png"), "wb").close()
+        _pages_json(os.path.join(flat, "ocr"), ["p-001.png.json"])
+        self.assertEqual(paths.layout_of(flat), paths.LAYOUT_FLAT)
+        self.assertTrue(runs.stage_runnable(flat, "ocr")[0])
+        self.assertTrue(runs.stage_runnable(flat, "repair")[0])
+        self.assertTrue(runs.stage_runnable(flat, "md")[0])
 
 
 class TestReportStages(_TmpCase):
@@ -279,16 +277,22 @@ class TestReportStages(_TmpCase):
 
 
 class TestNeverRaises(_TmpCase):
-    def test_unknown_stage(self):
+    def test_degenerate_inputs_never_raise(self):
+        """它站在 /api/state 的渲染链上：未知阶段、run 不存在、OSError
+        都必须退化成「不可运行 + 一句理由」，绝不抛。"""
         root = self.run_root()
         ok, why = runs.stage_runnable(root, "prune")
         self.assertFalse(ok)
         self.assertIn("prune", why)
 
-    def test_missing_run_root(self):
         ok, why = runs.stage_runnable(os.path.join(self.d, "no-such-run"), "verify")
         self.assertFalse(ok)
         self.assertTrue(why)
+
+        with mock.patch.object(runs.paths, "work_dir", side_effect=OSError("盘掉了")):
+            ok, why = runs.stage_runnable(root, "ocr")
+        self.assertFalse(ok)
+        self.assertIn("盘掉了", why)
 
     def test_corrupt_manifest_and_meta(self):
         """manifest 与 _textlayer.meta 都是元数据：坏了只能退化成「不可运行」，不能抛。"""
@@ -303,13 +307,6 @@ class TestNeverRaises(_TmpCase):
             self.assertIsInstance(ok, bool, name)
             self.assertIsInstance(why, str, name)
         self.assertFalse(runs.stage_runnable(root, "verify")[0])
-
-    def test_oserror_is_swallowed(self):
-        root = self.run_root()
-        with mock.patch.object(runs.paths, "work_dir", side_effect=OSError("盘掉了")):
-            ok, why = runs.stage_runnable(root, "ocr")
-        self.assertFalse(ok)
-        self.assertIn("盘掉了", why)
 
 
 class TestReadOnly(_TmpCase):

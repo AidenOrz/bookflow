@@ -5,17 +5,11 @@
 新书（tiered）才能用上新目录。任何一条写错，就会变成
 「旧书读不出来」或「新书又平铺回第一层」。
 
-用例全部对应 IO-CONVENTIONS.md 里的编号：
+用例对应 IO-CONVENTIONS.md 的编号：flat 的 out/ 路径与改动前完全一致（O1/O6）、
+四类产物分家、备份不能在数据目录内部（O10）、manifest 缺失/损坏不挡出书、
+failed 不算做完（O5）、run id 不许越界、推断阶段必须带 inferred 标记。
 
-- test_flat_layout_keeps_old_paths：flat 的 out/ 路径必须与改动前完全一致（O1/O6）。
-- test_tiered_layout_splits_four_kinds：四类产物分家（§3 的四类边界表）。
-- test_backup_is_outside_data_dir：备份不能落在被备份目录内部（O10）。
-- test_manifest_missing_is_empty_not_error：manifest 缺失/损坏都不能挡住出书（§4.4）。
-- test_failed_stage_is_not_done：failed 不算做完，否则进度条会骗人（O5）。
-- test_run_id_rejects_traversal：run id 不许越出仓库。
-- test_inferred_stages_are_marked：推断出来的阶段必须带 inferred 标记（O5）。
-
-运行：python -X utf8 -m unittest discover -s tests
+**用例组织方式**：同一个对象的规则合并进少数几个方法，用 subTest 分跑各条输入。
 """
 import os
 import sys
@@ -51,16 +45,19 @@ class TestLayout(unittest.TestCase):
         self.assertEqual(paths.layout_of(self.d), paths.LAYOUT_FLAT)
 
     def test_flat_layout_keeps_old_paths(self):
+        """flat 的所有角色路径必须与改动前逐字一致——四个既有工作目录靠这条活着。"""
         os.makedirs(os.path.join(self.d, "pages"))
         os.makedirs(os.path.join(self.d, "out"))
         self.assertEqual(paths.layout_of(self.d), paths.LAYOUT_FLAT)
-        self.assertEqual(paths.work_dir(self.d), os.path.abspath(self.d))
-        self.assertEqual(paths.report_dir(self.d), os.path.join(self.d, "out"))
-        self.assertEqual(paths.review_dir(self.d), os.path.join(self.d, "out"))
-        self.assertEqual(paths.decisions_path(self.d),
-                         os.path.join(self.d, "out", "decisions.json"))
-        self.assertEqual(paths.book_md(self.d),
-                         os.path.join(self.d, "out", "book.md"))
+        for got, want in (
+            (paths.work_dir(self.d), os.path.abspath(self.d)),
+            (paths.report_dir(self.d), os.path.join(self.d, "out")),
+            (paths.review_dir(self.d), os.path.join(self.d, "out")),
+            (paths.decisions_path(self.d), os.path.join(self.d, "out", "decisions.json")),
+            (paths.book_md(self.d), os.path.join(self.d, "out", "book.md")),
+        ):
+            with self.subTest(want=want):
+                self.assertEqual(got, want)
 
     def test_tiered_layout_splits_four_kinds(self):
         dirs = paths.ensure_tiered(self.d)
@@ -87,15 +84,17 @@ class TestLayout(unittest.TestCase):
         paths.ensure_tiered(self.d)
         self.assertTrue(paths.is_tiered(self.d))
 
-    def test_work_dir_does_not_create_by_default(self):
-        """只查询路径不该有副作用（否则 git status 会凭空多出空目录）。"""
+    def test_queries_have_no_side_effects_and_backup_is_outside(self):
+        """两条「不该发生的事」一起验：查询不建目录；备份不在数据目录内部。
+
+        前者：只查路径却建出空目录，git status 会凭空多出东西。
+        后者（O10）：备份放在被备份目录里，prune 删整个 ocr_merged 时连备份一起删。
+        """
         before = set(os.listdir(self.d))
         paths.work_dir(self.d, create=False)
         paths.report_dir(self.d, create=False)
         self.assertEqual(set(os.listdir(self.d)), before)
 
-    def test_backup_is_outside_data_dir(self):
-        """O10：备份必须落在 work/.backup，不能是 <src>/.bak。"""
         paths.ensure_tiered(self.d)
         bak = paths.backup_dir(self.d)
         ocr = paths.ocr_dir(self.d, "ocr_merged")
@@ -109,13 +108,11 @@ class TestManifest(unittest.TestCase):
         self.addCleanup(__import__("shutil").rmtree, self.d, True)
         paths.ensure_tiered(self.d)
 
-    def test_manifest_missing_is_empty_not_error(self):
+    def test_missing_or_corrupt_manifest_is_empty_not_error(self):
+        """元数据文件没有资格挡住出书：缺失与损坏都退回空骨架。"""
         doc = mf.read(self.d)
         self.assertEqual(doc["stages"], {})
         self.assertEqual(doc["input"], {})
-
-    def test_corrupt_manifest_is_empty_not_error(self):
-        """坏文件不能让流水线崩：元数据文件没有资格挡住出书。"""
         with open(os.path.join(self.d, "manifest.json"), "w", encoding="utf-8") as f:
             f.write("{ 这不是 json")
         self.assertEqual(mf.read(self.d)["stages"], {})
@@ -133,60 +130,62 @@ class TestManifest(unittest.TestCase):
         pdf = os.path.join(self.d, "b.pdf")
         touch(pdf, None, "第一版")
         mf.set_input(self.d, pdf=pdf)
-        self.assertEqual(mf.verify_input(self.d, pdf)[0], True)
+        self.assertTrue(mf.verify_input(self.d, pdf)[0])
         touch(pdf, None, "第二版内容不同")
         same, old, new = mf.verify_input(self.d, pdf)
         self.assertFalse(same)
         self.assertNotEqual(old, new)
 
-    def test_set_stage_and_status(self):
-        mf.set_stage(self.d, "render", "ok", count=310, out=os.path.join(self.d, "work", "pages"))
+    def test_set_stage_records_and_corrects_illegal_status(self):
+        mf.set_stage(self.d, "render", "ok", count=310,
+                     out=os.path.join(self.d, "work", "pages"))
         rec = mf.read(self.d)["stages"]["render"]
         self.assertEqual(rec["status"], "ok")
         self.assertEqual(rec["count"], 310)
         self.assertEqual(rec["out"], "work/pages")
         self.assertEqual(mf.stage_status(self.d, "render"), "ok")
         self.assertEqual(mf.stage_status(self.d, "ocr"), "missing")
-
-    def test_illegal_status_becomes_failed(self):
+        # 非法状态就地纠正成 failed，不写脏数据
         mf.set_stage(self.d, "ocr", "weird")
         self.assertEqual(mf.stage_status(self.d, "ocr"), "failed")
 
-    def test_failed_stage_is_not_done(self):
-        """failed 不算做完：否则一个阶段失败，进度条仍显示 100%。"""
-        mf.set_stage(self.d, "render", "ok")
-        mf.set_stage(self.d, "ocr", "failed")
-        done, total, pct, cur = mf.progress(self.d)
-        self.assertEqual(done, 1)
-        self.assertEqual(total, len(mf.STAGES))
-        self.assertEqual(cur, "ocr")
-
-    def test_degraded_and_skipped_count_as_done(self):
+    def test_progress_counts_only_finished_statuses(self):
+        """failed 不算做完（否则一个阶段失败，进度条仍显示 100%）；
+        degraded / skipped 算做完。"""
         mf.set_stage(self.d, "render", "ok")
         mf.set_stage(self.d, "textlayer", "degraded")
         mf.set_stage(self.d, "ocr", "skipped")
-        done, _t, _p, cur = mf.progress(self.d)
+        done, total, _pct, cur = mf.progress(self.d)
         self.assertEqual(done, 3)
+        self.assertEqual(total, len(mf.STAGES))
         self.assertEqual(cur, "")
+
+        mf2 = tempfile.mkdtemp(prefix=".tmp-man2-")
+        self.addCleanup(__import__("shutil").rmtree, mf2, True)
+        mf.set_stage(mf2, "render", "ok")
+        mf.set_stage(mf2, "ocr", "failed")
+        done, total, _pct, cur = mf.progress(mf2)
+        self.assertEqual(done, 1)
+        self.assertEqual(cur, "ocr")
 
 
 class TestRunIds(unittest.TestCase):
-    def test_resolve_rejects_traversal(self):
-        for bad in ("../x", "a/b/c", "/abs/path", "C:/Windows", "..", "runs/../../x"):
-            self.assertIsNone(runs.resolve(bad), bad)
-
-    def test_resolve_accepts_dot_and_plain(self):
+    def test_resolve_accepts_valid_shapes(self):
         repo = paths.repo_root()
-        self.assertEqual(runs.resolve("."), repo)
-        self.assertEqual(runs.resolve("run-lacan"),
-                         os.path.join(repo, "run-lacan"))
-        self.assertEqual(runs.resolve("runs/lacan"),
-                         os.path.join(repo, "runs", "lacan"))
+        for rid, want in (
+            (".", repo),
+            ("run-lacan", os.path.join(repo, "run-lacan")),
+            ("runs/lacan", os.path.join(repo, "runs", "lacan")),
+        ):
+            with self.subTest(run_id=rid):
+                self.assertEqual(runs.resolve(rid), want)
 
-    def test_resolve_rejects_non_ascii_id(self):
-        """中文目录名不接受：本项目的产物名已经带全角标点，再叠中文路径
-        会在 URL 编码与命令行 quoting 上多出两类失败面。"""
-        self.assertIsNone(runs.resolve("拉康"))
+    def test_resolve_rejects_traversal_and_non_ascii(self):
+        """越界与中文 id 都不接受：产物名已带全角标点，再叠中文路径会在
+        URL 编码与命令行 quoting 上多出两类失败面。"""
+        for bad in ("../x", "a/b/c", "/abs/path", "C:/Windows", "..", "runs/../../x", "拉康"):
+            with self.subTest(run_id=bad):
+                self.assertIsNone(runs.resolve(bad))
 
 
 class TestRunSummary(unittest.TestCase):
@@ -220,8 +219,6 @@ class TestRunSummary(unittest.TestCase):
                          dec.make_decision("p-002.png", 20.0, A="a", B="b", verdict="A")])
         dec.write(paths.decisions_path(self.root), doc)
         self.assertEqual(runs.pending_decisions(self.root), (1, 2))
-
-    def test_unknown_run_returns_none(self):
         self.assertIsNone(runs.summary("no-such-book", repo=self.d))
 
 

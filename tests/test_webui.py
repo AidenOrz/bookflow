@@ -137,27 +137,28 @@ class TestState(ServerCase):
 
 
 class TestPathsSafety(ServerCase):
-    def test_unknown_run_404(self):
+    def test_traversal_is_blocked_everywhere(self):
+        """能读 /etc 就等于任意文件读。三条路都要挡住：
+        run id、file 参数、绝对路径。"""
+        # 不存在的 run
         st, d = self.jreq("GET", "/api/runs/nope/report")
         self.assertEqual(st, 404)
         self.assertIn("error", d)
 
-    def test_path_traversal_blocked(self):
         _mk_run(self.tmp, "run-a")
+        # file 参数不许越出仓库
         for bad in ("..%2F..%2Fetc%2Fpasswd", ".%2E/.%2E/secret", "..%5C..%5Cwin.ini"):
-            st, _h, _raw = self.req("GET", "/api/runs/run-a/file?path=" + bad)
-            self.assertIn(st, (400, 404), bad)
-            self.assertNotEqual(st, 200, bad)
-
-    def test_run_id_traversal_blocked(self):
-        # resolve() 是第一道闸；这里验它后面确实拦得住
-        self.assertIsNone(runs.resolve("../../etc", self.tmp))
-        self.assertIsNone(runs.resolve("a/b/c", self.tmp))
-
-    def test_absolute_path_rejected(self):
-        _mk_run(self.tmp, "run-a")
+            with self.subTest(param=bad):
+                st, _h, _raw = self.req("GET", "/api/runs/run-a/file?path=" + bad)
+                self.assertIn(st, (400, 404), bad)
+                self.assertNotEqual(st, 200, bad)
+        # 绝对路径同样拒绝
         st, _h, _raw = self.req("GET", "/api/runs/run-a/file?path=C:/Windows/win.ini")
         self.assertIn(st, (400, 404))
+        # run id 本身是第一道闸
+        for bad in ("../../etc", "a/b/c"):
+            with self.subTest(run_id=bad):
+                self.assertIsNone(runs.resolve(bad, self.tmp))
 
 
 class TestDecisionsApi(ServerCase):
@@ -189,61 +190,63 @@ class TestDecisionsApi(ServerCase):
         self.assertTrue(d["missing"])
         self.assertEqual(d["total"], 0)
 
-    def test_decisions_post_is_all_or_nothing(self):
-        """一条非法就整份不写：裁决表是唯一不可重建的产物。"""
+    def test_rejected_updates_never_partially_write(self):
+        """三种非法更新都必须**整份不写**：裁决表是唯一不可重建的产物，
+        改了一半是最坏结果（与 make_table --import 同口径）。"""
         root = _mk_run(self.tmp, "run-a", lines=2)
-        with open(paths.decisions_path(root), "rb") as f:
+        dp = paths.decisions_path(root)
+        with open(dp, "rb") as f:
             before = f.read()
-        st, d = self.jreq("POST", "/api/runs/run-a/decisions", {"updates": [
-            {"key": "p-001.png@100", "verdict": "B"},        # 合法
-            {"key": "p-002.png@200", "verdict": "C"},        # C 缺整行 -> 非法
-        ]})
-        self.assertEqual(st, 400)
-        self.assertIn("error", d)
-        with open(paths.decisions_path(root), "rb") as f:
-            self.assertEqual(f.read(), before)
 
-    def test_unknown_key_rejected(self):
-        root = _mk_run(self.tmp, "run-a", lines=1)
-        st, d = self.jreq("POST", "/api/runs/run-a/decisions", {"updates": [
-            {"key": "p-999.png@1", "verdict": "A"}]})
-        self.assertEqual(st, 400)
-        self.assertEqual(dec.read(paths.decisions_path(root))["decisions"][0]["verdict"], "?")
+        doc = dec.read(dp)
+        doc["decisions"].append(dec.make_decision("p-009.png", None, verdict="?",
+                                                   note="未定位行：x", tag=7))
+        dec.write(dp, doc)
+        unlocated_key = doc["decisions"][-1]["key"]
+        with open(dp, "rb") as f:
+            before = f.read()
 
-    def test_valid_update_resets_status(self):
+        for updates, needles in (
+            # 一条合法一条非法（C 缺整行）：整份拒绝，detail 里要指到那一条
+            ([{"key": "p-001.png@100", "verdict": "B"},
+              {"key": "p-002.png@200", "verdict": "C"}], ("p-002.png@200", "C")),
+            # 键不存在（表格来自别的书）
+            ([{"key": "p-999.png@1", "verdict": "A"}], ("键不存在",)),
+            # 未定位条目判 B：apply 会判 missing，这里必须先拦下并说清怎么修
+            ([{"key": unlocated_key, "verdict": "B"}], ("y0",)),
+        ):
+            with self.subTest(needles=needles, n=len(updates)):
+                st, d = self.jreq("POST", "/api/runs/run-a/decisions",
+                                  {"updates": updates})
+                self.assertEqual(st, 400)
+                msg = (d.get("detail") or "") + (d.get("error") or "")
+                for needle in needles:
+                    self.assertIn(needle, msg)
+                with open(dp, "rb") as f:
+                    self.assertEqual(f.read(), before, "非法更新不许写盘")
+
+    def test_valid_update_semantics(self):
+        """合法更新：改判定 + 重置 status（上次的 applied 就不作数了）；
+        判定没变时跳过（幂等）。"""
         root = _mk_run(self.tmp, "run-a", lines=1)
-        doc = dec.read(paths.decisions_path(root))
+        dp = paths.decisions_path(root)
+        doc = dec.read(dp)
         doc["decisions"][0]["status"] = "applied"
-        dec.write(paths.decisions_path(root), doc)
-        st, d = self.jreq("POST", "/api/runs/run-a/decisions", {"updates": [
-            {"key": "p-001.png@100", "verdict": "B"}]})
+        dec.write(dp, doc)
+        st, d = self.jreq("POST", "/api/runs/run-a/decisions",
+                          {"updates": [{"key": "p-001.png@100", "verdict": "B"}]})
         self.assertEqual(st, 200)
         self.assertEqual(d["changed"], 1)
-        e = dec.read(paths.decisions_path(root))["decisions"][0]
+        e = dec.read(dp)["decisions"][0]
         self.assertEqual(e["verdict"], "B")
-        # 判定变了，上次的 applied 就不作数了，否则 apply 会跳过它
-        self.assertEqual(e["status"], "pending")
+        self.assertEqual(e["status"], "pending", "判定变了，applied 就不作数了")
 
-    def test_idempotent_update_is_skipped(self):
-        root = _mk_run(self.tmp, "run-a", lines=1, verdict="B")
-        st, d = self.jreq("POST", "/api/runs/run-a/decisions", {"updates": [
-            {"key": "p-001.png@100", "verdict": "B"}]})
+        # 再发一次同样的判定：跳过，不重复计数
+        st, d = self.jreq("POST", "/api/runs/run-a/decisions",
+                          {"updates": [{"key": "p-001.png@100", "verdict": "B"}]})
         self.assertEqual(st, 200)
         self.assertEqual(d["changed"], 0)
         self.assertEqual(d["skipped"], 1)
-
-    def test_b_without_y0_rejected(self):
-        """未定位条目判 B 会被 apply 判 missing，这里必须先拦下并说清楚怎么修。"""
-        root = _mk_run(self.tmp, "run-a", lines=1)
-        doc = dec.read(paths.decisions_path(root))
-        doc["decisions"].append(dec.make_decision("p-009.png", None, verdict="?",
-                                                  note="未定位行：x", tag=7))
-        dec.write(paths.decisions_path(root), doc)
-        key = doc["decisions"][-1]["key"]
-        st, d = self.jreq("POST", "/api/runs/run-a/decisions", {"updates": [
-            {"key": key, "verdict": "B"}]})
-        self.assertEqual(st, 400)
-        self.assertIn("y0", d["detail"])
 
 
 class TestApplyGate(ServerCase):
@@ -268,21 +271,17 @@ class TestApplyGate(ServerCase):
 
 
 class TestReportView(ServerCase):
-    def test_report_defaults_when_missing(self):
+    def test_missing_artifacts_give_empty_not_500(self):
+        """产物缺失时接口要给"空"而不是报错：report 给空骨架、manifest 给空表、
+        epub 给 404（前端据此显示"还没有成品"）。"""
         _mk_run(self.tmp, "run-a")
         st, d = self.jreq("GET", "/api/runs/run-a/report")
         self.assertEqual(st, 200)
         self.assertEqual(d["pages"], 0)
         self.assertEqual(d["toc"]["tree"], [])
-
-    def test_manifest_empty_when_missing(self):
-        _mk_run(self.tmp, "run-a")
         st, d = self.jreq("GET", "/api/runs/run-a/manifest")
         self.assertEqual(st, 200)
         self.assertEqual(d.get("stages"), {})
-
-    def test_epub_404_when_absent(self):
-        _mk_run(self.tmp, "run-a")
         st, d = self.jreq("GET", "/api/runs/run-a/epub")
         self.assertEqual(st, 404)
 
@@ -305,15 +304,22 @@ class TestMultipart(ServerCase):
 
 
 class TestSanitize(unittest.TestCase):
-    def test_book_id_is_ascii_slug(self):
+    def test_ids_and_ascii_names(self):
+        """book id 只收 ASCII slug；送给浏览器的下载名也必须是纯 ASCII。
+
+        两个都是 URL / Content-Disposition 的硬要求：中文 id 会在编码与
+        命令行 quoting 上多出两类失败面，非 ASCII 文件名会让部分浏览器
+        存成乱码。
+        """
         self.assertEqual(ws._sanitize_id("拉康式主体"), "")
         self.assertEqual(ws._sanitize_id("Lacan Subject"), "lacan-subject")
         self.assertEqual(ws._sanitize_id("a" * 100), "a" * 40)
-
-    def test_ascii_fallback_name(self):
+        # 下载名：非 ASCII 全部替换掉，扩展名保留
         self.assertEqual(ws._ascii_name("拉康.epub"), "__.epub")
         self.assertTrue(ws._ascii_name("a b.epub").endswith(".epub"))
 
 
+if __name__ == "__main__":
+    unittest.main()
 if __name__ == "__main__":
     unittest.main()

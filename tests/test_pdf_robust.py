@@ -20,6 +20,7 @@
 x 跨度差 1~2pt），不写"假想的漂亮数据"。两个缺陷的判据都要能被反例打穿：
 把修复前的逻辑放回去，这些用例必须红。
 """
+import io
 import os
 import subprocess
 import sys
@@ -71,51 +72,36 @@ class TestTwoLayerPdf(unittest.TestCase):
     def _texts(self, page, dpi=72):
         return [L["t"] for L in textlayer.page_lines(page, dpi)]
 
-    def test_duplicate_layer_collapsed_to_one_line(self):
-        """两套文字只应留下**一条**，不是两条。
+    def test_two_layers_are_split_then_collapsed(self):
+        """叠字图层的核心路径：先按字高拆成两条候选，再按几何合并成一条。
 
-        这是核心断言：修复前 page_lines 返回 2 条（「回到精神分析本身来说」出现
-        两次），成书里每句话都念两遍。真书 288/310 页中招。
+        不先拆的话 group_lines 会把两套并进同一行，拼出来是
+        「…来说回到精神分析本身来说」这种黏连；不合并的话成书里每句话念两遍
+        （实测真书 288/310 页中招，261,359 汉字 vs 真实值 146,866）。
         """
         page = two_layer_page(P011_PIECES, P011_WHOLE)
         texts = self._texts(page)
-        self.assertEqual(texts, [P011_WHOLE],
-                         "叠字图层必须合并成一条，实际=%r" % (texts,))
+        self.assertEqual(texts, [P011_WHOLE], "叠字图层必须合并成一条，实际=%r" % (texts,))
 
-    def test_split_mixed_height_row_detects_two_layers(self):
-        """拆行函数本身要能认出「小框簇 + 整行框」这种两簇字高。
-
-        拆是合并的前提：不先拆成两条候选，group_lines 会把两套并进同一行，
-        拼出来是「…来说回到精神分析本身来说」这种黏连。
-        """
-        page = two_layer_page(P011_PIECES, P011_WHOLE)
         rows = textlayer.group_lines(textlayer.dedupe_words(page["words"]), 3.0)
         parts = []
         for r in rows:
             parts.extend(textlayer.split_mixed_height_row(r))
         self.assertEqual(len(parts), 2, "应在字高间隙处拆成两条候选，实际=%d 条" % len(parts))
-        # 小框那簇只有 5 个词，大框那簇只有 1 个
-        self.assertEqual(sorted(len(p) for p in parts), [1, 5])
+        self.assertEqual(sorted(len(p) for p in parts), [1, 5], "小框簇 5 词、大框簇 1 词")
 
-    def test_note_number_at_line_end_not_split(self):
-        """行尾上标注号不许触发拆行——它只占最右边一点点宽度。
-
-        若只按"这一行有两簇字高"就拆，几乎每条带注号的正文都会被拆成两条。
-        真书的注号实测就是这种形状：字高 ~6pt、贴在行尾。
-        """
+    def test_negative_cases_never_split(self):
+        """拆行的两个反例：行尾注号、单层 PDF。拆错任何一条都会毁掉大量正文。"""
+        # 行尾上标注号只占最右边一点点宽度，不许触发拆行
         ws = [word(60, 71, 94.8, 105.8, "回"), word(71, 82, 94.8, 105.8, "到"),
               word(82, 93, 94.8, 105.8, "精"), word(93, 104, 94.8, 105.8, "神"),
-              # 行尾注号与正文同基线（同基线才考验"按字高拆"这条规则本身）
+              # 与正文同基线（同基线才考验"按字高拆"这条规则本身）
               word(430, 436, 99.8, 105.8, "1")]
         row = textlayer.group_lines(textlayer.dedupe_words(ws), 3.0)[0]
         self.assertEqual(len(textlayer.split_mixed_height_row(row)), 1,
                          "行尾注号的 x 跨度远小于行宽，不许拆")
 
-    def test_single_layer_pdf_untouched(self):
-        """单层 PDF 上拆行与合并都必须零触发——三本参照书实测如此。
-
-        用真书的正文行形状（SimSun 11pt 逐字框，全部同高），拆行与合并都不该动它。
-        """
+        # 单层 PDF（三本参照书的形状）：拆行与合并都必须零触发
         ws = [word(60 + i * 11, 71 + i * 11, 94.8, 105.8, ch)
               for i, ch in enumerate("回到精神分析本身来说")]
         page = {"w": 500.0, "h": 796.0, "words": ws}
@@ -125,36 +111,32 @@ class TestTwoLayerPdf(unittest.TestCase):
                          "同一字高的整行不是叠字图层，不许拆")
         self.assertEqual(len(textlayer.page_lines(page, 72)), 1)
 
-    def test_short_rows_not_merged(self):
-        """页码/注号这种短行不许被合并——实测残留的 428 对几乎全是「VI」vs「VII」。"""
-        rows = [
+    def test_collapse_guards(self):
+        """合并的三个守卫：短行不合、跨度不够不合、合并时留信息多的那份。"""
+        # 页码/注号这种短行不许合并——实测残留的 428 对几乎全是「VI」vs「VII」
+        short = [
             {"x0": 60.0, "y0": 741.0, "x1": 84.0, "y1": 752.0, "t": "VI"},
             {"x0": 62.0, "y0": 741.0, "x1": 84.0, "y1": 767.0, "t": "VII"},
         ]
-        self.assertEqual(len(textlayer.collapse_duplicate_rows(rows)), 2)
+        self.assertEqual(len(textlayer.collapse_duplicate_rows(short)), 2)
 
-    def test_almost_same_span_required(self):
-        """x 跨度只部分重叠（正文引文压在别的行上）时不许合并。
-
-        实测把覆盖门槛从 0.98 放宽到 0.90 只多合 36 对，而且全是假的：
-        「1/0组合。」vs「1/0组合。」这类把正确文本和漏字文本混在一起。
-        """
-        rows = [
+        # 跨度过半不算叠字图层。门槛从 0.98 放宽到 0.90 只多合 36 对且全是假的：
+        # 「1/0组合。」vs「1/0组合。」把正确文本和漏字文本混在一起
+        half = [
             {"x0": 60.0, "y0": 100.0, "x1": 200.0, "y1": 116.5, "t": "同一行文字的第一段内容在这里"},
             {"x0": 150.0, "y0": 104.0, "x1": 300.0, "y1": 120.5, "t": "同一行文字的第二段内容在这里"},
         ]
-        self.assertEqual(len(textlayer.collapse_duplicate_rows(rows)), 2,
+        self.assertEqual(len(textlayer.collapse_duplicate_rows(half)), 2,
                          "两条只互相覆盖一半，不是叠字图层，不该合并")
 
-    def test_collapse_keeps_longer_text(self):
-        """合并时留信息多的那份：实测大框（整行）漏字比小框少。"""
-        rows = [
+        # 合并时留信息多的那份：实测大框（整行）漏字比小框少
+        both = [
             {"x0": 60.0, "y0": 100.0, "x1": 400.0, "y1": 111.0,
              "t": "翻译在历史上就是紧密交织的。事20世纪初弗洛伊德"},          # 小框，漏字
             {"x0": 58.0, "y0": 96.0, "x1": 402.0, "y1": 112.5,
              "t": "翻译在历史上就是紧密交织的。事实上，早在20世纪初弗洛伊德"},   # 大框，完整
         ]
-        out = textlayer.collapse_duplicate_rows(rows)
+        out = textlayer.collapse_duplicate_rows(both)
         self.assertEqual(len(out), 1)
         self.assertIn("事实上", out[0]["t"])
 
@@ -165,27 +147,28 @@ class TestStdioEncoding(unittest.TestCase):
     # 真书里出现的、GBK 编不进去的字符（逐个实测过）
     NON_GBK = "ÜÉç∅∀∃₁₂äï"
 
-    def test_non_gbk_chars_really_break_gbk(self):
-        """先证明这些字符确实不在 GBK 里——否则下面的用例就是空的。"""
+    def test_non_gbk_chars_and_stdio_survive(self):
+        """先证明这些字符确实不在 GBK 里，再证明装了 utf8_stdio 之后打得出来。
+
+        没有前半段，后半段就是空的：GBK 本来就编得进去的字符，怎么测都过。
+        """
         for ch in self.NON_GBK:
             with self.subTest(ch=ch):
                 with self.assertRaises(UnicodeEncodeError):
                     ch.encode("gbk")
 
-    def test_stdio_module_makes_print_survivable(self):
-        """装了 utf8_stdio 之后，打印这些字符既不死也不乱码。"""
         code = ("import sys; sys.path.insert(0, %r); import stdio; "
                 "stdio.utf8_stdio(); "
-                "print('%s')" % (ROOT, self.NON_GBK))
+                "print(%r)" % (ROOT, self.NON_GBK))
         cp = subprocess.run([PY, "-c", code], stdout=subprocess.PIPE, text=True,
                             encoding="utf-8", errors="replace")
         self.assertEqual(cp.returncode, 0, "打印非 GBK 字符不许让进程失败")
         self.assertEqual(cp.stdout.strip(), self.NON_GBK)
 
-    def test_scripts_call_utf8_stdio_at_entry(self):
-        """每个会打印用户文本的脚本都要在入口调一次。
+    def test_entry_points_and_fallback(self):
+        """每个打印用户文本的脚本都要在入口调一次；实在拿不走 UTF-8 时退化成 ?。
 
-        这不是"约定"，是实测漏过：`repair.py` 没调，崩在第 129 页，剩下 181 页
+        这不是"约定"，是实测漏过：repair.py 没调，崩在第 129 页，剩下 181 页
         一个都没写。所以这里直接扫源码，少一个就红。
         """
         need = ["repair.py", "audit.py", "disagree.py", "apply_decisions.py",
@@ -198,16 +181,13 @@ class TestStdioEncoding(unittest.TestCase):
                 self.assertIn("stdio.utf8_stdio()", src,
                               "%s 必须在入口调 stdio.utf8_stdio()" % name)
 
-    def test_textlayer_keeps_compat_alias(self):
-        """textlayer._utf8_stdio 这个名字有调用方和测试在用，不能删。"""
+        # textlayer._utf8_stdio 这个名字有调用方在用，不能删
         self.assertTrue(callable(textlayer._utf8_stdio))
 
-    def test_errors_replace_never_raises(self):
-        """即使调用方拿不走 UTF-8（老终端），也只是退化成 ?，不许抛。"""
-        import io
+        # errors="replace" 兜底：老终端拿不走 UTF-8 也只是显示成 ?，不许抛
         buf = io.BytesIO()
         stream = io.TextIOWrapper(buf, encoding="gbk", errors="replace")
-        stream.write("Ü")          # 不该抛
+        stream.write("Ü")
         stream.flush()
         self.assertEqual(buf.getvalue(), b"?")
 
@@ -285,29 +265,31 @@ class TestMarkValueNeverRaises(unittest.TestCase):
     旧实现用 "表.index(s)" 取下标，s 不在表里就抛，整条 make_md 阶段失败。
     """
 
-    def test_no_character_in_range_raises(self):
+    def test_range_never_raises_and_maps_digits(self):
+        """整段 [\u2070-\u209c] 逐个喂进去都不许抛——这是整条 make_md 的命门。
+
+        其中只有真上标数字应该映射成数字；下标 ₁（S₁ 的注号记号）、上标 i、
+        上标运算符都在范围内却不是数字，必须返回 None 而不是抛。
+        """
         for o in range(0x2070, 0x209D):
             with self.subTest(codepoint=hex(o)):
                 layout.mark_value(chr(o))      # 不该抛
 
-    def test_superscript_digits_map_correctly(self):
         digits = "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079"
         for i, ch in enumerate(digits):
             with self.subTest(digit=i):
                 self.assertEqual(layout.mark_value(ch), i)
 
-    def test_subscripts_are_not_note_numbers(self):
-        """S₁ 的 ₁ 不是注号，认不出返回 None，不许抛。"""
+        # S₁ 的 ₁ 不是注号，认不出返回 None，不许抛
         self.assertIsNone(layout.mark_value("\u2081"))
         self.assertIsNone(layout.mark_value("\u2082"))
 
-    def test_circled_and_plain_numbers_still_work(self):
-        """原有判据不能因为改了实现而失效。"""
-        self.assertEqual(layout.mark_value("\u2460"), 1)
-        self.assertEqual(layout.mark_value("\u2461"), 2)
-        self.assertEqual(layout.mark_value("12"), 12)
-        self.assertEqual(layout.mark_value("(3)"), 3)
-        self.assertEqual(layout.mark_value("i"), 1)
+    def test_existing_forms_still_work(self):
+        """原有判据不能因为改了实现而失效：圈号、普通数字、括号号、罗马数字。"""
+        for text, want in (("\u2460", 1), ("\u2461", 2), ("12", 12),
+                           ("(3)", 3), ("i", 1)):
+            with self.subTest(text=text):
+                self.assertEqual(layout.mark_value(text), want)
 
 
 if __name__ == "__main__":

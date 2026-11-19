@@ -52,19 +52,18 @@ class TestPageImageTolerance(unittest.TestCase):
         _touch_png(self.pages, "p-1.png")
         _touch_png(self.pages, "p-9.png")
 
-    def test_exact_name_wins(self):
+    def test_page_image_tolerates_padding(self):
+        """页图名必须容忍补零差异：pdftoppm 按页数决定位宽（9 页的书出 p-1.png），
+        而页级 JSON 一律叫 p-001.png。"""
+        # 名字完全一致时直接用
         self.assertEqual(os.path.basename(run_layout._page_image(self.pages, "p-1.png")),
                          "p-1.png")
-
-    def test_padded_name_falls_back_to_unpadded(self):
-        """JSON 叫 p-001.png、页图叫 p-1.png：必须能对上。"""
+        # JSON 叫 p-001.png、页图叫 p-1.png：必须能对上
         self.assertEqual(os.path.basename(run_layout._page_image(self.pages, "p-001.png")),
                          "p-1.png")
 
-    def test_missing_page_returns_none(self):
+    def test_page_image_returns_none_when_absent(self):
         self.assertIsNone(run_layout._page_image(self.pages, "p-042.png"))
-
-    def test_no_pages_dir_returns_none(self):
         self.assertIsNone(run_layout._page_image(os.path.join(self.d, "nope"), "p-1.png"))
 
     def test_repair_and_review_share_the_same_rule(self):
@@ -97,59 +96,64 @@ class TestLayoutGuard(unittest.TestCase):
         return bookflow.build_args(work=self.d, text_layer="off")
 
     def _seed(self, json_names, png_names):
+        # 必须**先清空**：同一个用例里会 seed 两轮（正例、反例），
+        # 上一轮的 p-1.png 残留会让第二轮的页号交集非空，反例就测不出来了。
         js = paths.ocr_dir(self.d, "ocr_fix", create=True)
         pg = paths.pages_dir(self.d, create=True)
+        for d in (js, pg):
+            shutil.rmtree(d, ignore_errors=True)
+            os.makedirs(d, exist_ok=True)
         for n in json_names:
             jsonio.write(os.path.join(js, n + ".json"),
                          {"name": n, "w": 100, "h": 100, "lines": []}, indent=1)
         for n in png_names:
             _touch_png(pg, n)
 
-    def test_padded_json_and_unpadded_png_is_not_skipped(self):
-        """9 页的书：JSON 是 p-001..009，页图是 p-1..9。守卫**不能**因此跳过。"""
-        self._seed(["p-001.png"], ["p-1.png"])
-        a = self._args()
-        a.force = True
-        called = []
-        with mock.patch.object(bookflow, "stage_layout",
-                               lambda x: called.append(x)), \
-                mock.patch.object(bookflow, "ensure_textlayer_coverage", lambda x: None), \
-                mock.patch("sys.stdout"):
-            bookflow.stage_layout_guarded(a)
-        self.assertEqual(len(called), 1, "页号一致时必须仍然调用版面分析")
-
-    def test_truly_mismatched_pages_still_skipped(self):
-        self._seed(["p-001.png"], ["p-500.png"])
-        a = self._args()
-        a.force = True
-        called = []
+    def _guarded_call(self):
+        """跑一次 stage_layout_guarded，返回 (被调用的参数列表, 输出文本)。"""
         import io
         from contextlib import redirect_stdout
+        a = self._args()
+        a.force = True
+        called = []
         buf = io.StringIO()
         with mock.patch.object(bookflow, "stage_layout", lambda x: called.append(x)), \
                 mock.patch.object(bookflow, "ensure_textlayer_coverage", lambda x: None), \
                 redirect_stdout(buf):
             bookflow.stage_layout_guarded(a)
+        return called, buf.getvalue()
+
+    def test_guard_compares_page_numbers_not_filenames(self):
+        """守卫必须按**页号**比，不能按文件名交集。
+
+        旧版用文件名交集：9 页的书 JSON 是 p-001..009、页图是 p-1..9，
+        交集永远是空集，于是**连 run_layout 都没被调用**（退出码 0）。
+        """
+        self._seed(["p-001.png"], ["p-1.png"])
+        called, _out = self._guarded_call()
+        self.assertEqual(len(called), 1, "页号一致时必须仍然调用版面分析")
+        self.assertEqual(called[0].work, self.d, "调用的必须是这本的工作目录")
+
+        # 真对不上时才跳过，并把原因打出来
+        self._seed(["p-001.png"], ["p-500.png"])
+        called, out = self._guarded_call()
         self.assertEqual(called, [])
-        self.assertIn("页号对不上", buf.getvalue())
+        self.assertIn("页号对不上", out)
 
 
 class TestDeliverableName(unittest.TestCase):
-    def test_has_date_segment(self):
-        n = bookflow._deliverable_name("某书")
-        self.assertRegex(n, r"^某书__\d{8}\.epub$")
-
-    def test_filesystem_hostile_chars_replaced(self):
+    def test_deliverable_name_is_safe_and_dated(self):
+        """交付物名：带日期段（两次运行不互相覆盖）+ 过滤文件系统非法字符。"""
+        self.assertRegex(bookflow._deliverable_name("某书"), r"^某书__\d{8}\.epub$")
         for bad in ('a/b', 'a\\b', 'a:b', 'a*b', 'a?b', 'a"b', 'a<b', 'a>b', 'a|b'):
-            n = bookflow._deliverable_name(bad)
-            for ch in '/\\:*?"<>|':
-                self.assertNotIn(ch, n, bad)
-
-    def test_empty_title_falls_back(self):
+            with self.subTest(title=bad):
+                n = bookflow._deliverable_name(bad)
+                for ch in '/\\:*?"<>|':
+                    self.assertNotIn(ch, n, bad)
+        # 空标题 / 全空白退回 book__
         self.assertTrue(bookflow._deliverable_name("").startswith("book__"))
         self.assertTrue(bookflow._deliverable_name("   ").startswith("book__"))
-
-    def test_long_title_truncated(self):
+        # 超长标题截断，别让文件名撑爆路径上限
         n = bookflow._deliverable_name("书" * 200)
         self.assertLessEqual(len(n), 60 + len("__20261118.epub"))
 
@@ -186,18 +190,18 @@ class TestTieredDeliverableRouting(unittest.TestCase):
             bookflow.stage_epub(a)
         return captured
 
-    def test_flat_stays_in_out(self):
-        work = os.path.join(self.d, "flatbook")
-        os.makedirs(os.path.join(work, "out"))
-        self.assertFalse(paths.is_tiered(work))
-        cmds = self._run_epub(work, "平铺的书")
+    def test_flat_stays_in_out_and_tiered_goes_to_dist(self):
+        """两者不能同时出现两份 epub：flat 出在 out/，tiered 出到 dist/。"""
+        flat = os.path.join(self.d, "flatbook")
+        os.makedirs(os.path.join(flat, "out"))
+        self.assertFalse(paths.is_tiered(flat))
+        cmds = self._run_epub(flat, "平铺的书")
         out = cmds[0][cmds[0].index("--out") + 1]
-        self.assertEqual(os.path.dirname(out), os.path.join(work, "out"))
+        self.assertEqual(os.path.dirname(out), os.path.join(flat, "out"))
 
-    def test_tiered_goes_to_dist(self):
-        work = os.path.join(self.d, "tierbook")
-        paths.ensure_tiered(work)
-        cmds = self._run_epub(work, "分层的书")
+        tier = os.path.join(self.d, "tierbook")
+        paths.ensure_tiered(tier)
+        cmds = self._run_epub(tier, "分层的书")
         out = cmds[0][cmds[0].index("--out") + 1]
         self.assertTrue(out.startswith(paths.dist_dir("tierbook")), out)
         self.assertRegex(os.path.basename(out), r"^分层的书__\d{8}\.epub$")
@@ -219,7 +223,8 @@ class TestLimitPages(unittest.TestCase):
             bookflow.stage_render(a)
         return calls
 
-    def test_limit_adds_first_last(self):
+    def test_limit_pages_controls_first_and_last(self):
+        """打样必须真的只渲染前 N 页；不给限制时不能凭空加上 -f/-l。"""
         calls = self._render(20)
         self.assertEqual(len(calls), 1)
         cmd = calls[0]
@@ -227,7 +232,6 @@ class TestLimitPages(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-f") + 1], "1")
         self.assertEqual(cmd[cmd.index("-l") + 1], "20")
 
-    def test_no_limit_has_no_f_l(self):
         cmd = self._render(0)[0]
         self.assertNotIn("-f", cmd)
         self.assertNotIn("-l", cmd)
@@ -259,18 +263,20 @@ class TestDiscoveryRegressions(unittest.TestCase):
         self.d = tempfile.mkdtemp(prefix=".tmp-disc-")
         self.addCleanup(shutil.rmtree, self.d, True)
 
-    def test_runs_subdir_is_discovered(self):
-        """`runs` 不能进 _SKIP：它有自己的分支，一旦被跳过，
-        界面就看不见新书（而 404 会被前端兜成空卡片，看起来像"全部未跑"）。"""
-        paths.ensure_tiered(os.path.join(self.d, "runs", "b1"))
-        self.assertIn("runs/b1", runs.list_ids(self.d))
+    def test_discovery_finds_new_books_and_skips_code_dirs(self):
+        """新书必须出现在任务列表里；代码目录不能被当成书。
 
-    def test_flat_and_tiered_both_discovered(self):
+        `runs` 不能进 _SKIP——它有自己的分支，一旦被跳过，界面就看不见新书
+        （而 404 会被前端兜成空卡片，看起来像"全部未跑"）。
+        """
         paths.ensure_tiered(os.path.join(self.d, "runs", "b1"))
+        self.assertIn("runs/b1", runs.list_ids(self.d),
+                      "`runs` 不能进 _SKIP：它有自己的分支，一旦被跳过界面就看不见新书")
+
         os.makedirs(os.path.join(self.d, "flatbook", "out"))
         ids = runs.list_ids(self.d)
         self.assertIn("runs/b1", ids)
-        self.assertIn("flatbook", ids)
+        self.assertIn("flatbook", ids, "旧的 flat 目录也要能发现")
 
     def test_skipped_dirs_are_not_runs(self):
         for n in ("docs", "tests", "webui", "dist", "input"):
@@ -302,28 +308,25 @@ class TestRouterShapes(unittest.TestCase):
                 return (view, "/".join(rest))
         return ("notfound", None)
 
-    def test_multi_segment_run_id(self):
-        self.assertEqual(self.parse("/run/runs/book-x/inspect"),
-                         ("inspect", "runs/book-x"))
-        self.assertEqual(self.parse("/run/runs/book-x/triage"),
-                         ("triage", "runs/book-x"))
-        self.assertEqual(self.parse("/run/runs/book-x"), ("run", "runs/book-x"))
+    def test_route_shapes(self):
+        """多段 id 是契约的一部分：末段是视图名就吃掉，剩余全部是 id。
 
-    def test_single_segment_run_id(self):
-        self.assertEqual(self.parse("/run/run-lacan/inspect"), ("inspect", "run-lacan"))
-        self.assertEqual(self.parse("/run/run-lacan"), ("run", "run-lacan"))
-
-    def test_unknown_view_segment_is_kept_as_part_of_id(self):
-        """末段不是视图名时**不当作视图**，原样留给 id。
-
-        这条看着奇怪，但它是对的：id 允许多段（runs/<book-id>），
-        所以 "run-lacan/bogus" 是一个不合法的 id，交给后端 404 —— 而不是
-        在前端猜"用户想进哪个视图"。猜错的表现是把人送去一个空页面。
+        猜错的后果是把人送去 404 页，实测就发生了（旧的
+        #/run/runs/book-x/inspect 被判成 404）。所以「末段不认识就当 id」
+        不是偷懒，是唯一不会把人送错页面的规则。
         """
-        self.assertEqual(self.parse("/run/run-lacan/bogus"), ("run", "run-lacan/bogus"))
-
-    def test_top_level_notfound(self):
-        self.assertEqual(self.parse("/nothing/here"), ("notfound", None))
+        for path, want in (
+            ("/run/runs/book-x/inspect", ("inspect", "runs/book-x")),
+            ("/run/runs/book-x/triage", ("triage", "runs/book-x")),
+            ("/run/runs/book-x", ("run", "runs/book-x")),
+            ("/run/run-lacan/inspect", ("inspect", "run-lacan")),
+            ("/run/run-lacan", ("run", "run-lacan")),
+            # 末段不是视图名 -> 不当作视图，原样留给 id，交给后端 404
+            ("/run/run-lacan/bogus", ("run", "run-lacan/bogus")),
+            ("/nothing/here", ("notfound", None)),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(self.parse(path), want)
 
 
 if __name__ == "__main__":

@@ -77,6 +77,9 @@ class TestCoverTitleEscaping(unittest.TestCase):
             return z.read("cover.xhtml").decode("utf-8")
 
     def img_alt(self, title):
+        # 每次注入前重建一份**干净**的 epub：cover.inject 对已存在 cover.xhtml
+        # 的包是跳过而不是覆盖，重复注入会安静地什么都不做（实测得到的是上一次的书名）。
+        write_min_epub(self.epub)
         with contextlib.redirect_stdout(io.StringIO()):
             cover.inject(self.epub, title, self.jpg)
         xml = self.cover_xhtml()
@@ -85,24 +88,26 @@ class TestCoverTitleEscaping(unittest.TestCase):
         el = next(img)
         return el.get("alt")
 
-    def test_plain_title_roundtrip(self):
-        self.assertEqual(self.img_alt("中国僧官制度史"), "中国僧官制度史")
+    def test_hostile_titles_keep_xml_valid(self):
+        """书名进 alt="" 属性必须转义，否则整本 EPUB 是坏 XML。
 
-    def test_ampersand_in_title_is_escaped(self):
-        """书名带 & 时，旧版产出 alt="A & B" → 整本 EPUB 是坏 XML。"""
-        self.assertEqual(self.img_alt("制度 & 信仰"), "制度 & 信仰")
+        旧版直接 COVER_XHTML.format(title=title)：一个 & 或 " 就把属性截断，
+        cover.xhtml 解析失败。ET.fromstring 会在这里直接抛，不用额外断言。
+        """
+        for title in (
+            "中国僧官制度史",            # 普通书名：不得被改写
+            "制度 & 信仰",               # & -> &amp;
+            '《读书"札记"》',            # " -> &quot;
+            "a<b>c",                      # < > 转义后应原样还原
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(self.img_alt(title), title)
 
-    def test_quote_in_title_keeps_xml_valid(self):
-        """书名带双引号时，旧版直接拼进双引号属性，属性被截断。"""
-        self.assertEqual(self.img_alt('《读书"札记"》'), '《读书"札记"》')
-
-    def test_angle_brackets_in_title_are_escaped(self):
-        self.assertEqual(self.img_alt("a<b>c"), "a<b>c")
-
-    def test_cover_xhtml_is_wellformed_for_hostile_title(self):
+        # 四种敌意字符同时出现（含单引号）：整份 cover.xhtml 仍必须是良构 XML
+        write_min_epub(self.epub)
         with contextlib.redirect_stdout(io.StringIO()):
             cover.inject(self.epub, '<x> & 引"号\'', self.jpg)
-        ET.fromstring(self.cover_xhtml())         # 不抛即通过
+        ET.fromstring(self.cover_xhtml())
 
 
 # ---------------------------------------------------------------------------
@@ -127,12 +132,12 @@ class TestMedianCharWidthEmpty(unittest.TestCase):
         jsonio.write(p, {"name": name, "w": w, "h": h, "lines": lines})
         return p
 
-    def test_empty_file_list_returns_none(self):
-        """旧版 statistics.median([]) → StatisticsError，调用方的兜底永远轮不到。"""
+    def test_median_char_width_returns_none_without_samples(self):
+        """空样本不是不可能事件：旧版 statistics.median([]) 抛 StatisticsError，
+        把 main() 里那句友好提示截胡了。目录页、整页插图、纯扫描件都会走到这里。"""
+        # 没有任何文件
         self.assertIsNone(self.repair.median_char_width([]))
-
-    def test_only_short_lines_returns_none(self):
-        """只有短行（目录页）时同样没有样本，不能抛。"""
+        # 只有短行（目录页）同样没有样本
         p = self.page("p-001", [{"x0": 100.0, "y0": 100.0, "x1": 400.0,
                                  "y1": 160.0, "t": "目　录", "s": 1.0}])
         self.assertIsNone(self.repair.median_char_width([p]))
@@ -152,8 +157,13 @@ class TestMedianCharWidthEmpty(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestWritesGoThroughJsonio(unittest.TestCase):
-    def test_disagree_writes_via_jsonio(self):
-        """disagree.py 的产物/回填一律走 jsonio（旧版三处 json.dump(open(...))）。"""
+    def test_no_writer_uses_bare_open_or_double_constant(self):
+        """产物写入一律走 jsonio（原子写 + 句柄即收），常量只定义一次。
+
+        disagree.py 旧版三处 json.dump(obj, open(...))：句柄不收（Windows 上紧跟的
+        改名/删除会 PermissionError），且没有原子写（中途崩就是半个 JSON）。
+        audit / cmp_ocr 是同一个病根，一起钉住。
+        """
         src = src_of("disagree.py")
         self.assertNotIn("json.dump(", src)
         self.assertNotIn('open(a.out, "w"', src)
@@ -161,24 +171,16 @@ class TestWritesGoThroughJsonio(unittest.TestCase):
         self.assertIn("jsonio.write(", src)
         self.assertIn("jsonio.write_text(", src)
 
-    def test_other_writers_have_no_bare_open(self):
-        """audit / cmp_ocr 同样不许 json.dump(obj, open(...)) 与裸 open().write()。
-
-        这两个脚本产物不大、跑得不频繁，所以一直没人管；但它们写在同一个
-        Windows 文件系统上，句柄不收照样会 PermissionError，崩在中途照样留半截。
-        """
         for name in ("audit.py", "cmp_ocr.py"):
-            src = src_of(name)
             with self.subTest(module=name):
-                self.assertNotIn("json.dump(", src)
-                self.assertNotRegex(src, r'=\s*open\([^)]*"w"')
-                self.assertNotRegex(src, r'^\s*open\([^)]*"w"[^)]*\)\.write\(')
-                self.assertIn("jsonio.write(", src)
+                s = src_of(name)
+                self.assertNotIn("json.dump(", s)
+                self.assertNotRegex(s, r'=\s*open\([^)]*"w"')
+                self.assertNotRegex(s, r'^\s*open\([^)]*"w"[^)]*\)\.write\(')
+                self.assertIn("jsonio.write(", s)
 
-    def test_apply_decisions_legacy_table_defined_once(self):
-        """同一个常量赋值两遍，早晚会有一次只改了其中一处。"""
-        src = src_of("apply_decisions.py")
-        hits = re.findall(r"^LEGACY_TABLE\s*=", src, re.M)
+        # 同一个常量赋值两遍，早晚会有一次只改了其中一处
+        hits = re.findall(r"^LEGACY_TABLE\s*=", src_of("apply_decisions.py"), re.M)
         self.assertEqual(len(hits), 1, "LEGACY_TABLE 重复赋值 %d 次" % len(hits))
 
 

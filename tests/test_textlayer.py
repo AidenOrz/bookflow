@@ -83,60 +83,57 @@ def build_md(src, meta=None):
 # ---------------------------------------------------------------------------
 
 class TestParseBBox(unittest.TestCase):
-    def test_words_and_size(self):
+    def test_words_size_and_entities(self):
+        """poppler 会把引号转成 &quot;，不还原的话正文里会出现 &quot;。"""
         pages = textlayer.parse_bbox(bbox_xhtml([
             (595.0, 842.0, [w(18, 819.692, 36, 831.692, "PDF"),
-                            w(42, 819.692, 90, 831.692, "文件使用")])]))
-        self.assertEqual(len(pages), 1)
+                            w(42, 819.692, 90, 831.692, "文件使用")]),
+            (595, 842, [w(0, 0, 10, 10, "&quot;pdfFactory&quot;"),
+                        w(0, 0, 10, 10, "a&amp;b")])]))
+        self.assertEqual(len(pages), 2)
         self.assertAlmostEqual(pages[0]["w"], 595.0)
         self.assertAlmostEqual(pages[0]["h"], 842.0)
         self.assertEqual([x["t"] for x in pages[0]["words"]], ["PDF", "文件使用"])
         self.assertAlmostEqual(pages[0]["words"][0]["y0"], 819.692)
+        self.assertEqual(pages[1]["words"][0]["t"], '"pdfFactory"')
+        self.assertEqual(pages[1]["words"][1]["t"], "a&b")
 
-    def test_entities_are_unescaped(self):
-        """poppler 会把引号转成 &quot;，不还原的话正文里会出现 &quot;。"""
-        pages = textlayer.parse_bbox(bbox_xhtml([
-            (595, 842, [w(0, 0, 10, 10, "&quot;pdfFactory&quot;"),
-                        w(0, 0, 10, 10, "a&amp;b")])]))
-        self.assertEqual(pages[0]["words"][0]["t"], '"pdfFactory"')
-        self.assertEqual(pages[0]["words"][1]["t"], "a&b")
-
-    def test_whitespace_only_words_dropped(self):
+    def test_degenerate_inputs_keep_page_count(self):
+        """纯空白词丢掉；空输入给空表；**有 page 但没 word 仍是一页**
+        （少一页会让整本页码错位）。"""
         pages = textlayer.parse_bbox(bbox_xhtml([
             (595, 842, [w(0, 0, 10, 10, "  "), w(0, 0, 10, 10, "字")])]))
         self.assertEqual(len(pages[0]["words"]), 1)
 
-    def test_empty_and_garbage_input(self):
         self.assertEqual(textlayer.parse_bbox(""), [])
         self.assertEqual(textlayer.parse_bbox("<html></html>"), [])
-        # 有 page 但一个 word 都没有 → 一页、零行（不是零页！少一页会整体错位）
         pages = textlayer.parse_bbox(bbox_xhtml([(595, 842, [])]))
         self.assertEqual(len(pages), 1)
         self.assertEqual(pages[0]["words"], [])
 
 
 class TestParsePages(unittest.TestCase):
-    def test_forms(self):
-        self.assertEqual(textlayer.parse_pages("1-60"), (1, 60))
-        self.assertEqual(textlayer.parse_pages("5"), (5, 5))
-        self.assertEqual(textlayer.parse_pages("5-"), (5, None))
-        self.assertEqual(textlayer.parse_pages("-60"), (None, 60))
-        self.assertEqual(textlayer.parse_pages(""), (None, None))
-
-    def test_clamped_to_total(self):
-        """上限超出实际页数 → 夹到总页数（用户多写一个数字不该让流程失败）。"""
-        self.assertEqual(textlayer.parse_pages("1-999", total=100), (1, 100))
-
-    def test_bad_spec_raises(self):
-        for spec in ("abc", "0-10", "10-5", "1-2-3"):
+    def test_forms_and_clamping(self):
+        for spec, want in (
+            ("1-60", (1, 60)),
+            ("5", (5, 5)),
+            ("5-", (5, None)),
+            ("-60", (None, 60)),
+            ("", (None, None)),
+            # 上限超出实际页数 -> 夹到总页数（用户多写一个数字不该让流程失败）
+            ("1-999", (1, 100)),
+        ):
             with self.subTest(spec=spec):
-                with self.assertRaises(ValueError):
-                    textlayer.parse_pages(spec)
+                self.assertEqual(textlayer.parse_pages(spec, total=100 if "999" in spec else None),
+                                 want)
 
-    def test_first_beyond_total_raises(self):
+    def test_bad_specs_raise(self):
         """首页超界必须报错：静默返回 0 页会让人以为"这本书没有文字层"。"""
-        with self.assertRaises(ValueError):
-            textlayer.parse_pages("500-", total=100)
+        for spec, total in (("abc", None), ("0-10", None), ("10-5", None),
+                            ("1-2-3", None), ("500-", 100)):
+            with self.subTest(spec=spec, total=total):
+                with self.assertRaises(ValueError):
+                    textlayer.parse_pages(spec, total=total)
 
 
 # ---------------------------------------------------------------------------
@@ -152,30 +149,26 @@ class TestGroupLines(unittest.TestCase):
                 out.append({"x0": x0, "y0": y1 - 10, "x1": x1, "y1": y1, "t": t})
         return out
 
-    def test_same_baseline_groups(self):
+    def test_baseline_decides_rows(self):
+        """同一行按**基线**聚合：基线一致或抖动 2pt 内算一行，拉开 20pt 才分。
+
+        用 yMax 而不是 yMin，是因为中文字形的上下边缘对不齐：实测同一行里
+        「存不存在一种」(y0=67.0) 与「巴」(y0=68.7) yMin 差 1.7pt、yMax 却几乎
+        相同；按 yMin 分会把一行拆成三段（1 页 68 行 vs 真实 33 行）。
+        """
+        # 基线完全一致
         rows = textlayer.group_lines(self._ws((110, [(10, 40, "甲"), (60, 90, "乙")])), 3)
         self.assertEqual(len(rows), 1)
         self.assertEqual([x["t"] for x in rows[0]], ["甲", "乙"])
-
-    def test_baseline_jitter_within_tolerance(self):
-        """同一行内基线抖 2pt 是常态，不能被拆成两行。"""
+        # 同一行内基线抖 2pt 是常态，不能拆
         rows = textlayer.group_lines(self._ws((110, [(10, 40, "甲")]),
                                              (111.5, [(60, 90, "乙")])), 3)
         self.assertEqual(len(rows), 1)
-
-    def test_far_baseline_splits(self):
+        # 差 20pt 是两行
         rows = textlayer.group_lines(self._ws((110, [(10, 40, "甲")]),
                                              (130, [(10, 40, "乙")])), 3)
         self.assertEqual(len(rows), 2)
-
-    def test_grouping_uses_baseline_not_top_edge(self):
-        """上下边缘对不齐的中文字形必须落在同一行（本次修的真实 bug）。
-
-        实测德勒兹那本书同一行里「存不存在一种」(y0=67.0) 与「巴」(y0=68.7)
-        yMin 差 1.7pt、yMax 差却只有 0.3pt；按 yMin 分会把一行拆成三段，
-        拼出来的句子东一段西一段（1 页 68 行 vs 真实 33 行）。
-        这里给出 yMin 差 8pt、yMax 完全对齐的一组词——必须成 1 行。
-        """
+        # yMin 差 8pt、yMax 完全对齐 -> 仍是一行
         ws = [{"x0": 0, "y0": 60.0, "x1": 10, "y1": 77.6, "t": "存"},
               {"x0": 10, "y0": 68.7, "x1": 20, "y1": 77.6, "t": "巴"},
               {"x0": 20, "y0": 67.0, "x1": 30, "y1": 77.6, "t": "乌"}]
@@ -183,15 +176,13 @@ class TestGroupLines(unittest.TestCase):
         self.assertEqual(len(rows), 1, "基线一致就必须是一行")
         self.assertEqual(textlayer.join_words(rows[0]), "存巴乌")
 
-    def test_sorting_is_by_x_within_row(self):
-        """输入顺序打乱也必须按 x 排：poppler 的输出顺序不保证。"""
+    def test_row_order_and_drift_guard(self):
+        """行内按 x 排序（poppler 输出顺序不保证）；链式漂移不能被黏成一行。"""
         ws = [{"x0": 90, "y0": 100, "x1": 120, "y1": 110, "t": "后"},
               {"x0": 10, "y0": 100, "x1": 40, "y1": 110, "t": "前"}]
         rows = textlayer.group_lines(ws, 3)
         self.assertEqual([x["t"] for x in rows[0]], ["前", "后"])
-
-    def test_chain_drift_does_not_glue_rows(self):
-        """基线逐词缓慢漂移时，不能靠"和上一个词比"把两行黏成一行。"""
+        # 每个词都比上一个低 2pt：逐对比较会把 10 个词黏成一行
         ws = [{"x0": i * 10, "y0": 100 + i * 2.0, "x1": i * 10 + 8,
                "y1": 110 + i * 2.0, "t": str(i)} for i in range(10)]
         rows = textlayer.group_lines(ws, 2.0)
@@ -209,74 +200,63 @@ def line_of(*items):
 
 
 class TestJoin(unittest.TestCase):
+    """行内拼空格：**先看两侧字符宽度类别，再看间距**。
+
+    这是本模块最大的坑。任务描述里"间距 > 0.3 字高才补空格"在真实英文 PDF 上
+    会把整句拼成 "othercountries"（poppler 切英文时相邻框重叠、字距中位数只有
+    0.25em），在中文 PDF 上又会因为弯引号两侧的缝凭空插空格。所以下面三组
+    用例分别钉住：中文不补、拉丁必须补、其余按邻居定性。
+    """
+
     def test_cjk_never_gets_space(self):
-        """中文按词切开的缝（实测 p50=0.17em）不能补空格。"""
-        self.assertEqual(textlayer.join_words(line_of((0, 5, "学校代"), (5.5, 10, "码"))),
-                         "学校代码")
-        # 0.25em 的缝也不补（实测汉-汉 p90=0.244）
-        self.assertEqual(textlayer.join_words(line_of((0, 5, "中"), (7.5, 12, "的"))),
-                         "中的")
+        """中文按词切开的缝（实测 p50=0.17em、p90=0.244em）一律不补。"""
+        for items, want in (
+            (((0, 5, "学校代"), (5.5, 10, "码")), "学校代码"),
+            (((0, 5, "中"), (7.5, 12, "的")), "中的"),
+            (((0, 5, "正文"), (5, 10, "。")), "正文。"),
+        ):
+            with self.subTest(want=want):
+                self.assertEqual(textlayer.join_words(line_of(*items)), want)
 
-    def test_cjk_punctuation_no_space(self):
-        self.assertEqual(textlayer.join_words(line_of((0, 5, "正文"), (5, 10, "。"))),
-                         "正文。")
+    def test_latin_always_gets_space(self):
+        """英文相邻词的字距只有 0.25em，框还可能首尾相接（gap≈0），都必须补空格。
+        不补就是 "othercountries"——原判据的致命缺陷。"""
+        for items, want in (
+            (((0, 30, "other"), (32.5, 80, "countries")), "other countries"),
+            (((0, 30, "of"), (30, 50, "the")), "of the"),
+            # 同一单词被切开时两段坐标完全重叠 -> 不补
+            (((0, 20, "regu"), (15, 40, "lation")), "regulation"),
+            # word 文本自带空格时不能拼出双空格
+            (((0, 30, "PDF "), (32, 60, "文件")), "PDF 文件"),
+        ):
+            with self.subTest(want=want):
+                self.assertEqual(textlayer.join_words(line_of(*items)), want)
 
-    def test_english_words_keep_spaces(self):
-        """英文相邻词的字距只有 0.25em，必须补空格——这是原判据的致命缺陷。"""
+    def test_neighbour_decides_for_neutral_and_mixed(self):
+        """弯引号/撇号是中性字符：由邻居定性。混排缝隙是双峰的（0.25em 不补、0.4em 补）。"""
+        # 实测原文「提出了 “哪个德勒兹？ ”」——引号两侧的缝比汉-汉正常字距大 0.12em，
+        # 照"间距>0.3em"判会凭空插两个空格
         self.assertEqual(
-            textlayer.join_words(line_of((0, 30, "other"), (32.5, 80, "countries"))),
-            "other countries")
-
-    def test_english_touching_boxes_still_get_space(self):
-        """poppler 切英文时相邻框首尾相接（gap≈0），仍然要补空格。"""
-        self.assertEqual(textlayer.join_words(line_of((0, 30, "of"), (30, 50, "the"))),
-                         "of the")
-
-    def test_split_word_fragment_not_spaced(self):
-        """同一单词被切开时两段坐标完全重叠 → 不补空格。"""
-        self.assertEqual(textlayer.join_words(line_of((0, 20, "regu"), (15, 40, "lation"))),
-                         "regulation")
-
-    def test_mixed_wide_latin(self):
-        """混排缝隙是双峰的：0.25em 不补（实测「圖4-1-1」），0.4em 补（真空格）。"""
+            textlayer.join_words(line_of((0, 10, "提出了"), (12.2, 15, "“"),
+                                         (15.2, 30, "哪个"))),
+            "提出了“哪个")
+        # 英文撇号紧贴单词（gap≈0），不能被当成宽字插空格
+        self.assertEqual(
+            textlayer.join_words(line_of((0, 40, "devices"), (40, 44, "’"),
+                                         (44.5, 90, "classification"))),
+            "devices’ classification")
+        # 混排：0.25em 的缝不补（实测「圖4-1-1」），0.4em 的真空格才补
         self.assertEqual(textlayer.join_words(line_of((0, 10, "圖"), (12.5, 40, "4-1-1"))),
                          "圖4-1-1")
         self.assertEqual(textlayer.join_words(line_of((0, 10, "對"), (14, 40, "TYPE"))),
                          "對 TYPE")
 
-    def test_chinese_quotes_do_not_break_lines(self):
-        """弯引号是中性字符，由邻居定性：中文里贴着汉字，不补空格。
-
-        实测原文「提出了 “哪个德勒兹？ ” 这个问题」——引号两侧的缝比汉-汉
-        正常字距大 0.12em，照"间距>0.3em"判会凭空插两个空格。
-        """
-        self.assertEqual(
-            textlayer.join_words(line_of((0, 10, "提出了"), (12.2, 15, "“"),
-                                         (15.2, 30, "哪个"))),
-            "提出了“哪个")
-
-    def test_english_apostrophe(self):
-        """英文撇号紧贴单词（gap≈0），不能被当成宽字插空格。"""
-        self.assertEqual(
-            textlayer.join_words(line_of((0, 40, "devices"), (40, 44, "’"),
-                                         (44.5, 90, "classification"))),
-            "devices’ classification")
-
-    def test_huge_gap_gets_space(self):
-        """双栏/目录页码列：间距 5em 必须补空格，否则两栏黏在一起。"""
-        out = textlayer.join_words(line_of((0, 10, "第一章"), (60, 70, "3")))
-        self.assertEqual(out, "第一章 3")
-
-    def test_no_double_space(self):
-        """word 文本自带空格时不能拼出双空格。"""
-        self.assertEqual(textlayer.join_words(line_of((0, 30, "PDF "), (32, 60, "文件"))),
-                         "PDF 文件")
-
-    def test_empty(self):
+    def test_edge_cases(self):
+        """双栏/目录页码列（5em）必须补空格；空行给空串；行高按最高字取。"""
+        self.assertEqual(textlayer.join_words(line_of((0, 10, "第一章"), (60, 70, "3"))),
+                         "第一章 3")
         self.assertEqual(textlayer.join_words([]), "")
-
-    def test_line_height_uses_max(self):
-        """行内夹小字（注号）时，字高按最高的取——中位数会把阈值拉低。"""
+        # 行内夹小字（注号）时按最高的取——中位数会把阈值拉低
         ws = [{"x0": 0, "y0": 100, "x1": 10, "y1": 110, "t": "正"},
               {"x0": 12, "y0": 104, "x1": 20, "y1": 107, "t": "①"}]
         self.assertAlmostEqual(textlayer.line_height(ws), 10.0)
@@ -294,22 +274,16 @@ class TestDedupe(unittest.TestCase):
         """双图层 PDF：同一段字两份、坐标几乎重合（实测重叠率 p50=0.84）。"""
         ws = [self._w(0, 40, "Figure"), self._w(0.5, 40.5, "Figure"),
               self._w(42, 90, "1.1."), self._w(42.2, 90.2, "1.1.")]
-        out = textlayer.dedupe_words(ws)
-        self.assertEqual([x["t"] for x in out], ["Figure", "1.1."])
-
-    def test_real_repeat_text_kept(self):
-        """正文里真实的重复词（「的的」）不是重叠框，不能删。"""
-        ws = [self._w(0, 10, "的"), self._w(10, 20, "的")]
-        self.assertEqual(len(textlayer.dedupe_words(ws)), 2)
-
-    def test_overlap_but_different_text_kept(self):
-        """上标/注号本来就和正文框重叠，但文本不同，必须保留。"""
-        ws = [self._w(0, 40, "正文①"), self._w(20, 24, "①")]
-        self.assertEqual(len(textlayer.dedupe_words(ws)), 2)
-
-    def test_three_layers(self):
+        self.assertEqual([x["t"] for x in textlayer.dedupe_words(ws)], ["Figure", "1.1."])
+        # 三层叠字同样只留一层
         ws = [self._w(0, 40, "x"), self._w(0, 40, "x"), self._w(0, 40, "x")]
         self.assertEqual(len(textlayer.dedupe_words(ws)), 1)
+
+    def test_real_repeats_and_overlaps_are_kept(self):
+        """正文里真实的重复词（「的的」）不是重叠框；上标/注号与正文框重叠
+        但文本不同——两者都必须保留。"""
+        self.assertEqual(len(textlayer.dedupe_words([self._w(0, 10, "的"), self._w(10, 20, "的")])), 2)
+        self.assertEqual(len(textlayer.dedupe_words([self._w(0, 40, "正文①"), self._w(20, 24, "①")])), 2)
 
 
 # ---------------------------------------------------------------------------
@@ -317,8 +291,11 @@ class TestDedupe(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestCoords(unittest.TestCase):
-    def test_scale_300dpi(self):
-        """PDF 点 × dpi/72：595.28pt@300dpi = 2480px（与 pdftoppm 的产物一致）。"""
+    def test_scale_and_naming(self):
+        """PDF 点 × dpi/72：595.28pt@300dpi = 2480px（与 pdftoppm 一致）。
+
+        dpi 翻倍坐标必须翻倍**一次**——乘两次会变 4 倍，小样本看不出来。
+        """
         page = {"w": 595.28, "h": 841.89,
                 "words": [{"x0": 10.0, "y0": 20.0, "x1": 30.0, "y1": 32.0, "t": "字"}]}
         doc, _st = textlayer.build_page(page, 1, dpi=300)
@@ -327,20 +304,15 @@ class TestCoords(unittest.TestCase):
         self.assertAlmostEqual(doc["lines"][0]["x0"], 41.7, places=1)   # 10 × 4.1667
         self.assertAlmostEqual(doc["lines"][0]["y1"], 133.3, places=1)  # 32 × 4.1667
 
-    def test_scale_is_applied_exactly_once(self):
-        """dpi 翻倍 → 坐标翻倍（乘两次会变成 4 倍，这种 bug 小样本看不出来）。"""
-        page = {"w": 100.0, "h": 100.0,
-                "words": [{"x0": 10.0, "y0": 10.0, "x1": 20.0, "y1": 20.0, "t": "字"}]}
         d300, _ = textlayer.build_page(page, 1, dpi=300)
         d600, _ = textlayer.build_page(page, 1, dpi=600)
         self.assertAlmostEqual(d600["lines"][0]["x0"], 2 * d300["lines"][0]["x0"], places=0)
 
-    def test_page_name_and_confidence(self):
-        page = {"w": 100.0, "h": 100.0,
-                "words": [{"x0": 1.0, "y0": 1.0, "x1": 9.0, "y1": 9.0, "t": "字"}]}
-        doc, _ = textlayer.build_page(page, 7, dpi=72)
+        # 页名补零到三位；文字层没有置信度，固定 1.0
+        doc, _ = textlayer.build_page({"w": 100.0, "h": 100.0, "words": [
+            {"x0": 1.0, "y0": 1.0, "x1": 9.0, "y1": 9.0, "t": "字"}]}, 7, dpi=72)
         self.assertEqual(doc["name"], "p-007.png")
-        self.assertEqual(doc["lines"][0]["s"], 1.0, "文字层没有置信度，固定 1.0")
+        self.assertEqual(doc["lines"][0]["s"], 1.0)
 
     def test_line_tolerance_is_dpi_independent(self):
         """聚类发生在 **PDF 点空间**，所以行数不能随 dpi 变化。
@@ -351,38 +323,33 @@ class TestCoords(unittest.TestCase):
         """
         apart4 = [{"x0": 0, "y0": 100, "x1": 10, "y1": 110, "t": "甲"},
                   {"x0": 0, "y0": 104, "x1": 10, "y1": 114, "t": "乙"}]
-        for dpi in (72, 300, 600):
-            with self.subTest(dpi=dpi):
-                self.assertEqual(len(textlayer.page_lines({"words": apart4}, dpi)), 2,
-                                 "4pt > 3pt 容差，任何 dpi 下都该是两行")
-        # 2pt 的抖动在同一行内，三档 dpi 都必须合成一行
         apart2 = [{"x0": 0, "y0": 100, "x1": 10, "y1": 110, "t": "甲"},
                   {"x0": 12, "y0": 102, "x1": 22, "y1": 112, "t": "乙"}]
         for dpi in (72, 300, 600):
             with self.subTest(dpi=dpi):
-                self.assertEqual(len(textlayer.page_lines({"words": apart2}, dpi)), 1)
+                self.assertEqual(len(textlayer.page_lines({"words": apart4}, dpi)), 2,
+                                 "4pt > 3pt 容差，任何 dpi 下都该是两行")
+                self.assertEqual(len(textlayer.page_lines({"words": apart2}, dpi)), 1,
+                                 "2pt 抖动在同一行内")
 
 
 class TestEmptyPages(unittest.TestCase):
-    def test_empty_page_has_empty_lines(self):
-        """纯图片页 → 空 lines，但**页必须在**（少一页会让后续全部错位）。"""
+    def test_empty_pages_keep_their_slot(self):
+        """纯图片页 / 只有空白的页 -> 空 lines，但**页必须在**（少一页会让后续全部错位）。"""
         doc, st = textlayer.build_page({"w": 595.0, "h": 842.0, "words": []}, 3)
         self.assertEqual(doc["lines"], [])
         self.assertEqual(doc["name"], "p-003.png")
         self.assertEqual(st, {"chars": 0, "cjk": 0})
 
-    def test_stats_chars_and_cjk(self):
-        lines = [{"t": "汉字 abc 123"}, {"t": "。！"}]
-        st = textlayer.page_stats(lines)
-        self.assertEqual(st["chars"], 10)     # 汉字abc123。！ = 2+3+3+2
-        self.assertEqual(st["cjk"], 2)
-
-    def test_blank_only_words_make_no_line(self):
-        doc, st = textlayer.build_page({"w": 595.0, "h": 842.0,
-                                        "words": [{"x0": 1, "y0": 1, "x1": 2,
-                                                   "y1": 2, "t": " "}]}, 1)
+        doc, st = textlayer.build_page({"w": 595.0, "h": 842.0, "words": [
+            {"x0": 1, "y0": 1, "x1": 2, "y1": 2, "t": " "}]}, 1)
         self.assertEqual(doc["lines"], [])
         self.assertEqual(st["chars"], 0)
+
+        # 统计口径：chars 数所有非空白字符，cjk 只数汉字
+        st = textlayer.page_stats([{"t": "汉字 abc 123"}, {"t": "。！"}])
+        self.assertEqual(st["chars"], 10)     # 汉字abc123。！ = 2+3+3+2
+        self.assertEqual(st["cjk"], 2)
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +391,8 @@ class TestUnusable(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "out")
             pdf = self._pdf(tmp)
-            with self._patch_run(stdout=body),                     mock.patch.object(textlayer, "pdf_page_count", lambda p: 2):
+            with self._patch_run(stdout=body), \
+                    mock.patch.object(textlayer, "pdf_page_count", lambda p: 2):
                 summary = textlayer.extract(pdf, out, quiet=True)
             self.assertFalse(summary["usable"])
             self.assertEqual(summary["pages"], 2)
@@ -433,15 +401,23 @@ class TestUnusable(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(out, "p-001.png.json")),
                              "纯扫描件不许产出空 JSON")
 
-    def test_no_words_means_unusable_cli_exit_code(self):
-        """CLI 上要给出退出码 2（「整本无字」）——与 3（pdftotext 失败）区分开。"""
-        body = bbox_xhtml([(595, 842, []), (595, 842, [])]).encode("utf-8")
+    def test_cli_reports_failures_with_exit_codes(self):
+        """CLI 的三种失败要给出不同的退出码与人话，且都不写文件。
+
+        2 = 整本无字（扫描件）；3 = pdftotext 失败（加密/损坏）或装不上。
+        两者混用会让上层无法区分"这本书本来就没文字层"和"工具坏了"。
+        """
+        empty = bbox_xhtml([(595, 842, []), (595, 842, [])]).encode("utf-8")
         with tempfile.TemporaryDirectory() as tmp:
-            out = os.path.join(tmp, "out")
             pdf = self._pdf(tmp)
+            # 2：整本无字
             buf, err = io.StringIO(), io.StringIO()
-            with self._patch_run(stdout=body),                     mock.patch.object(textlayer, "pdf_page_count", lambda p: 2),                     mock.patch.object(textlayer, "pdftotext_version", lambda *a: "26.09.0"),                     contextlib.redirect_stdout(buf),                     contextlib.redirect_stderr(err):
-                rc = textlayer.main(["--pdf", pdf, "--out", out, "--quiet"])
+            with self._patch_run(stdout=empty), \
+                    mock.patch.object(textlayer, "pdf_page_count", lambda p: 2), \
+                    mock.patch.object(textlayer, "pdftotext_version", lambda *a: "26.09.0"), \
+                    contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(err):
+                rc = textlayer.main(["--pdf", pdf, "--out", os.path.join(tmp, "o1"), "--quiet"])
             self.assertEqual(rc, 2)
             self.assertIn("文字层不可用", err.getvalue())
             line = [l for l in buf.getvalue().splitlines() if l.startswith("SUMMARY ")][0]
@@ -449,40 +425,37 @@ class TestUnusable(unittest.TestCase):
             self.assertFalse(summary["usable"])
             self.assertEqual(summary["written"], 0)
 
-    def test_pdftotext_failure_is_reported(self):
-        """pdftotext 退出码非 0（加密 PDF）→ 退出码 3 + 人话，不是 traceback。"""
-        with tempfile.TemporaryDirectory() as tmp:
-            pdf = self._pdf(tmp)
-            out = os.path.join(tmp, "out")
-            buf, err = io.StringIO(), io.StringIO()
+            # 3：pdftotext 退出码非 0（加密 PDF），要报人话而不是 traceback
+            out3 = os.path.join(tmp, "o3")
+            err = io.StringIO()
             with self._patch_run(returncode=1,
                                  stderr="Syntax Error: may be encrypted".encode()), \
-                    contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stdout(io.StringIO()), \
                     contextlib.redirect_stderr(err):
-                rc = textlayer.main(["--pdf", pdf, "--out", out])
+                rc = textlayer.main(["--pdf", pdf, "--out", out3])
             self.assertEqual(rc, 3)
-            e = err.getvalue()
-            self.assertIn("文字层不可用", e)
-            self.assertIn("加密", e)
-            self.assertFalse(os.path.isdir(out), "失败时一个文件都不该写")
+            self.assertIn("文字层不可用", err.getvalue())
+            self.assertIn("加密", err.getvalue())
+            self.assertFalse(os.path.isdir(out3), "失败时一个文件都不该写")
 
-    def test_pdftotext_missing_is_reported(self):
-        """PATH 上没有 pdftotext 也要报人话，不是 FileNotFoundError 的裸 traceback。"""
-        with tempfile.TemporaryDirectory() as tmp:
-            pdf = self._pdf(tmp)
+            # 3：PATH 上没有 pdftotext，也不能是裸 FileNotFoundError
             with mock.patch.object(textlayer.shutil, "which", lambda name: None), \
                     contextlib.redirect_stdout(io.StringIO()), \
                     contextlib.redirect_stderr(io.StringIO()):
-                rc = textlayer.main(["--pdf", pdf, "--out", os.path.join(tmp, "o")])
+                rc = textlayer.main(["--pdf", pdf, "--out", os.path.join(tmp, "o4")])
             self.assertEqual(rc, 3)
 
-    def test_missing_pdf_raises(self):
         with self.assertRaises(textlayer.TextLayerError):
             textlayer.run_pdftotext(os.path.join(tempfile.gettempdir(), "不存在的.pdf"))
 
-    def test_error_codes_are_stable_ascii(self):
-        """错误码必须是 ASCII 且稳定，上层不必去匹配中文文案。"""
-        cases = [
+    def test_error_codes_and_summary_are_ascii(self):
+        """错误码是 ASCII 且稳定（上层不必匹配中文文案）；SUMMARY 行也必须是 ASCII。
+
+        实测：父进程用 encoding="utf-8" 解码 GBK 字节会抛 UnicodeDecodeError
+        （不是乱码，是异常），整个阶段直接失败。所以机器可读那一行必须与编码无关，
+        中文用 \\uXXXX 转义——json 解析回来仍是原字。
+        """
+        for msg, want in (
             ("PATH 上找不到 pdftotext（装 poppler 后把它加进 PATH）", "NO_PDFTOTEXT"),
             ("PDF 不存在：x.pdf", "PDF_MISSING"),
             ("pdftotext 超时（30 秒）：x.pdf", "TIMEOUT"),
@@ -490,19 +463,11 @@ class TestUnusable(unittest.TestCase):
             ("pdftotext 没有输出任何 <page> 元素（PDF 可能损坏）", "EMPTY_OUTPUT"),
             ("pdftotext 失败（退出码 1，PDF 可能加密或损坏）", "PDFTOTEXT_FAILED"),
             ("谁知道呢", "UNKNOWN"),
-        ]
-        for msg, want in cases:
+        ):
             with self.subTest(msg=msg):
                 self.assertEqual(textlayer.error_code(textlayer.TextLayerError(msg)), want)
                 self.assertTrue(want.isascii())
 
-    def test_summary_line_is_pure_ascii(self):
-        """SUMMARY 行必须纯 ASCII：调用方按 UTF-8 解码不会炸。
-
-        实测：父进程用 \`encoding="utf-8"\` 解码 GBK 字节会抛 UnicodeDecodeError
-        （不是乱码，是异常），整个阶段直接失败。所以机器可读那一行必须与编码无关，
-        中文用 \\uXXXX 转义——json 解析回来仍是原字。
-        """
         line = textlayer.summary_line({"usable": False, "error": "文字层不可用：加密"})
         self.assertTrue(line.isascii(), "SUMMARY 行必须是 ASCII：%r" % line)
         self.assertTrue(line.startswith("SUMMARY "))
@@ -510,20 +475,18 @@ class TestUnusable(unittest.TestCase):
         self.assertEqual(back["error"], "文字层不可用：加密")
         self.assertFalse(back["usable"])
 
-    def test_failure_summary_carries_error_code(self):
-        """走 CLI 的失败分支时，stdout 上仍要有完整的 ASCII SUMMARY。"""
+        # 走 CLI 的失败分支时，stdout 上仍要有完整的 ASCII SUMMARY + error_code
         with tempfile.TemporaryDirectory() as tmp:
             pdf = self._pdf(tmp)
-            buf, err = io.StringIO(), io.StringIO()
+            buf = io.StringIO()
             with self._patch_run(returncode=1,
                                  stderr=b"Syntax Error: may be encrypted"), \
                     contextlib.redirect_stdout(buf), \
-                    contextlib.redirect_stderr(err):
+                    contextlib.redirect_stderr(io.StringIO()):
                 rc = textlayer.main(["--pdf", pdf, "--out", os.path.join(tmp, "o")])
             self.assertEqual(rc, 3)
             self.assertTrue(buf.getvalue().isascii(), "机器可读那一行必须 ASCII")
-            line = [l for l in buf.getvalue().splitlines()
-                    if l.startswith("SUMMARY ")][0]
+            line = [l for l in buf.getvalue().splitlines() if l.startswith("SUMMARY ")][0]
             summary = json.loads(line[len("SUMMARY "):])
             self.assertEqual(summary["error_code"], "PDFTOTEXT_FAILED")
             self.assertFalse(summary["usable"])
@@ -633,11 +596,11 @@ class TestWritersStamp(unittest.TestCase):
         """三个写入端都必须 import pagedoc 并盖章（防止有人改回去）。"""
         for name in ("run_ocr.py", "repair.py", "run_layout.py"):
             with open(os.path.join(ROOT, name), encoding="utf-8") as f:
-                src = f.read()
+                s = f.read()
             with self.subTest(module=name):
-                self.assertIn("import pagedoc", src)
-                self.assertIn("pagedoc.stamp(", src)
-                self.assertIn("pagedoc.producer(", src)
+                self.assertIn("import pagedoc", s)
+                self.assertIn("pagedoc.stamp(", s)
+                self.assertIn("pagedoc.producer(", s)
 
     def test_stamp_preserves_existing_fields(self):
         """盖章只新增键：regions/region/r 这些既有字段一个都不能丢。"""
@@ -665,24 +628,19 @@ class TestWritersStamp(unittest.TestCase):
             self.assertEqual(pagedoc.read(path)["lines"][0]["t"],
                              legacy["lines"][0]["t"])
             # layout.load_pages 与 layout.build 都必须能读
-            pages = layout.load_pages(tmp)
-            self.assertEqual(len(pages), 1)
-            md, report = build_md(tmp)
+            self.assertEqual(len(layout.load_pages(tmp)), 1)
+            md, _report = build_md(tmp)
             self.assertIsInstance(md, str)
 
-    def test_decisions_reads_legacy_pages(self):
-        """decisions.page_path / apply_decisions 也读页级 JSON，老文件不能报错。"""
-        import decisions as dec
-        with tempfile.TemporaryDirectory() as tmp:
+            # decisions.page_path 也读页级 JSON：补零容错必须找得到 p-001.png.json
+            import decisions as dec
             name = dec.page_name(1)
             jsonio.write(os.path.join(tmp, name + ".json"),
                          {"name": name, "w": 100, "h": 200,
                           "lines": [{"x0": 1, "y0": 2, "x1": 3, "y1": 4,
                                      "t": "错字行", "s": 0.9}]})
-            path = dec.page_path(tmp, 1)
-            self.assertTrue(path, "补零容错必须能找到 p-001.png.json")
-            doc = jsonio.read(path)
-            self.assertEqual(doc["lines"][0]["t"], "错字行")
+            self.assertTrue(dec.page_path(tmp, 1), "补零容错必须能找到页 JSON")
+            self.assertEqual(jsonio.read(dec.page_path(tmp, 1))["lines"][0]["t"], "错字行")
 
 
 if __name__ == "__main__":

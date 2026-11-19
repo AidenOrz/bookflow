@@ -1,9 +1,13 @@
 #!/usr/bin/env python
-"""本轮新增行为（2026-11-16）：PDF 书签当目录 / 叠字图层择优 / 图形区裁图。
+"""PDF 书签当目录 / 叠字图层择优 / 图形区裁图 / 表格可读性。
 
 全部用例的证据都来自《拉康式主体》《规训与惩罚》《中国僧官制度史》的实测，
-不是"假想的漂亮数据"。三条判据都各有一个反例用例——把实现改回直觉写法，
-那些用例必须红。
+不是"假想的漂亮数据"。每条判据都配了反例——把实现改回直觉写法，那些用例必须红。
+
+**用例组织方式**：同一判据的正例/反例/边界被合并进一个方法，用 subTest 逐个跑。
+合并的只是「方法个数」，不是断言——每个 case 的断言一条不少，失败时 subTest
+会精确报出是哪一组输入挂了（例如 toc_depth=2）。这样做的直接收益是：一个新读
+的人看 TestLayerRank 里的 3 行就能知道整条规则，不用在一屏短方法之间来回跳。
 """
 import os
 import sys
@@ -25,19 +29,16 @@ def row(t, x0=0.0, x1=100.0, y0=0.0, y1=16.5):
 class TestOutlineClean(unittest.TestCase):
     """书签标题规整：只去掉不可见字符和多余空白，不改词。"""
 
-    def test_invisible_chars_removed(self):
-        self.assertEqual(outline._clean("第1部分\u200b结构"), "第1部分结构")
-
-    def test_ideographic_space_folded(self):
-        self.assertEqual(outline._clean("第2\u3000部分"), "第2 部分")
-
-    def test_control_chars_removed(self):
-        self.assertEqual(outline._clean("\x00标题\x07"), "标题")
-
-    def test_text_is_not_rewritten(self):
-        # 「部分」是一个词，书签里就是「第1部分结构」，不能被拆成「第1部　分结构」
-        self.assertEqual(outline._clean("第1部分结构：异化与他者"),
-                         "第1部分结构：异化与他者")
+    def test_clean_only_strips_invisible(self):
+        for raw, want in (
+            ("第1部分\u200b结构", "第1部分结构"),           # 零宽空格
+            ("第2\u3000部分", "第2 部分"),                  # 全角空格折成半角
+            ("\x00标题\x07", "标题"),                      # 控制字符
+            # 「部分」是一个词，书签里就是「第1部分结构」，不能被拆成「第1部　分结构」
+            ("第1部分结构：异化与他者", "第1部分结构：异化与他者"),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(outline._clean(raw), want)
 
 
 class TestOutlineSkipTitles(unittest.TestCase):
@@ -45,23 +46,24 @@ class TestOutlineSkipTitles(unittest.TestCase):
 
     def test_layout_pages_skipped(self):
         for t in ("封面", "书名页", "目录", "版权", "Cover", "Contents"):
-            self.assertTrue(outline.SKIP_TITLES.match(t), t)
+            with self.subTest(title=t):
+                self.assertTrue(outline.SKIP_TITLES.match(t))
 
     def test_real_chapters_kept(self):
         for t in ("封面设计：张三", "第一部分 酷刑", "索引", "参考书目"):
-            self.assertFalse(outline.SKIP_TITLES.match(t), t)
+            with self.subTest(title=t):
+                self.assertFalse(outline.SKIP_TITLES.match(t))
 
 
 class TestOutlineEntryFallback(unittest.TestCase):
     """书签不可用时不抛异常，返回空表 + 人话原因。"""
 
-    def test_missing_pdf(self):
+    def test_missing_outline_reports_reason_not_raises(self):
         e, why = outline.read_outline("no-such-file.pdf")
         self.assertEqual(e, [])
         self.assertIn("没有 PDF 路径", why)
-
-    def test_no_outline_reports_reason(self):
-        e, why = outline.read_outline(__file__)   # 不是 PDF
+        # 不是 PDF 的文件：同样返回空表，但理由不同（pypdf 读不了）
+        e, why = outline.read_outline(__file__)
         self.assertEqual(e, [])
         self.assertTrue(why)
 
@@ -101,73 +103,60 @@ class TestTableQuality(unittest.TestCase):
 
 
 class TestLayerRank(unittest.TestCase):
-    """叠字图层择优：碎词少的优先，字数只排第二。"""
+    """叠字图层择优：碎词少的优先，字数只排第二，空格不算信息。"""
 
-    def test_whole_word_beats_fragments(self):
+    def test_rank_prefers_whole_words_over_fragments_and_spaces(self):
         whole = row("康奈尔大学的理查德·克莱因（Richard Klein）则让我初次", y1=16.5)
         frag = row("康奈尔大学的理查德·克莱因（Richard K le in）则让我初次", y1=11.0)
-        self.assertGreater(textlayer._layer_rank(whole),
-                           textlayer._layer_rank(frag))
+        self.assertGreater(textlayer._layer_rank(whole), textlayer._layer_rank(frag))
 
-    def test_char_count_breaks_tie_when_no_fragments(self):
+        # 没有碎词时按字数破平
         longer = row("他们使用的象征符（symbols）什么意义都没", y1=11.0)
         shorter = row("他们使用的象征符（symbols）什么意义都", y1=16.5)
-        self.assertGreater(textlayer._layer_rank(longer),
-                           textlayer._layer_rank(shorter))
+        self.assertGreater(textlayer._layer_rank(longer), textlayer._layer_rank(shorter))
 
-    def test_space_count_is_not_information(self):
         # 「K le in」比「Klein」多 4 个空格，但空格不是信息
         dense = row("术语上拉康将德语Trieb驱力译作冲动", y1=11.0)
         spaced = row("术语上拉康将德语T r i e b驱力译作冲动", y1=16.5)
-        self.assertGreater(textlayer._layer_rank(dense),
-                           textlayer._layer_rank(spaced))
+        self.assertGreater(textlayer._layer_rank(dense), textlayer._layer_rank(spaced))
 
 
 class TestFigureRegions(unittest.TestCase):
-    """图区类别：display_formula / chart 必须和 image 一样被裁出来。"""
+    """图区类别：display_formula / chart 必须和 image 一样被裁出来。
 
-    def test_formula_counts_as_figure(self):
+    与 test_layout.py 的 TestFigureRegions 分工不同：那边验裁图产物（真跑
+    make_md 后图有没有落在正文里），这里只钉住**类别集合**这一条静态约定。
+    """
+
+    def test_formula_and_chart_are_figure_regions_not_drop_regions(self):
         self.assertIn("display_formula", layout.FIG_REGIONS)
-
-    def test_chart_counts_as_figure(self):
         self.assertIn("chart", layout.FIG_REGIONS)
-
-    def test_formula_not_in_drop_regions(self):
         # 直接删掉的话，成书里那一块会凭空消失，读者不知道原处有什么
         self.assertNotIn("display_formula", layout.DROP_REGIONS)
 
 
 class TestRunningHeadTitleException(unittest.TestCase):
-    """章标题即使等于书眉文字，也不能被当成版式删掉。"""
+    """章标题即使等于书眉文字，也不能被当成版式删掉（位置证据优先于文本证据）。"""
 
     def setUp(self):
         self.page = {"name": "p-266.png", "w": 2100, "h": 3309,
                      "lines": [], "regions": []}
 
-    def test_title_kept_when_it_is_also_running_head(self):
+    def clean(self, text, region, y0=853.1):
         p = dict(self.page)
-        p["lines"] = [{"x0": 299.0, "y0": 853.1, "x1": 966.0, "y1": 920.0,
-                       "t": "附录2：追踪原因", "region": "paragraph_title"}]
-        heads = {layout.norm("附录2：追踪原因")}
-        out = layout.clean_page(p, 53.4, 59.3, heads, band_top=0.09, band_bot=0.94)
+        p["lines"] = [{"x0": 299.0, "y0": y0, "x1": 966.0, "y1": y0 + 67.0,
+                       "t": text, "region": region}]
+        heads = {layout.norm(text)}
+        return layout.clean_page(p, 53.4, 59.3, heads, band_top=0.09, band_bot=0.94)
+
+    def test_title_like_running_head(self):
+        # 标题区 + 不在页眉带 → 保留（「附录2：追踪原因」「索引」曾被整章删掉）
+        out = self.clean("附录2：追踪原因", "paragraph_title")
         self.assertEqual([L["t"] for L in out], ["附录2：追踪原因"])
-
-    def test_running_head_without_title_region_still_dropped(self):
-        p = dict(self.page)
-        p["lines"] = [{"x0": 299.0, "y0": 853.1, "x1": 966.0, "y1": 920.0,
-                       "t": "拉康式主体", "region": "text"}]
-        heads = {layout.norm("拉康式主体")}
-        out = layout.clean_page(p, 53.4, 59.3, heads, band_top=0.09, band_bot=0.94)
-        self.assertEqual(out, [])
-
-    def test_title_in_header_band_still_dropped(self):
-        # 位置证据优先：真书眉在页眉带里，标题不在
-        p = dict(self.page)
-        p["lines"] = [{"x0": 299.0, "y0": 60.0, "x1": 966.0, "y1": 120.0,
-                       "t": "索引", "region": "paragraph_title"}]
-        heads = {layout.norm("索引")}
-        out = layout.clean_page(p, 53.4, 59.3, heads, band_top=0.09, band_bot=0.94)
-        self.assertEqual(out, [])
+        # 同样的文字但区域是 text → 仍是书眉，删
+        self.assertEqual(self.clean("拉康式主体", "text"), [])
+        # 位置证据优先：标题区但在页眉带里 → 照样是书眉，删
+        self.assertEqual(self.clean("索引", "paragraph_title", y0=60.0), [])
 
 
 class TestBodyTitleUntouchedForOutline(unittest.TestCase):
